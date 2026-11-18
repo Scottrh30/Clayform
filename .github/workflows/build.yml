@@ -19,7 +19,9 @@ jobs:
       - name: Build
         run: cargo build --release
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
+          retention-days: 7
           name: clayform-windows
           path: target/release/clayform.exe
       - name: Attach to release
