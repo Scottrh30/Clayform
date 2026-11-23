@@ -16,28 +16,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --release
-      - name: Build
-        run: cargo build --release
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+      - name: Test engine
+        run: cargo test --release -p clayform-core
+      - name: Build app and installer
+        run: npx --yes @tauri-apps/cli@2 build
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp target/release/clayform.exe out/Clayform.exe
+          cp target/release/bundle/nsis/*-setup.exe out/Clayform-setup.exe
       - uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
-          retention-days: 7
           name: clayform-windows
-          path: target/release/clayform.exe
+          path: out/
+          retention-days: 7
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/clayform.exe
+          files: |
+            out/Clayform.exe
+            out/Clayform-setup.exe
 
-  linux:
+  engine-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgtk-3-dev
-      - run: cargo test
+      - run: cargo test -p clayform-core

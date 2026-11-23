@@ -1,7 +1,7 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
     view: mat4x4<f32>,
-    // x: material id, y: show mask, z: flat shading, w: unused
+    // x: material id, y: show mask, z: flat shading, w: encode sRGB in the shader
     params: vec4<f32>,
     wire_color: vec4<f32>,
     bg_top: vec4<f32>,
@@ -98,7 +98,15 @@ fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         let m = clamp(i.mask, 0.0, 1.0);
         c = mix(c, c * vec3<f32>(0.18, 0.2, 0.28), m * 0.85);
     }
-    return vec4<f32>(c, 1.0);
+    return vec4<f32>(encode(c), 1.0);
+}
+
+// Surfaces without an sRGB format (some WebGL setups) need manual encoding.
+fn encode(c: vec3<f32>) -> vec3<f32> {
+    if (u.params.w > 0.5) {
+        return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    }
+    return c;
 }
 
 @vertex
@@ -129,5 +137,5 @@ fn vs_bg(@builtin(vertex_index) vi: u32) -> BgOut {
 fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
     let t = clamp(i.uv.y, 0.0, 1.0);
     let vign = 1.0 - 0.25 * length(i.uv - vec2<f32>(0.5, 0.55));
-    return vec4<f32>(mix(u.bg_bottom.rgb, u.bg_top.rgb, t) * vign, 1.0);
+    return vec4<f32>(encode(mix(u.bg_bottom.rgb, u.bg_top.rgb, t) * vign), 1.0);
 }

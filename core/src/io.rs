@@ -2,15 +2,15 @@
 
 use crate::mesh::Mesh;
 use glam::Vec3;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::Write;
 
-pub fn load(path: &Path) -> Result<Mesh, String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let bytes = std::fs::read(path).map_err(|e| format!("Could not read file: {e}"))?;
+/// Parses an OBJ or STL file (chosen by the file name's extension) and
+/// normalises it for sculpting.
+pub fn load(file_name: &str, bytes: &[u8]) -> Result<Mesh, String> {
+    let ext = extension(file_name);
     let mut mesh = match ext.as_str() {
-        "obj" => parse_obj(&String::from_utf8_lossy(&bytes))?,
-        "stl" => parse_stl(&bytes)?,
+        "obj" => parse_obj(&String::from_utf8_lossy(bytes))?,
+        "stl" => parse_stl(bytes)?,
         _ => return Err(format!("Unsupported format '.{ext}' (use .obj or .stl)")),
     };
     if mesh.tris.is_empty() {
@@ -20,15 +20,19 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
     Ok(mesh)
 }
 
-pub fn save(mesh: &Mesh, path: &Path) -> Result<(), String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let f = std::fs::File::create(path).map_err(|e| format!("Could not create file: {e}"))?;
-    let mut w = BufWriter::new(f);
-    let r = match ext.as_str() {
+/// Serialises the mesh as OBJ (`"obj"`) or binary STL (`"stl"`).
+pub fn save(mesh: &Mesh, ext: &str) -> Vec<u8> {
+    let mut w = Vec::new();
+    let r = match ext.to_ascii_lowercase().as_str() {
         "stl" => write_stl(mesh, &mut w),
         _ => write_obj(mesh, &mut w),
     };
-    r.and_then(|_| w.flush()).map_err(|e| format!("Write failed: {e}"))
+    r.expect("writing to memory cannot fail");
+    w
+}
+
+fn extension(name: &str) -> String {
+    name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
 }
 
 #[inline]
@@ -162,6 +166,15 @@ mod tests {
         write_obj(&m, &mut buf).unwrap();
         let back = parse_obj(&String::from_utf8(buf).unwrap()).unwrap();
         assert!((back.positions[2] - Vec3::new(4.0, 4.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn load_and_save_by_extension() {
+        let bytes = save(&Mesh::icosphere(1), "stl");
+        let m = load("ball.STL", &bytes).unwrap();
+        assert_eq!(m.tris.len(), 80);
+        assert!(load("ball.fbx", &bytes).is_err());
+        assert!(String::from_utf8(save(&m, "obj")).unwrap().starts_with("# Exported from Clayform"));
     }
 
     #[test]

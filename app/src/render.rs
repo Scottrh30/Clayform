@@ -1,20 +1,18 @@
-//! Offscreen wgpu renderer for the sculpt viewport. The result is shown in
-//! egui as a native texture.
+//! wgpu (WebGL 2) renderer drawing the sculpt straight into the viewport canvas.
 
-use crate::mesh::Mesh;
-use crate::sculpt::GpuDirty;
 use bytemuck::{Pod, Zeroable};
-use egui_wgpu::wgpu;
-use glam::Mat4;
+use clayform_core::glam::Mat4;
+use clayform_core::mesh::Mesh;
+use clayform_core::sculpt::GpuDirty;
 use std::collections::HashSet;
+use web_sys::HtmlCanvasElement;
 
-pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const SAMPLES: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub struct GpuVertex {
+struct GpuVertex {
     pos: [f32; 3],
     nrm: [f32; 3],
     mask: f32,
@@ -32,23 +30,37 @@ struct Uniforms {
     bg_bottom: [f32; 4],
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub struct ViewSettings {
     pub material: u32,
     pub show_mask: bool,
     pub flat: bool,
     pub wireframe: bool,
+    pub background: u32,
 }
+
+/// Background presets: (name, top colour, bottom colour), linear RGB.
+pub const BACKGROUNDS: [(&str, [f32; 3], [f32; 3]); 4] = [
+    ("Dark gradient", [0.075, 0.08, 0.095], [0.018, 0.018, 0.022]),
+    ("Studio grey", [0.30, 0.31, 0.33], [0.08, 0.085, 0.09]),
+    ("Light", [0.72, 0.74, 0.78], [0.42, 0.44, 0.48]),
+    ("Black", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+];
+
+pub const MATERIALS: [&str; 6] = ["Clay", "Red wax", "Pearl", "Jade", "Chrome", "Normals"];
 
 struct Targets {
     size: [u32; 2],
-    resolve_view: wgpu::TextureView,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 }
 
 pub struct Renderer {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    srgb_surface: bool,
     mesh_pipe: wgpu::RenderPipeline,
     wire_pipe: wgpu::RenderPipeline,
     bg_pipe: wgpu::RenderPipeline,
@@ -62,7 +74,7 @@ pub struct Renderer {
     edges_stale: bool,
     staging: Vec<GpuVertex>,
     targets: Option<Targets>,
-    pub texture_id: Option<egui::TextureId>,
+    pub adapter_name: String,
 }
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -76,7 +88,48 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 impl Renderer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    pub async fn new(canvas: HtmlCanvasElement) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|e| format!("Could not create a WebGL 2 surface: {e}"))?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or("No WebGL 2 graphics adapter is available")?;
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("clayform"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                    memory_hints: Default::default(),
+                },
+                None,
+            )
+            .await
+            .map_err(|e| format!("Could not open the graphics device: {e}"))?;
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: canvas.width().max(1),
+            height: canvas.height().max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clayform shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -133,11 +186,7 @@ impl Renderer {
                     module: &shader,
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOR_FORMAT,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 primitive: wgpu::PrimitiveState { topology, cull_mode: None, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -187,9 +236,13 @@ impl Renderer {
             None,
         );
 
-        Self {
-            device: device.clone(),
-            queue: queue.clone(),
+        Ok(Self {
+            adapter_name: adapter.get_info().name,
+            surface,
+            config,
+            srgb_surface: format.is_srgb(),
+            device,
+            queue,
             mesh_pipe,
             wire_pipe,
             bg_pipe,
@@ -203,50 +256,34 @@ impl Renderer {
             edges_stale: true,
             staging: Vec::new(),
             targets: None,
-            texture_id: None,
-        }
+        })
     }
 
-    fn ensure_targets(&mut self, size: [u32; 2], egui_renderer: &mut egui_wgpu::Renderer) {
+    fn ensure_size(&mut self, size: [u32; 2]) {
         let size = [size[0].max(1), size[1].max(1)];
         if self.targets.as_ref().map(|t| t.size) == Some(size) {
             return;
         }
-        let tex = |label: &str, format, samples, usage| {
+        self.config.width = size[0];
+        self.config.height = size[1];
+        self.surface.configure(&self.device, &self.config);
+        let tex = |label: &str, format| {
             self.device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
                     mip_level_count: 1,
-                    sample_count: samples,
+                    sample_count: SAMPLES,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 })
                 .create_view(&Default::default())
         };
-        let resolve_view = tex(
-            "viewport",
-            COLOR_FORMAT,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        );
-        let msaa_view = tex("msaa", COLOR_FORMAT, SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let depth_view = tex("depth", DEPTH_FORMAT, SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        match self.texture_id {
-            Some(id) => egui_renderer.update_egui_texture_from_wgpu_texture(
-                &self.device,
-                &resolve_view,
-                wgpu::FilterMode::Linear,
-                id,
-            ),
-            None => {
-                self.texture_id =
-                    Some(egui_renderer.register_native_texture(&self.device, &resolve_view, wgpu::FilterMode::Linear))
-            }
-        }
-        self.targets = Some(Targets { size, resolve_view, msaa_view, depth_view });
+        let msaa_view = tex("msaa", self.config.format);
+        let depth_view = tex("depth", DEPTH_FORMAT);
+        self.targets = Some(Targets { size, msaa_view, depth_view });
     }
 
     /// Uploads whatever changed in the mesh since the last frame.
@@ -287,11 +324,7 @@ impl Renderer {
                 self.staging[i] = to_gpu(i);
             }
             let off = (a * std::mem::size_of::<GpuVertex>()) as u64;
-            self.queue.write_buffer(
-                self.vbuf.as_ref().unwrap(),
-                off,
-                bytemuck::cast_slice(&self.staging[a..=b]),
-            );
+            self.queue.write_buffer(self.vbuf.as_ref().unwrap(), off, bytemuck::cast_slice(&self.staging[a..=b]));
         }
         if need_edges && self.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);
@@ -318,36 +351,32 @@ impl Renderer {
         }
     }
 
-    pub fn render(
-        &mut self,
-        size: [u32; 2],
-        egui_renderer: &mut egui_wgpu::Renderer,
-        view: Mat4,
-        proj: Mat4,
-        settings: &ViewSettings,
-        dark_ui: bool,
-    ) {
-        self.ensure_targets(size, egui_renderer);
-        let (top, bottom) = if dark_ui {
-            ([0.075, 0.08, 0.095, 1.0], [0.018, 0.018, 0.022, 1.0])
-        } else {
-            ([0.55, 0.58, 0.63, 1.0], [0.22, 0.23, 0.26, 1.0])
-        };
+    pub fn render(&mut self, size_px: [u32; 2], view: Mat4, proj: Mat4, s: &ViewSettings) {
+        self.ensure_size(size_px);
+        let (_, top, bottom) = BACKGROUNDS[(s.background as usize).min(BACKGROUNDS.len() - 1)];
         let u = Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
             view: view.to_cols_array_2d(),
             params: [
-                settings.material as f32,
-                settings.show_mask as u32 as f32,
-                settings.flat as u32 as f32,
-                0.0,
+                s.material as f32,
+                s.show_mask as u32 as f32,
+                s.flat as u32 as f32,
+                (!self.srgb_surface) as u32 as f32,
             ],
             wire_color: [0.0, 0.0, 0.0, 0.35],
-            bg_top: top,
-            bg_bottom: bottom,
+            bg_top: [top[0], top[1], top[2], 1.0],
+            bg_bottom: [bottom[0], bottom[1], bottom[2], 1.0],
         };
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
 
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(_) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+        };
+        let target = frame.texture.create_view(&Default::default());
         let t = self.targets.as_ref().unwrap();
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
@@ -355,18 +384,12 @@ impl Renderer {
                 label: Some("viewport"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &t.msaa_view,
-                    resolve_target: Some(&t.resolve_view),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Discard,
-                    },
+                    resolve_target: Some(&target),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -380,7 +403,7 @@ impl Renderer {
                 pass.set_pipeline(&self.mesh_pipe);
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.index_count, 0, 0..1);
-                if settings.wireframe {
+                if s.wireframe {
                     if let Some(eb) = &self.ebuf {
                         pass.set_pipeline(&self.wire_pipe);
                         pass.set_index_buffer(eb.slice(..), wgpu::IndexFormat::Uint32);
@@ -390,5 +413,6 @@ impl Renderer {
             }
         }
         self.queue.submit(Some(enc.finish()));
+        frame.present();
     }
 }

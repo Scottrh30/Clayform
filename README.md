@@ -1,21 +1,31 @@
 # Clayform
 
-A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.com/sculptgl/), built with egui + wgpu.
+A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.com/sculptgl/): a
+[Tauri](https://tauri.app) desktop app with a [Leptos](https://leptos.dev) interface.
 
 ![Clayform](docs/screenshot.png)
 
-## Features (milestone 1)
+## Interface
 
-- **Brushes:** Draw, Clay, Smooth, Flatten, Inflate, Pinch, Crease, Grab, Mask, each with a radius and intensity setting.
-- **Modifiers:** hold Ctrl to invert the brush (dig instead of raise, or unmask), hold Shift to smooth.
-- **X symmetry**, with a ghost cursor that shows where the mirrored dab lands.
-- **Masking:** paint a mask to protect areas from sculpting, then clear or invert it.
-- **Loop subdivision** for more detail (up to 6M triangles).
-- **Undo/redo** for every stroke, subdivision and mesh change.
-- **Primitives:** sphere (adjustable detail), cube and plane.
-- **Import/export:** OBJ and STL (binary and ASCII). Imported meshes are normalised for sculpting and exported back at their original scale and position.
-- **Settings panel:** dock it on the left or right of the viewport (the ◀/▶ button in the panel header, the View menu, or Panel side under Material). The choice is remembered between launches.
-- **Viewport:** 4× MSAA, procedural matcaps (Clay, Red wax, Pearl, Jade, Chrome, Normals), wireframe and flat shading.
+Like SculptGL, the functions are grouped into dropdown areas:
+
+- **Top-bar menus:** **File** (import, export OBJ/STL), **Edit** (undo, redo), **Scene** (new sphere, cube or plane,
+  sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
+  (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
+- **Side-panel folders** (click a title to fold it): **Sculpting** (tool dropdown, radius, intensity, negative,
+  symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (subdivide, mesh statistics),
+  **Rendering** (material dropdown, flat shading, wireframe) and **Interface** (panel side).
+- The side panel docks on the **left or right** of the viewport. Use the **Panel left / Panel right** button in the
+  top bar, or **Interface › Panel side**. Your choice is remembered.
+
+## Features
+
+- **Brushes:** Draw, Clay, Smooth, Flatten, Inflate, Pinch, Crease, Grab and Mask, each with its own radius and
+  intensity. Hold Ctrl to invert a brush and Shift to smooth.
+- **X symmetry**, with a second cursor showing where the mirrored stroke lands.
+- **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke and mesh change.
+- **Import/export** OBJ and STL. Imported meshes are rescaled for sculpting and exported at their original scale.
+- **Viewport:** WebGL 2 through wgpu, 4× MSAA, six procedural matcaps, wireframe and flat shading.
 
 ## Controls
 
@@ -34,29 +44,37 @@ A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.co
 | Ctrl+D | Subdivide |
 | Ctrl+O / Ctrl+S | Import / export OBJ |
 | Home | Frame mesh |
+| `1` `3` `7` (Ctrl for the opposite side) | Front, right, top views |
 
-You can also open a mesh from the command line: `clayform model.obj`
+## Project layout
 
-## Build
-
-```
-cargo run --release
-```
-
-To cross-compile the Windows .exe from Linux, without rustup's Windows target, run `scripts/build-windows-exe.sh`. The output goes to `dist/clayform.exe`.
-
-The GitHub Actions workflow builds `clayform.exe` on Windows and uploads it as a build artifact. If you push a `v*` tag, it also attaches the .exe to a GitHub release.
-
-## Architecture
-
-| File | Purpose |
+| Folder | What it is |
 |---|---|
-| `src/mesh.rs` | Indexed triangle mesh with CSR adjacency, normals, mask, Loop subdivision and primitives |
-| `src/bvh.rs` | Triangle BVH for ray picking, refitted once per frame after sculpting |
-| `src/sculpt.rs` | Brush engine (flood-fill region, falloff, tools), strokes, grab, undo/redo |
-| `src/render.rs` + `shader.wgsl` | Offscreen wgpu renderer (MSAA, matcaps, wireframe), shown in egui as a native texture |
-| `src/camera.rs` | Orbit camera, picking rays and screen-to-world brush radius |
-| `src/app.rs` | egui UI, input handling, shortcuts |
+| `core/` | **clayform-core**: the engine. Mesh, brushes, undo, BVH picking, camera, editor input logic, OBJ/STL. No interface code. |
+| `app/` | **clayform-app**: the Leptos interface and wgpu (WebGL 2) viewport, compiled to WebAssembly together with the engine, so strokes never wait on the desktop backend. |
+| `src-tauri/` | **clayform**: the Tauri desktop shell. It opens the window and provides native Open/Save dialogs. |
+
+## Run
+
+    rustup target add wasm32-unknown-unknown
+    cargo install trunk
+    npx @tauri-apps/cli@2 dev        # live-reloading window
+    npx @tauri-apps/cli@2 build      # target/release/clayform.exe and an installer
+
+The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
+Import and Export use the browser's file picker and downloads.
+
+Tests: `cargo test` (engine: meshes, subdivision, picking, brushes, strokes, undo, symmetry, OBJ/STL).
+
+## Windows build
+
+- **From Linux without GitHub:** `./build-windows.sh` produces `dist/Clayform-setup.exe` (installer) and
+  `dist/Clayform-portable.zip` (Clayform.exe + WebView2Loader.dll). If rustup can't download the WebAssembly and
+  Windows targets, the script builds Rust's standard library from source instead.
+- **GitHub Actions:** every push to `main` is built on Windows. Publishing a release with a `v*` tag attaches
+  `Clayform.exe` and `Clayform-setup.exe` to it.
+
+Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The installer adds it if a PC lacks it.
 
 ## Roadmap ideas
 

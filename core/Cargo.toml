@@ -1,0 +1,9 @@
+[package]
+name = "clayform-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clayform's sculpting engine: mesh, brushes, undo, picking, camera, OBJ/STL"
+
+[dependencies]
+glam = "0.29"
