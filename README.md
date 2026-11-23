@@ -42,6 +42,8 @@ You can also open a mesh from the command line: `clayform model.obj`
 cargo run --release
 ```
 
+To cross-compile the Windows .exe from Linux, without rustup's Windows target, run `scripts/build-windows-exe.sh`. The output goes to `dist/clayform.exe`.
+
 The GitHub Actions workflow builds `clayform.exe` on Windows and uploads it as a build artifact. If you push a `v*` tag, it also attaches the .exe to a GitHub release.
 
 ## Architecture
