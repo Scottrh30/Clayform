@@ -22,6 +22,8 @@ struct GrabAnchor {
     normal: Vec3,
 }
 
+const PANEL_SIDE_KEY: &str = "panel_side";
+
 const MATERIALS: [&str; 6] = ["Clay", "Red wax", "Pearl", "Jade", "Chrome", "Normals"];
 
 pub struct App {
@@ -40,6 +42,9 @@ pub struct App {
     last_dab: Vec2,
     grab: Option<GrabAnchor>,
     sphere_level: u32,
+    /// Tools / settings panel docked on the right of the viewport.
+    panel_right: bool,
+    saved_panel_right: bool,
     status: String,
     status_at: Instant,
     frame_ms: f32,
@@ -65,10 +70,16 @@ impl App {
             last_dab: Vec2::ZERO,
             grab: None,
             sphere_level: 6,
+            panel_right: cc
+                .storage
+                .and_then(|s| s.get_string(PANEL_SIDE_KEY))
+                .is_some_and(|v| v == "right"),
+            saved_panel_right: false,
             status: "Ready — drag on the sphere to sculpt".into(),
             status_at: Instant::now(),
             frame_ms: 0.0,
         };
+        app.saved_panel_right = app.panel_right;
         if let Some(p) = open {
             app.load(p);
         }
@@ -404,6 +415,11 @@ impl App {
                     ui.checkbox(&mut self.view.wireframe, "Wireframe   W");
                     ui.checkbox(&mut self.view.flat, "Flat shading");
                     ui.checkbox(&mut self.view.show_mask, "Show mask");
+                    ui.separator();
+                    ui.label("Settings panel");
+                    ui.radio_value(&mut self.panel_right, false, "Left of viewport");
+                    ui.radio_value(&mut self.panel_right, true, "Right of viewport");
+                    ui.separator();
                     if ui.button("Frame mesh   Home").clicked() {
                         self.frame_mesh();
                         ui.close_menu();
@@ -414,10 +430,29 @@ impl App {
     }
 
     fn tool_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("tools").resizable(false).exact_width(236.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        let panel = if self.panel_right {
+            egui::SidePanel::right("tools")
+        } else {
+            egui::SidePanel::left("tools")
+        };
+        panel.resizable(false).exact_width(236.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(if self.panel_right { "tools_scroll_r" } else { "tools_scroll_l" })
+                .show(ui, |ui| {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("CLAYFORM").strong().size(18.0).color(accent()));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CLAYFORM").strong().size(18.0).color(accent()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (icon, tip) = if self.panel_right {
+                            ("◀", "Move settings to the left of the viewport")
+                        } else {
+                            ("▶", "Move settings to the right of the viewport")
+                        };
+                        if ui.small_button(icon).on_hover_text(tip).clicked() {
+                            self.panel_right = !self.panel_right;
+                        }
+                    });
+                });
                 ui.add_space(4.0);
                 section(ui, "Brush");
                 egui::Grid::new("tools_grid").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
@@ -499,6 +534,11 @@ impl App {
                 ui.checkbox(&mut self.view.wireframe, "Wireframe   (W)");
                 ui.checkbox(&mut self.view.flat, "Flat shading");
                 ui.checkbox(&mut self.view.show_mask, "Show mask");
+                ui.horizontal(|ui| {
+                    ui.label("Panel side");
+                    ui.selectable_value(&mut self.panel_right, false, "Left");
+                    ui.selectable_value(&mut self.panel_right, true, "Right");
+                });
 
                 section(ui, "Controls");
                 let help = [
@@ -547,6 +587,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(PANEL_SIDE_KEY, if self.panel_right { "right" } else { "left" }.to_string());
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let t0 = Instant::now();
         self.sculptor.refresh_bvh();
@@ -604,6 +648,15 @@ impl eframe::App for App {
 
         if self.drag != Drag::None {
             ctx.request_repaint();
+        }
+        // Persist the panel side right away instead of waiting for eframe's
+        // periodic autosave (which only runs while frames are being drawn).
+        if self.panel_right != self.saved_panel_right {
+            if let Some(storage) = frame.storage_mut() {
+                self.save(storage);
+                storage.flush();
+            }
+            self.saved_panel_right = self.panel_right;
         }
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.frame_ms = self.frame_ms * 0.9 + ms * 0.1;

@@ -14,6 +14,7 @@ A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.co
 - **Undo/redo** for every stroke, subdivision and mesh change.
 - **Primitives:** sphere (adjustable detail), cube and plane.
 - **Import/export:** OBJ and STL (binary and ASCII). Imported meshes are normalised for sculpting and exported back at their original scale and position.
+- **Settings panel:** dock it on the left or right of the viewport (the ◀/▶ button in the panel header, the View menu, or Panel side under Material). The choice is remembered between launches.
 - **Viewport:** 4× MSAA, procedural matcaps (Clay, Red wax, Pearl, Jade, Chrome, Normals), wireframe and flat shading.
 
 ## Controls
