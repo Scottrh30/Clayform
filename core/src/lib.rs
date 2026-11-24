@@ -7,6 +7,7 @@ pub mod dyntopo;
 pub mod editor;
 pub mod io;
 pub mod mesh;
+pub mod remesh;
 pub mod sculpt;
 
 pub use glam;

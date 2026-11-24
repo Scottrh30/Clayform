@@ -9,6 +9,7 @@ use clayform_core::editor::{Brush, Button, Drag, Editor, Mods, ViewDir};
 use clayform_core::glam::Vec2;
 use clayform_core::io;
 use clayform_core::mesh::Mesh;
+use clayform_core::remesh::{VoxelSettings, MAX_RESOLUTION, MIN_RESOLUTION};
 use clayform_core::sculpt::{Tool, MAX_TRIANGLES};
 use leptos::ev;
 use leptos::prelude::*;
@@ -47,6 +48,8 @@ struct Ui {
     level: RwSignal<usize>,
     level_count: RwSignal<usize>,
     top_tris: RwSignal<usize>,
+    voxel: RwSignal<VoxelSettings>,
+    busy: RwSignal<bool>,
     view: RwSignal<ViewSettings>,
     fov: RwSignal<f32>,
     panel_right: RwSignal<bool>,
@@ -77,6 +80,8 @@ impl Ui {
             level: RwSignal::new(0),
             level_count: RwSignal::new(1),
             top_tris: RwSignal::new(0),
+            voxel: RwSignal::new(VoxelSettings::default()),
+            busy: RwSignal::new(false),
             view: RwSignal::new(ViewSettings { material: 0, show_mask: true, flat: false, wireframe: false, background: 0 }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
@@ -142,6 +147,7 @@ enum Action {
     DeleteLower,
     DeleteHigher,
     ToggleDyntopo,
+    VoxelRemesh,
     ClearMask,
     InvertMask,
     FrameMesh,
@@ -199,6 +205,29 @@ fn act(ui: Ui, a: Action) {
             with_ed(|e| e.delete_higher());
             ui.status.set("Deleted the higher levels".into());
         }
+        Action::VoxelRemesh => {
+            if ui.busy.get_untracked() {
+                return;
+            }
+            let settings = ui.voxel.get_untracked();
+            ui.busy.set(true);
+            ui.status.set(format!("Remeshing at resolution {}…", settings.resolution));
+            spawn_local(async move {
+                // let the status line paint before the (blocking) remesh
+                sleep_ms(40).await;
+                let t0 = now_ms();
+                match with_ed(|e| e.voxel_remesh(&settings)) {
+                    Ok(n) => ui.status.set(format!(
+                        "Remeshed — {} triangles in {:.1} s",
+                        fmt_count(n),
+                        (now_ms() - t0) / 1000.0
+                    )),
+                    Err(e) => ui.status.set(format!("Remesh failed: {e}")),
+                }
+                ui.busy.set(false);
+                ui.refresh();
+            });
+        }
         Action::ToggleDyntopo => {
             if ui.level_count.get_untracked() > 1 {
                 ui.status.set("Dynamic topology needs a single level: use Delete lower / Delete higher first".into());
@@ -220,6 +249,19 @@ fn act(ui: Ui, a: Action) {
         Action::TogglePanelSide => ui.panel_right.update(|r| *r = !*r),
     }
     ui.refresh();
+}
+
+async fn sleep_ms(ms: i32) {
+    let p = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+}
+
+fn now_ms() -> f64 {
+    web_sys::window().and_then(|w| w.performance()).map(|p| p.now()).unwrap_or(0.0)
 }
 
 fn new_mesh(ui: Ui, m: Mesh, name: &str) {
@@ -534,6 +576,9 @@ fn MenuBar(ui: Ui) -> impl IntoView {
             <Menu ui id="edit" label="Edit">
                 <Item ui action=Action::Undo label="Undo" key="Ctrl+Z" enabled=can_undo />
                 <Item ui action=Action::Redo label="Redo" key="Ctrl+Shift+Z" enabled=can_redo />
+                <div class="sep"></div>
+                <Item ui action=Action::Subdivide label="Subdivide (add level)" key="Ctrl+D" />
+                <Item ui action=Action::VoxelRemesh label="Voxel remesh" key="R" />
             </Menu>
             <Menu ui id="scene" label="Scene">
                 <Item ui action=Action::NewSphere label="New sphere" />
@@ -607,6 +652,7 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"Ctrl+D"</td><td>"Subdivide (add a level)"</td></tr>
                         <tr><td>"Page Up / Page Down"</td><td>"Higher / lower level"</td></tr>
                         <tr><td>"T"</td><td>"Dynamic topology on/off"</td></tr>
+                        <tr><td>"R"</td><td>"Voxel remesh"</td></tr>
                     </table>
                     <p class="about">"Clayform — a SculptGL-style sculpting app (Tauri + Leptos)."</p>
                 </div>
@@ -734,6 +780,32 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                 <Show when=move || multi.get()>
                     <div class="hint">"Works on a single level. Use Delete lower / Delete higher to merge the levels first."</div>
                 </Show>
+                <div class="subhead">"Voxel remesh (DynaMesh)"</div>
+                <Slider
+                    label="Resolution"
+                    min=MIN_RESOLUTION as f32 max=MAX_RESOLUTION as f32 step=8.0
+                    value=Signal::derive(move || ui.voxel.get().resolution as f32)
+                    on_change=move |v| ui.voxel.update(|s| s.resolution = v as u32)
+                    format=|v| format!("{v:.0}")
+                />
+                <Slider
+                    label="Smooth"
+                    min=0.0 max=4.0 step=1.0
+                    value=Signal::derive(move || ui.voxel.get().smooth as f32)
+                    on_change=move |v| ui.voxel.update(|s| s.smooth = v as u32)
+                    format=|v| format!("{v:.0}")
+                />
+                <Check
+                    label="Project onto the original shape"
+                    value=Signal::derive(move || ui.voxel.get().project)
+                    on_change=move |v| ui.voxel.update(|s| s.project = v)
+                />
+                <div class="row buttons">
+                    <button class="primary" disabled=move || ui.busy.get() on:click=move |_| act(ui, Action::VoxelRemesh)>
+                        {move || if ui.busy.get() { "Remeshing…" } else { "Remesh  (R)" }}
+                    </button>
+                </div>
+                <div class="hint">"Rebuilds an even, closed mesh: merges overlapping parts, closes holes and evens out dynamic-topology strokes. Replaces all levels."</div>
                 <div class="row info">
                     {move || {
                         let (v, t) = ui.stats.get();
@@ -830,6 +902,7 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "pageup" => act(ui, Action::LevelUp),
             "pagedown" => act(ui, Action::LevelDown),
             "t" => act(ui, Action::ToggleDyntopo),
+            "r" => act(ui, Action::VoxelRemesh),
             _ => {
                 if let Some(t) = Tool::ALL.iter().find(|t| t.shortcut().to_ascii_lowercase().to_string() == k) {
                     ui.tool.set(*t);

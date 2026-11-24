@@ -119,3 +119,6 @@ button, select, input { font: inherit; color: inherit; }
 .stepper .level { min-width: 56px; text-align: center; font-variant-numeric: tabular-nums; }
 .check.disabled { color: #5d5e66; cursor: default; }
 .hint { color: var(--dim); font-size: 11.5px; line-height: 1.35; padding: 2px 0 4px; }
+.buttons button.primary { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+.buttons button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+.buttons button.primary:disabled { background: var(--panel-2); color: var(--dim); }

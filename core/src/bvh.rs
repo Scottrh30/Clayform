@@ -165,6 +165,87 @@ impl Bvh {
     }
 }
 
+impl Bvh {
+    /// Closest point on the surface to `p`, if one lies within `max_dist`.
+    pub fn closest_point(&self, mesh: &Mesh, p: Vec3, max_dist: f32) -> Option<Vec3> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut best_d2 = max_dist * max_dist;
+        let mut best = None;
+        let test = |t: u32, best_d2: &mut f32, best: &mut Option<Vec3>| {
+            let [a, b, c] = mesh.tris[t as usize];
+            if a == NONE {
+                return;
+            }
+            let q = closest_on_triangle(p, mesh.positions[a as usize], mesh.positions[b as usize], mesh.positions[c as usize]);
+            let d2 = q.distance_squared(p);
+            if d2 < *best_d2 {
+                *best_d2 = d2;
+                *best = Some(q);
+            }
+        };
+        for t in self.indexed.min(mesh.tris.len())..mesh.tris.len() {
+            test(t as u32, &mut best_d2, &mut best);
+        }
+        let mut stack: Vec<u32> = vec![0];
+        while let Some(ni) = stack.pop() {
+            let n = &self.nodes[ni as usize];
+            let d = (n.min - p).max(p - n.max).max(Vec3::ZERO);
+            if d.length_squared() > best_d2 {
+                continue;
+            }
+            if n.count > 0 {
+                for &t in &self.order[n.first as usize..(n.first + n.count) as usize] {
+                    test(t, &mut best_d2, &mut best);
+                }
+            } else {
+                stack.push(n.first);
+                stack.push(n.first + 1);
+            }
+        }
+        best
+    }
+}
+
+/// Closest point to `p` on triangle abc (Ericson, Real-Time Collision Detection 5.1.5).
+pub fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = p - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    a + ab * (vb * denom) + ac * (vc * denom)
+}
+
 #[inline]
 fn ray_aabb(o: Vec3, inv: Vec3, mn: Vec3, mx: Vec3) -> Option<f32> {
     let t1 = (mn - o) * inv;
@@ -210,6 +291,15 @@ mod tests {
         let h = b.raycast(&m, Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         assert!((h.point.z - 1.0).abs() < 0.01, "{:?}", h.point);
         assert!(b.raycast(&m, Vec3::new(3.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).is_none());
+    }
+
+    #[test]
+    fn closest_point_on_sphere() {
+        let m = Mesh::icosphere(4);
+        let b = Bvh::build(&m);
+        let q = b.closest_point(&m, Vec3::new(0.0, 2.0, 0.0), 5.0).unwrap();
+        assert!((q - Vec3::Y).length() < 0.01, "{q:?}");
+        assert!(b.closest_point(&m, Vec3::new(0.0, 3.0, 0.0), 0.5).is_none());
     }
 
     #[test]

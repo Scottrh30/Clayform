@@ -3,6 +3,7 @@
 
 use crate::camera::Camera;
 use crate::mesh::Mesh;
+use crate::remesh::{voxel_remesh, VoxelSettings};
 use crate::sculpt::{mirror_x, DabParams, Sculptor, Tool};
 use glam::{Vec2, Vec3, Vec4};
 
@@ -158,6 +159,17 @@ impl Editor {
         self.cancel_drag();
         self.sculptor.delete_higher();
         self.redraw = true;
+    }
+
+    /// DynaMesh-style voxel remesh of the current shape (undoable). The
+    /// result is a single level. Returns the new triangle count.
+    pub fn voxel_remesh(&mut self, settings: &VoxelSettings) -> Result<usize, String> {
+        self.cancel_drag();
+        let m = voxel_remesh(&self.sculptor.mesh, settings)?;
+        let n = m.tris.len();
+        self.sculptor.set_mesh(m);
+        self.redraw = true;
+        Ok(n)
     }
 
     pub fn set_mesh(&mut self, m: Mesh) {
@@ -403,6 +415,21 @@ mod tests {
         }
         e.pointer_up();
         assert!(e.sculptor.tri_count() > n0 + 200, "{n0} -> {}", e.sculptor.tri_count());
+    }
+
+    #[test]
+    fn voxel_remesh_is_undoable_and_keeps_view() {
+        let mut e = Editor::new();
+        e.sculptor.subdivide().unwrap();
+        let (yaw, dist) = (e.camera.yaw, e.camera.dist);
+        let n0 = e.sculptor.tri_count();
+        let n = e.voxel_remesh(&VoxelSettings { resolution: 48, smooth: 1, project: true }).unwrap();
+        assert_eq!(e.sculptor.tri_count(), n);
+        assert_eq!(e.sculptor.level_count(), 1);
+        assert_eq!((e.camera.yaw, e.camera.dist), (yaw, dist));
+        e.undo();
+        assert_eq!(e.sculptor.tri_count(), n0);
+        assert_eq!(e.sculptor.level_count(), 2);
     }
 
     #[test]
