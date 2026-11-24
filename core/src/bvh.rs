@@ -1,7 +1,7 @@
 //! Bounding volume hierarchy over triangles for fast ray picking.
 //! Built once per topology change and refitted cheaply after sculpting.
 
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, NONE};
 use glam::Vec3;
 
 #[derive(Clone, Copy)]
@@ -17,6 +17,9 @@ struct Node {
 pub struct Bvh {
     nodes: Vec<Node>,
     order: Vec<u32>,
+    /// Faces with index >= `indexed` were added after the build (dynamic
+    /// topology) and are tested by brute force until the next rebuild.
+    indexed: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,12 +34,15 @@ const LEAF_SIZE: usize = 4;
 
 impl Bvh {
     pub fn build(mesh: &Mesh) -> Self {
-        let nt = mesh.tris.len();
-        let mut order: Vec<u32> = (0..nt as u32).collect();
+        let mut order: Vec<u32> = (0..mesh.tris.len() as u32).filter(|&f| mesh.is_alive(f)).collect();
+        let nt = order.len();
         let centroids: Vec<Vec3> = mesh
             .tris
             .iter()
             .map(|t| {
+                if t[0] == NONE {
+                    return Vec3::ZERO;
+                }
                 (mesh.positions[t[0] as usize] + mesh.positions[t[1] as usize] + mesh.positions[t[2] as usize])
                     / 3.0
             })
@@ -71,7 +77,7 @@ impl Bvh {
             stack.push((left, start, mid));
             stack.push((left + 1, mid, end));
         }
-        let mut bvh = Bvh { nodes, order };
+        let mut bvh = Bvh { nodes, order, indexed: mesh.tris.len() };
         bvh.refit(mesh);
         bvh
     }
@@ -83,6 +89,9 @@ impl Bvh {
             let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             if n.count > 0 {
                 for &t in &self.order[n.first as usize..(n.first + n.count) as usize] {
+                    if !mesh.is_alive(t) {
+                        continue;
+                    }
                     for &v in &mesh.tris[t as usize] {
                         let p = mesh.positions[v as usize];
                         mn = mn.min(p);
@@ -100,15 +109,41 @@ impl Bvh {
         }
     }
 
+    /// Faces added since the build (tested by brute force).
+    pub fn unindexed(&self, mesh: &Mesh) -> usize {
+        mesh.tris.len().saturating_sub(self.indexed)
+    }
+
+    pub fn indexed(&self) -> usize {
+        self.indexed
+    }
+
     pub fn raycast(&self, mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
         if self.nodes.is_empty() || mesh.tris.is_empty() {
             return None;
         }
+        let mut best: Option<Hit> = None;
+        let mut best_t = f32::MAX;
+        let test = |t: u32, best: &mut Option<Hit>, best_t: &mut f32| {
+            let [a, b, c] = mesh.tris[t as usize];
+            if a == NONE {
+                return;
+            }
+            if let Some(tt) =
+                ray_tri(origin, dir, mesh.positions[a as usize], mesh.positions[b as usize], mesh.positions[c as usize])
+            {
+                if tt < *best_t {
+                    *best_t = tt;
+                    *best = Some(Hit { t: tt, tri: t, point: origin + dir * tt });
+                }
+            }
+        };
+        for t in self.indexed.min(mesh.tris.len())..mesh.tris.len() {
+            test(t as u32, &mut best, &mut best_t);
+        }
         // avoid 0 * inf = NaN in the slab test for axis-aligned rays
         let safe = |c: f32| if c.abs() < 1e-12 { 1e-12f32.copysign(c) } else { c };
         let inv = Vec3::ONE / Vec3::new(safe(dir.x), safe(dir.y), safe(dir.z));
-        let mut best: Option<Hit> = None;
-        let mut best_t = f32::MAX;
         let mut stack: Vec<u32> = Vec::with_capacity(64);
         stack.push(0);
         while let Some(ni) = stack.pop() {
@@ -119,19 +154,7 @@ impl Bvh {
             }
             if n.count > 0 {
                 for &t in &self.order[n.first as usize..(n.first + n.count) as usize] {
-                    let [a, b, c] = mesh.tris[t as usize];
-                    if let Some(tt) = ray_tri(
-                        origin,
-                        dir,
-                        mesh.positions[a as usize],
-                        mesh.positions[b as usize],
-                        mesh.positions[c as usize],
-                    ) {
-                        if tt < best_t {
-                            best_t = tt;
-                            best = Some(Hit { t: tt, tri: t, point: origin + dir * tt });
-                        }
-                    }
+                    test(t, &mut best, &mut best_t);
                 }
             } else {
                 stack.push(n.first);

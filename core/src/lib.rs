@@ -3,6 +3,7 @@
 
 pub mod bvh;
 pub mod camera;
+pub mod dyntopo;
 pub mod editor;
 pub mod io;
 pub mod mesh;

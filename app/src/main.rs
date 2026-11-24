@@ -42,6 +42,11 @@ struct Ui {
     intensity: RwSignal<[f32; Tool::ALL.len()]>,
     negative: RwSignal<bool>,
     symmetry: RwSignal<bool>,
+    dyntopo: RwSignal<bool>,
+    detail: RwSignal<f32>,
+    level: RwSignal<usize>,
+    level_count: RwSignal<usize>,
+    top_tris: RwSignal<usize>,
     view: RwSignal<ViewSettings>,
     fov: RwSignal<f32>,
     panel_right: RwSignal<bool>,
@@ -67,6 +72,11 @@ impl Ui {
             intensity: RwSignal::new(b.intensity),
             negative: RwSignal::new(b.negative),
             symmetry: RwSignal::new(b.symmetry),
+            dyntopo: RwSignal::new(b.dyntopo),
+            detail: RwSignal::new(b.detail),
+            level: RwSignal::new(0),
+            level_count: RwSignal::new(1),
+            top_tris: RwSignal::new(0),
             view: RwSignal::new(ViewSettings { material: 0, show_mask: true, flat: false, wireframe: false, background: 0 }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
@@ -88,12 +98,16 @@ impl Ui {
 
     /// Pulls mesh statistics and undo state from the engine.
     fn refresh(self) {
-        let (v, t, u, r) = with_ed(|e| {
-            (e.sculptor.mesh.vertex_count(), e.sculptor.tri_count(), e.sculptor.can_undo(), e.sculptor.can_redo())
+        let (v, t, u, r, lv, lc, top) = with_ed(|e| {
+            let s = &e.sculptor;
+            (s.mesh.vertex_count(), s.tri_count(), s.can_undo(), s.can_redo(), s.level(), s.level_count(), s.top_tri_count())
         });
         self.stats.set((v, t));
         self.can_undo.set(u);
         self.can_redo.set(r);
+        self.level.set(lv);
+        self.level_count.set(lc);
+        self.top_tris.set(top);
     }
 }
 
@@ -109,6 +123,9 @@ fn fmt_count(n: usize) -> String {
 
 // ----------------------------------------------------------------- actions
 
+// Some variants are only used inside view! closures, which rustc's
+// dead-code lint can't see through.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum Action {
     NewSphere,
@@ -120,6 +137,11 @@ enum Action {
     Undo,
     Redo,
     Subdivide,
+    LevelUp,
+    LevelDown,
+    DeleteLower,
+    DeleteHigher,
+    ToggleDyntopo,
     ClearMask,
     InvertMask,
     FrameMesh,
@@ -160,15 +182,28 @@ fn act(ui: Ui, a: Action) {
         }
         Action::Undo => with_ed(|e| e.undo()),
         Action::Redo => with_ed(|e| e.redo()),
-        Action::Subdivide => {
-            let r = with_ed(|e| {
-                let r = e.sculptor.subdivide();
-                e.redraw = true;
-                r
-            });
-            match r {
-                Ok(()) => ui.status.set(format!("Subdivided — {} triangles", fmt_count(with_ed(|e| e.sculptor.tri_count())))),
-                Err(e) => ui.status.set(e),
+        Action::Subdivide => match with_ed(|e| e.subdivide()) {
+            Ok(()) => {
+                let (lv, n) = with_ed(|e| (e.sculptor.level_count(), e.sculptor.tri_count()));
+                ui.status.set(format!("Added level {lv} — {} triangles", fmt_count(n)));
+            }
+            Err(e) => ui.status.set(e),
+        },
+        Action::LevelUp => with_ed(|e| e.set_level(e.sculptor.level() + 1)),
+        Action::LevelDown => with_ed(|e| e.set_level(e.sculptor.level().saturating_sub(1))),
+        Action::DeleteLower => {
+            with_ed(|e| e.delete_lower());
+            ui.status.set("Deleted the lower levels; this level is now the base".into());
+        }
+        Action::DeleteHigher => {
+            with_ed(|e| e.delete_higher());
+            ui.status.set("Deleted the higher levels".into());
+        }
+        Action::ToggleDyntopo => {
+            if ui.level_count.get_untracked() > 1 {
+                ui.status.set("Dynamic topology needs a single level: use Delete lower / Delete higher first".into());
+            } else {
+                ui.dyntopo.update(|d| *d = !*d);
             }
         }
         Action::ClearMask => with_ed(|e| {
@@ -461,10 +496,21 @@ fn Slider(
 }
 
 #[component]
-fn Check(label: &'static str, #[prop(into)] value: Signal<bool>, on_change: impl Fn(bool) + 'static) -> impl IntoView {
+fn Check(
+    label: &'static str,
+    #[prop(into)] value: Signal<bool>,
+    on_change: impl Fn(bool) + 'static,
+    #[prop(optional, into)] disabled: Option<Signal<bool>>,
+) -> impl IntoView {
+    let off = move || disabled.map(|d| d.get()).unwrap_or(false);
     view! {
-        <label class="row check">
-            <input type="checkbox" prop:checked=move || value.get() on:change=move |ev| on_change(event_target_checked(&ev)) />
+        <label class="row check" class:disabled=off>
+            <input
+                type="checkbox"
+                disabled=off
+                prop:checked=move || value.get()
+                on:change=move |ev| on_change(event_target_checked(&ev))
+            />
             <span>{label}</span>
         </label>
     }
@@ -558,7 +604,9 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"D C S F I P E G M"</td><td>"Brush tools"</td></tr>
                         <tr><td>"[  ]"</td><td>"Brush radius"</td></tr>
                         <tr><td>"X / W / N"</td><td>"Symmetry / wireframe / negative"</td></tr>
-                        <tr><td>"Ctrl+D"</td><td>"Subdivide"</td></tr>
+                        <tr><td>"Ctrl+D"</td><td>"Subdivide (add a level)"</td></tr>
+                        <tr><td>"Page Up / Page Down"</td><td>"Higher / lower level"</td></tr>
+                        <tr><td>"T"</td><td>"Dynamic topology on/off"</td></tr>
                     </table>
                     <p class="about">"Clayform — a SculptGL-style sculpting app (Tauri + Leptos)."</p>
                 </div>
@@ -578,8 +626,13 @@ fn MenuBar(ui: Ui) -> impl IntoView {
 #[component]
 fn SidePanel(ui: Ui) -> impl IntoView {
     let intensity = Signal::derive(move || ui.intensity.get()[ui.tool.get().index()]);
-    let too_dense = move || ui.stats.get().1 * 4 > MAX_TRIANGLES;
-    let subdiv_label = move || format!("Subdivide  ({} tris)", fmt_count(ui.stats.get().1 * 4));
+    let too_dense = move || ui.top_tris.get() * 4 > MAX_TRIANGLES;
+    let subdiv_label = move || {
+        format!("Subdivide → level {}  ({} tris)", ui.level_count.get() + 1, fmt_count(ui.top_tris.get() * 4))
+    };
+    let multi = Signal::derive(move || ui.level_count.get() > 1);
+    // (comparisons stay outside view!: a bare `>` in an attribute ends the tag)
+    let at_top = move || ui.level.get() + 1 >= ui.level_count.get();
     view! {
         <aside class="panel">
             <Folder title="Sculpting">
@@ -632,12 +685,55 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                 />
             </Folder>
             <Folder title="Topology">
+                <div class="subhead">"Multiresolution"</div>
+                <div class="row">
+                    <span class="label">"Level"</span>
+                    <div class="stepper">
+                        <button
+                            title="Lower level  (Page Down)"
+                            disabled=move || ui.level.get() == 0
+                            on:click=move |_| act(ui, Action::LevelDown)
+                        >"◀"</button>
+                        <span class="level">{move || format!("{} of {}", ui.level.get() + 1, ui.level_count.get())}</span>
+                        <button
+                            title="Higher level  (Page Up)"
+                            disabled=at_top
+                            on:click=move |_| act(ui, Action::LevelUp)
+                        >"▶"</button>
+                    </div>
+                </div>
+                <div class="row buttons">
+                    <button disabled=too_dense on:click=move |_| act(ui, Action::Subdivide)>{subdiv_label}</button>
+                </div>
                 <div class="row buttons">
                     <button
-                        disabled=too_dense
-                        on:click=move |_| act(ui, Action::Subdivide)
-                    >{subdiv_label}</button>
+                        title="Make this level the lowest one"
+                        disabled=move || ui.level.get() == 0
+                        on:click=move |_| act(ui, Action::DeleteLower)
+                    >"Delete lower"</button>
+                    <button
+                        title="Remove the levels above this one"
+                        disabled=at_top
+                        on:click=move |_| act(ui, Action::DeleteHigher)
+                    >"Delete higher"</button>
                 </div>
+                <div class="subhead">"Dynamic topology"</div>
+                <Check
+                    label="Dynamic topology  (T)"
+                    value=ui.dyntopo
+                    on_change=move |v| ui.dyntopo.set(v)
+                    disabled=multi
+                />
+                <Slider
+                    label="Detail"
+                    min=0.0 max=1.0 step=0.01
+                    value=ui.detail
+                    on_change=move |v| ui.detail.set(v)
+                    format=|v| format!("{:.0}%", v * 100.0)
+                />
+                <Show when=move || multi.get()>
+                    <div class="hint">"Works on a single level. Use Delete lower / Delete higher to merge the levels first."</div>
+                </Show>
                 <div class="row info">
                     {move || {
                         let (v, t) = ui.stats.get();
@@ -731,6 +827,9 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "3" => act(ui, Action::View(ViewDir::Right)),
             "7" => act(ui, Action::View(ViewDir::Top)),
             "escape" => ui.menu.set(None),
+            "pageup" => act(ui, Action::LevelUp),
+            "pagedown" => act(ui, Action::LevelDown),
+            "t" => act(ui, Action::ToggleDyntopo),
             _ => {
                 if let Some(t) = Tool::ALL.iter().find(|t| t.shortcut().to_ascii_lowercase().to_string() == k) {
                     ui.tool.set(*t);
@@ -758,6 +857,8 @@ fn App() -> impl IntoView {
             intensity: ui.intensity.get(),
             negative: ui.negative.get(),
             symmetry: ui.symmetry.get(),
+            dyntopo: ui.dyntopo.get(),
+            detail: ui.detail.get(),
         };
         with_ed(|e| e.brush = brush);
     });
@@ -802,6 +903,16 @@ fn App() -> impl IntoView {
                 <span>{move || {
                     let t = ui.tool.get();
                     format!("{}{}", t.name(), if ui.symmetry.get() { " · Sym X" } else { "" })
+                }}</span>
+                <span class="sep">"|"</span>
+                <span>{move || {
+                    if ui.level_count.get() > 1 {
+                        format!("Level {} of {}", ui.level.get() + 1, ui.level_count.get())
+                    } else if ui.dyntopo.get() {
+                        format!("Dynamic topology · detail {:.0}%", ui.detail.get() * 100.0)
+                    } else {
+                        "1 level".to_string()
+                    }
                 }}</span>
                 <span class="sep">"|"</span>
                 <span class="msg">{move || ui.status.get()}</span>

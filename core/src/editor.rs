@@ -13,6 +13,10 @@ pub struct Brush {
     pub intensity: [f32; Tool::ALL.len()],
     pub negative: bool,
     pub symmetry: bool,
+    /// Dynamic topology on/off (only applies with a single level).
+    pub dyntopo: bool,
+    /// Dynamic-topology detail, 0 (coarse) to 1 (fine).
+    pub detail: f32,
 }
 
 impl Default for Brush {
@@ -23,6 +27,8 @@ impl Default for Brush {
             intensity: Tool::ALL.map(|t| t.default_intensity()),
             negative: false,
             symmetry: true,
+            dyntopo: false,
+            detail: 0.7,
         }
     }
 }
@@ -116,6 +122,42 @@ impl Editor {
         let t = self.effective_tool(mods);
         let neg = if self.drag == Drag::Sculpt { self.stroke_negative } else { self.brush.negative ^ mods.ctrl };
         neg && t.has_negative()
+    }
+
+    /// Whether strokes currently change topology.
+    pub fn dyntopo_active(&self) -> bool {
+        self.brush.dyntopo && self.sculptor.dyntopo_allowed()
+    }
+
+    /// Target edge length as a fraction of the brush radius: 35 % at
+    /// detail 0 down to 3 % at detail 1 (exponential, so the slider feels even).
+    pub fn detail_ratio(detail: f32) -> f32 {
+        0.35 * (0.03f32 / 0.35).powf(detail.clamp(0.0, 1.0))
+    }
+
+    pub fn set_level(&mut self, level: usize) {
+        self.cancel_drag();
+        self.sculptor.set_level(level);
+        self.redraw = true;
+    }
+
+    pub fn subdivide(&mut self) -> Result<(), String> {
+        self.cancel_drag();
+        let r = self.sculptor.subdivide();
+        self.redraw = true;
+        r
+    }
+
+    pub fn delete_lower(&mut self) {
+        self.cancel_drag();
+        self.sculptor.delete_lower();
+        self.redraw = true;
+    }
+
+    pub fn delete_higher(&mut self) {
+        self.cancel_drag();
+        self.sculptor.delete_higher();
+        self.redraw = true;
     }
 
     pub fn set_mesh(&mut self, m: Mesh) {
@@ -241,6 +283,7 @@ impl Editor {
             intensity: self.brush.intensity[self.stroke_tool.index()],
             negative: self.stroke_negative,
             seed_tri: h.tri,
+            detail: self.dyntopo_active().then(|| r * Self::detail_ratio(self.brush.detail)),
         };
         self.sculptor.dab(&params);
         if self.brush.symmetry {
@@ -258,7 +301,7 @@ impl Editor {
         let Some(h) = self.sculptor.raycast(o, d) else { return false };
         self.stroke_tool = if mods.shift && self.brush.tool != Tool::Mask { Tool::Smooth } else { self.brush.tool };
         self.stroke_negative = self.brush.negative ^ mods.ctrl;
-        self.sculptor.begin_stroke();
+        self.sculptor.begin_stroke(self.dyntopo_active());
         if self.stroke_tool == Tool::Grab {
             let r = self.brush.radius_px * self.camera.world_per_point(h.point, size.y);
             self.sculptor.grab_begin(h.point, r, h.tri, false);
@@ -344,6 +387,22 @@ mod tests {
         e.undo();
         e.sculptor.refresh_bvh();
         assert!((hit_depth(&e) - before).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dynamic_topology_stroke_refines_mesh() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(3));
+        e.view_from(ViewDir::Front);
+        e.brush.dyntopo = true;
+        e.brush.detail = 1.0;
+        let n0 = e.sculptor.tri_count();
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        for i in 1..=10 {
+            e.pointer_move(SIZE * 0.5 + Vec2::X * (i as f32 * 6.0), SIZE);
+        }
+        e.pointer_up();
+        assert!(e.sculptor.tri_count() > n0 + 200, "{n0} -> {}", e.sculptor.tri_count());
     }
 
     #[test]

@@ -1,8 +1,16 @@
-//! Triangle mesh with compact (CSR) adjacency, normals, mask, and
-//! subdivision / primitive generation.
+//! Triangle mesh with editable connectivity (per-vertex face and neighbour
+//! rings), normals, mask, subdivision stencils and primitive generation.
+//!
+//! Dynamic topology may leave dead faces (`DEAD`) and orphan vertices behind
+//! while a stroke is in progress; `compact()` removes them afterwards.
 
 use glam::Vec3;
 use std::collections::HashMap;
+
+/// Marks a deleted face in `Mesh::tris` until the next `compact()`.
+pub const DEAD: [u32; 3] = [u32::MAX; 3];
+/// "No vertex" in a subdivision stencil (boundary edge).
+pub const NONE: u32 = u32::MAX;
 
 #[derive(Clone)]
 pub struct Mesh {
@@ -11,10 +19,8 @@ pub struct Mesh {
     pub mask: Vec<f32>,
     pub tris: Vec<[u32; 3]>,
     pub face_normals: Vec<Vec3>,
-    nbr_off: Vec<u32>,
-    nbr: Vec<u32>,
-    vf_off: Vec<u32>,
-    vf: Vec<u32>,
+    vf: Vec<Vec<u32>>,
+    nbr: Vec<Vec<u32>>,
     pub boundary: Vec<bool>,
     /// Imported meshes are normalised into a unit-ish volume for sculpting.
     /// Exported positions are `p / export_scale + export_center`.
@@ -32,28 +38,35 @@ impl Marker {
     pub fn new() -> Self {
         Self { marks: Vec::new(), cur: 1 }
     }
+    /// Starts a new generation covering indices `0..n` (grows as needed).
     pub fn begin(&mut self, n: usize) {
-        if self.marks.len() != n {
-            self.marks = vec![0; n];
+        if self.marks.len() < n {
+            self.marks.resize(n, 0);
+        }
+        self.cur = self.cur.wrapping_add(1);
+        if self.cur == 0 {
+            self.marks.iter_mut().for_each(|m| *m = 0);
             self.cur = 1;
-        } else {
-            self.cur = self.cur.wrapping_add(1);
-            if self.cur == 0 {
-                self.marks.iter_mut().for_each(|m| *m = 0);
-                self.cur = 1;
-            }
         }
     }
     /// Returns true when `i` was not yet marked in this generation.
     #[inline]
     pub fn mark(&mut self, i: u32) -> bool {
-        let m = &mut self.marks[i as usize];
+        let i = i as usize;
+        if i >= self.marks.len() {
+            self.marks.resize(i + 1, 0);
+        }
+        let m = &mut self.marks[i];
         if *m == self.cur {
             false
         } else {
             *m = self.cur;
             true
         }
+    }
+    #[inline]
+    pub fn is_marked(&self, i: u32) -> bool {
+        self.marks.get(i as usize).is_some_and(|m| *m == self.cur)
     }
 }
 
@@ -72,10 +85,8 @@ impl Mesh {
             face_normals: vec![Vec3::Y; tris.len()],
             positions,
             tris,
-            nbr_off: Vec::new(),
-            nbr: Vec::new(),
-            vf_off: Vec::new(),
             vf: Vec::new(),
+            nbr: Vec::new(),
             boundary: Vec::new(),
             export_center: Vec3::ZERO,
             export_scale: 1.0,
@@ -100,11 +111,7 @@ impl Mesh {
             let mut idx = [0u32; 3];
             for k in 0..3 {
                 let p = t[k];
-                let key = [
-                    (p.x / eps).round() as i64,
-                    (p.y / eps).round() as i64,
-                    (p.z / eps).round() as i64,
-                ];
+                let key = [(p.x / eps).round() as i64, (p.y / eps).round() as i64, (p.z / eps).round() as i64];
                 idx[k] = *map.entry(key).or_insert_with(|| {
                     positions.push(p);
                     (positions.len() - 1) as u32
@@ -121,102 +128,183 @@ impl Mesh {
         self.positions.len()
     }
 
+    /// Number of live triangles.
+    pub fn live_tri_count(&self) -> usize {
+        self.tris.iter().filter(|t| t[0] != NONE).count()
+    }
+
+    #[inline]
+    pub fn is_alive(&self, f: u32) -> bool {
+        self.tris[f as usize][0] != NONE
+    }
+
     #[inline]
     pub fn neighbors(&self, v: u32) -> &[u32] {
-        let v = v as usize;
-        &self.nbr[self.nbr_off[v] as usize..self.nbr_off[v + 1] as usize]
+        &self.nbr[v as usize]
     }
 
     #[inline]
     pub fn vert_faces(&self, v: u32) -> &[u32] {
-        let v = v as usize;
-        &self.vf[self.vf_off[v] as usize..self.vf_off[v + 1] as usize]
+        &self.vf[v as usize]
     }
 
     fn build_topology(&mut self) {
         let n = self.positions.len();
-        // vertex -> faces
-        let mut counts = vec![0u32; n + 1];
-        for t in &self.tris {
-            for &v in t {
-                counts[v as usize + 1] += 1;
-            }
-        }
-        for i in 0..n {
-            counts[i + 1] += counts[i];
-        }
-        let mut fill = counts.clone();
-        let mut vf = vec![0u32; self.tris.len() * 3];
+        self.vf = vec![Vec::new(); n];
         for (fi, t) in self.tris.iter().enumerate() {
+            if t[0] == NONE {
+                continue;
+            }
             for &v in t {
-                vf[fill[v as usize] as usize] = fi as u32;
-                fill[v as usize] += 1;
+                self.vf[v as usize].push(fi as u32);
             }
         }
-        self.vf_off = counts;
-        self.vf = vf;
-
-        // vertex -> one-ring neighbours, boundary flags
-        let mut nbr_off = Vec::with_capacity(n + 1);
-        let mut nbr = Vec::with_capacity(self.tris.len() * 3);
-        let mut boundary = vec![false; n];
-        let mut tmp: Vec<u32> = Vec::with_capacity(32);
-        nbr_off.push(0u32);
+        self.nbr = vec![Vec::new(); n];
+        self.boundary = vec![false; n];
+        let mut tmp = Vec::with_capacity(32);
         for v in 0..n as u32 {
-            tmp.clear();
-            for &f in self.vert_faces(v) {
-                for &u in &self.tris[f as usize] {
-                    if u != v {
-                        tmp.push(u);
-                    }
-                }
-            }
-            // every interior edge appears exactly twice; boundary edges once
-            tmp.sort_unstable();
-            let mut i = 0;
-            while i < tmp.len() {
-                let mut j = i + 1;
-                while j < tmp.len() && tmp[j] == tmp[i] {
-                    j += 1;
-                }
-                if j - i == 1 {
-                    boundary[v as usize] = true;
-                }
-                nbr.push(tmp[i]);
-                i = j;
-            }
-            nbr_off.push(nbr.len() as u32);
+            self.rebuild_ring_with(v, &mut tmp);
         }
-        self.nbr_off = nbr_off;
-        self.nbr = nbr;
-        self.boundary = boundary;
     }
 
-    fn edge_face_count(&self, a: u32, b: u32) -> usize {
-        self.vert_faces(a)
+    /// Recomputes the neighbour list and boundary flag of `v` from its faces.
+    pub fn rebuild_ring(&mut self, v: u32) {
+        let mut tmp = Vec::with_capacity(16);
+        self.rebuild_ring_with(v, &mut tmp);
+    }
+
+    fn rebuild_ring_with(&mut self, v: u32, tmp: &mut Vec<u32>) {
+        tmp.clear();
+        for &f in &self.vf[v as usize] {
+            for &u in &self.tris[f as usize] {
+                if u != v {
+                    tmp.push(u);
+                }
+            }
+        }
+        // every interior edge appears exactly twice; boundary edges once
+        tmp.sort_unstable();
+        let ring = &mut self.nbr[v as usize];
+        ring.clear();
+        let mut boundary = false;
+        let mut i = 0;
+        while i < tmp.len() {
+            let mut j = i + 1;
+            while j < tmp.len() && tmp[j] == tmp[i] {
+                j += 1;
+            }
+            if j - i == 1 {
+                boundary = true;
+            }
+            ring.push(tmp[i]);
+            i = j;
+        }
+        self.boundary[v as usize] = boundary;
+    }
+
+    pub fn edge_face_count(&self, a: u32, b: u32) -> usize {
+        self.vert_faces(a).iter().filter(|&&f| self.tris[f as usize].contains(&b)).count()
+    }
+
+    // ------------------------------------------------- editing primitives
+
+    /// Appends a vertex with no faces; returns its index.
+    pub fn add_vertex(&mut self, p: Vec3, n: Vec3, mask: f32) -> u32 {
+        self.positions.push(p);
+        self.normals.push(n);
+        self.mask.push(mask);
+        self.vf.push(Vec::new());
+        self.nbr.push(Vec::new());
+        self.boundary.push(false);
+        (self.positions.len() - 1) as u32
+    }
+
+    /// Appends a face and registers it with its vertices; returns its index.
+    pub fn add_face(&mut self, t: [u32; 3]) -> u32 {
+        let f = self.tris.len() as u32;
+        self.tris.push(t);
+        self.face_normals.push(Vec3::ZERO);
+        for &v in &t {
+            self.vf[v as usize].push(f);
+        }
+        f
+    }
+
+    /// Replaces the corners of a live face, keeping vertex→face lists right.
+    pub fn set_face(&mut self, f: u32, t: [u32; 3]) {
+        let old = self.tris[f as usize];
+        for &v in &old {
+            if !t.contains(&v) {
+                self.vf[v as usize].retain(|&x| x != f);
+            }
+        }
+        for &v in &t {
+            if !old.contains(&v) {
+                self.vf[v as usize].push(f);
+            }
+        }
+        self.tris[f as usize] = t;
+    }
+
+    /// Deletes a face (it stays as `DEAD` until `compact()`).
+    pub fn kill_face(&mut self, f: u32) {
+        let old = self.tris[f as usize];
+        if old[0] == NONE {
+            return;
+        }
+        for &v in &old {
+            self.vf[v as usize].retain(|&x| x != f);
+        }
+        self.tris[f as usize] = DEAD;
+    }
+
+    /// Removes dead faces and vertices without faces, renumbering the rest.
+    /// Returns false when there was nothing to remove.
+    pub fn compact(&mut self) -> bool {
+        let dead_faces = self.tris.iter().any(|t| t[0] == NONE);
+        let orphans = self.vf.iter().any(|f| f.is_empty());
+        if !dead_faces && !orphans {
+            return false;
+        }
+        let mut remap = vec![NONE; self.positions.len()];
+        let mut positions = Vec::with_capacity(self.positions.len());
+        let mut mask = Vec::with_capacity(self.positions.len());
+        for t in self.tris.iter().filter(|t| t[0] != NONE) {
+            for &v in t {
+                if remap[v as usize] == NONE {
+                    remap[v as usize] = positions.len() as u32;
+                    positions.push(self.positions[v as usize]);
+                    mask.push(self.mask[v as usize]);
+                }
+            }
+        }
+        let tris: Vec<[u32; 3]> = self
+            .tris
             .iter()
-            .filter(|&&f| self.tris[f as usize].contains(&b))
-            .count()
+            .filter(|t| t[0] != NONE)
+            .map(|t| [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]])
+            .collect();
+        let (c, s) = (self.export_center, self.export_scale);
+        *self = Mesh::new(positions, tris);
+        self.mask = mask;
+        self.export_center = c;
+        self.export_scale = s;
+        true
     }
 
     #[inline]
-    fn face_normal_raw(&self, f: usize) -> Vec3 {
+    pub fn face_normal_raw(&self, f: usize) -> Vec3 {
         let [a, b, c] = self.tris[f];
-        let (pa, pb, pc) = (
-            self.positions[a as usize],
-            self.positions[b as usize],
-            self.positions[c as usize],
-        );
+        if a == NONE {
+            return Vec3::ZERO;
+        }
+        let (pa, pb, pc) = (self.positions[a as usize], self.positions[b as usize], self.positions[c as usize]);
         (pb - pa).cross(pc - pa)
     }
 
     pub fn compute_all_normals(&mut self) {
-        if self.face_normals.len() != self.tris.len() {
-            self.face_normals = vec![Vec3::Y; self.tris.len()];
-        }
-        if self.normals.len() != self.positions.len() {
-            self.normals = vec![Vec3::Y; self.positions.len()];
-        }
+        self.face_normals.resize(self.tris.len(), Vec3::Y);
+        self.normals.resize(self.positions.len(), Vec3::Y);
         for f in 0..self.tris.len() {
             self.face_normals[f] = self.face_normal_raw(f);
         }
@@ -264,9 +352,15 @@ impl Mesh {
     pub fn bounds(&self) -> (Vec3, Vec3) {
         let mut mn = Vec3::splat(f32::MAX);
         let mut mx = Vec3::splat(f32::MIN);
-        for p in &self.positions {
+        for (v, p) in self.positions.iter().enumerate() {
+            if self.vf[v].is_empty() {
+                continue;
+            }
             mn = mn.min(*p);
             mx = mx.max(*p);
+        }
+        if mn.x > mx.x {
+            return (Vec3::splat(-1.0), Vec3::splat(1.0));
         }
         (mn, mx)
     }
@@ -286,19 +380,32 @@ impl Mesh {
         self.compute_all_normals();
     }
 
-    /// One level of subdivision. `smooth = true` is Loop subdivision,
-    /// `false` splits every triangle into four without moving anything.
-    pub fn subdivide(&self, smooth: bool) -> Mesh {
-        let n = self.positions.len();
-        let mut new_pos: Vec<Vec3> = Vec::with_capacity(n + self.tris.len() * 3 / 2 + 8);
-        let mut new_mask: Vec<f32> = Vec::with_capacity(new_pos.capacity());
+    /// Local frame (tangent, bitangent, normal) at `v`, used to store
+    /// multiresolution detail so it follows the surface.
+    pub fn frame(&self, v: u32) -> (Vec3, Vec3, Vec3) {
+        let n = self.normals[v as usize];
+        let p = self.positions[v as usize];
+        let mut t = Vec3::ZERO;
+        if let Some(&u) = self.neighbors(v).first() {
+            t = self.positions[u as usize] - p;
+            t -= n * t.dot(n);
+        }
+        let t = t.try_normalize().unwrap_or_else(|| n.any_orthonormal_vector());
+        (t, n.cross(t), n)
+    }
 
-        // even (original) vertices
+    // ---------------------------------------------------------- subdivision
+
+    /// Positions of the next finer level from this mesh's positions:
+    /// Loop rules for original (even) vertices, then one entry per `odd`
+    /// stencil `[a, b, c, d]` (edge a-b, opposite corners c and d; d = NONE
+    /// on a boundary).
+    pub fn loop_positions(&self, odd: &[[u32; 4]]) -> Vec<Vec3> {
+        let n = self.positions.len();
+        let mut out = Vec::with_capacity(n + odd.len());
         for v in 0..n as u32 {
             let p = self.positions[v as usize];
-            let np = if !smooth {
-                p
-            } else if self.boundary[v as usize] {
+            let np = if self.boundary[v as usize] {
                 let mut bsum = Vec3::ZERO;
                 let mut bc = 0;
                 for &u in self.neighbors(v) {
@@ -311,7 +418,7 @@ impl Mesh {
             } else {
                 let nb = self.neighbors(v);
                 let k = nb.len() as f32;
-                if k < 3.0 {
+                if nb.len() < 3 {
                     p
                 } else {
                     let beta = if nb.len() == 3 { 3.0 / 16.0 } else { 3.0 / (8.0 * k) };
@@ -319,64 +426,71 @@ impl Mesh {
                     p * (1.0 - k * beta) + sum * beta
                 }
             };
-            new_pos.push(np);
-            new_mask.push(self.mask[v as usize]);
+            out.push(np);
         }
+        for &[a, b, c, d] in odd {
+            let pa = self.positions[a as usize];
+            let pb = self.positions[b as usize];
+            out.push(if d != NONE {
+                (pa + pb) * 0.375 + (self.positions[c as usize] + self.positions[d as usize]) * 0.125
+            } else {
+                (pa + pb) * 0.5
+            });
+        }
+        out
+    }
 
-        // odd (edge) vertices
-        struct EdgeAcc {
-            idx: u32,
-            opp_sum: Vec3,
-            opp_count: u32,
-        }
-        let mut edges: HashMap<(u32, u32), EdgeAcc> = HashMap::with_capacity(self.tris.len() * 3 / 2);
-        let mut edge_list: Vec<(u32, u32)> = Vec::with_capacity(self.tris.len() * 3 / 2);
-        let mut face_mid = Vec::with_capacity(self.tris.len());
-        for t in &self.tris {
+    /// One level of subdivision. `smooth = true` is Loop subdivision,
+    /// `false` splits every triangle into four without moving anything.
+    pub fn subdivide(&self, smooth: bool) -> Mesh {
+        self.subdivide_with_stencil(smooth).0
+    }
+
+    /// Like `subdivide`, also returning the odd-vertex stencils so later
+    /// position updates (multiresolution) don't need to rebuild topology.
+    pub fn subdivide_with_stencil(&self, smooth: bool) -> (Mesh, Vec<[u32; 4]>) {
+        let n = self.positions.len() as u32;
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(self.tris.len() * 3 / 2);
+        let mut odd: Vec<[u32; 4]> = Vec::with_capacity(self.tris.len() * 3 / 2);
+        let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
+        for t in self.tris.iter().filter(|t| t[0] != NONE) {
             let mut mids = [0u32; 3];
             for e in 0..3 {
                 let a = t[e];
                 let b = t[(e + 1) % 3];
                 let c = t[(e + 2) % 3];
                 let key = (a.min(b), a.max(b));
-                let next = (n + edge_list.len()) as u32;
-                let acc = edges.entry(key).or_insert_with(|| {
-                    edge_list.push(key);
-                    EdgeAcc { idx: next, opp_sum: Vec3::ZERO, opp_count: 0 }
+                let idx = *edges.entry(key).or_insert_with(|| {
+                    odd.push([key.0, key.1, c, NONE]);
+                    n + odd.len() as u32 - 1
                 });
-                acc.opp_sum += self.positions[c as usize];
-                acc.opp_count += 1;
-                mids[e] = acc.idx;
+                let s = &mut odd[(idx - n) as usize];
+                if s[2] != c {
+                    s[3] = c;
+                }
+                mids[e] = idx;
             }
-            face_mid.push(mids);
-        }
-        for key in &edge_list {
-            let acc = &edges[key];
-            let pa = self.positions[key.0 as usize];
-            let pb = self.positions[key.1 as usize];
-            let p = if smooth && acc.opp_count == 2 {
-                (pa + pb) * 0.375 + acc.opp_sum * 0.125
-            } else {
-                (pa + pb) * 0.5
-            };
-            new_pos.push(p);
-            new_mask.push((self.mask[key.0 as usize] + self.mask[key.1 as usize]) * 0.5);
-        }
-
-        let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
-        for (t, m) in self.tris.iter().zip(face_mid.iter()) {
             let [a, b, c] = *t;
-            let [ab, bc, ca] = *m;
+            let [ab, bc, ca] = mids;
             new_tris.push([a, ab, ca]);
             new_tris.push([ab, b, bc]);
             new_tris.push([ca, bc, c]);
             new_tris.push([ab, bc, ca]);
         }
-        let mut out = Mesh::new(new_pos, new_tris);
-        out.mask = new_mask;
+        let positions = if smooth {
+            self.loop_positions(&odd)
+        } else {
+            let mut p = self.positions.clone();
+            p.extend(odd.iter().map(|s| (self.positions[s[0] as usize] + self.positions[s[1] as usize]) * 0.5));
+            p
+        };
+        let mut mask = self.mask.clone();
+        mask.extend(odd.iter().map(|s| (self.mask[s[0] as usize] + self.mask[s[1] as usize]) * 0.5));
+        let mut out = Mesh::new(positions, new_tris);
+        out.mask = mask;
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;
-        out
+        (out, odd)
     }
 
     // ---------------------------------------------------------------- primitives
@@ -480,6 +594,27 @@ mod tests {
         let (mn, mx) = s.bounds();
         assert!(mx.x < 0.8 && mn.x > -0.8);
         assert!(s.boundary.iter().all(|b| !b));
+    }
+
+    #[test]
+    fn stencil_positions_match_subdivision() {
+        let c = Mesh::cube(1);
+        let (fine, odd) = c.subdivide_with_stencil(true);
+        let p = c.loop_positions(&odd);
+        assert_eq!(p.len(), fine.positions.len());
+        assert!(p.iter().zip(&fine.positions).all(|(a, b)| (*a - *b).length() < 1e-6));
+    }
+
+    #[test]
+    fn kill_and_compact() {
+        let mut m = Mesh::icosphere(1);
+        let n = m.tris.len();
+        m.kill_face(0);
+        assert_eq!(m.live_tri_count(), n - 1);
+        assert!(m.compact());
+        assert_eq!(m.tris.len(), n - 1);
+        assert!(m.boundary.iter().any(|b| *b));
+        assert!(!m.compact());
     }
 
     #[test]

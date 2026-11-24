@@ -2,7 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use clayform_core::glam::Mat4;
-use clayform_core::mesh::Mesh;
+use clayform_core::mesh::{Mesh, NONE};
 use clayform_core::sculpt::GpuDirty;
 use std::collections::HashSet;
 use web_sys::HtmlCanvasElement;
@@ -73,6 +73,7 @@ pub struct Renderer {
     edge_count: u32,
     edges_stale: bool,
     staging: Vec<GpuVertex>,
+    index_staging: Vec<u32>,
     targets: Option<Targets>,
     pub adapter_name: String,
 }
@@ -255,6 +256,7 @@ impl Renderer {
             edge_count: 0,
             edges_stale: true,
             staging: Vec::new(),
+            index_staging: Vec::new(),
             targets: None,
         })
     }
@@ -296,25 +298,41 @@ impl Renderer {
             _pad: 0.0,
         };
         if dirty.topology || self.vbuf.is_none() {
-            self.staging = (0..n).map(to_gpu).collect();
-            let vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("vertices"),
-                size: (n.max(1) * std::mem::size_of::<GpuVertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&self.staging));
-            let flat: &[u32] = bytemuck::cast_slice(&mesh.tris);
-            let ibuf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("indices"),
-                size: (flat.len().max(1) * 4) as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.queue.write_buffer(&ibuf, 0, bytemuck::cast_slice(flat));
-            self.vbuf = Some(vbuf);
-            self.ibuf = Some(ibuf);
-            self.index_count = flat.len() as u32;
+            // Dynamic topology re-uploads every frame while sculpting, so
+            // buffers grow with headroom and are reused when big enough.
+            self.staging.clear();
+            self.staging.extend((0..n).map(to_gpu));
+            self.index_staging.clear();
+            for t in &mesh.tris {
+                if t[0] != NONE {
+                    self.index_staging.extend_from_slice(t);
+                }
+            }
+            let vbytes = (self.staging.len().max(1) * std::mem::size_of::<GpuVertex>()) as u64;
+            if self.vbuf.as_ref().is_none_or(|b| b.size() < vbytes) {
+                self.vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("vertices"),
+                    size: vbytes + vbytes / 2,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let ibytes = (self.index_staging.len().max(3) * 4) as u64;
+            if self.ibuf.as_ref().is_none_or(|b| b.size() < ibytes) {
+                self.ibuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("indices"),
+                    size: (ibytes + ibytes / 2 + 3) & !3,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if !self.staging.is_empty() {
+                self.queue.write_buffer(self.vbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.staging));
+            }
+            if !self.index_staging.is_empty() {
+                self.queue.write_buffer(self.ibuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.index_staging));
+            }
+            self.index_count = self.index_staging.len() as u32;
             self.edges_stale = true;
             dirty.topology = false;
             dirty.range = None;
@@ -329,7 +347,7 @@ impl Renderer {
         if need_edges && self.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);
             let mut edges: Vec<u32> = Vec::with_capacity(mesh.tris.len() * 3);
-            for t in &mesh.tris {
+            for t in mesh.tris.iter().filter(|t| t[0] != NONE) {
                 for k in 0..3 {
                     let (a, b) = (t[k], t[(k + 1) % 3]);
                     if seen.insert((a.min(b), a.max(b))) {

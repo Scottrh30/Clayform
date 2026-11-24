@@ -13,7 +13,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
   sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
   (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
 - **Side-panel folders** (click a title to fold it): **Sculpting** (tool dropdown, radius, intensity, negative,
-  symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (subdivide, mesh statistics),
+  symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, mesh statistics),
   **Rendering** (material dropdown, flat shading, wireframe) and **Interface** (panel side).
 - The side panel docks on the **left or right** of the viewport. Use the **Panel left / Panel right** button in the
   top bar, or **Interface › Panel side**. Your choice is remembered.
@@ -23,7 +23,15 @@ Like SculptGL, the functions are grouped into dropdown areas:
 - **Brushes:** Draw, Clay, Smooth, Flatten, Inflate, Pinch, Crease, Grab and Mask, each with its own radius and
   intensity. Hold Ctrl to invert a brush and Shift to smooth.
 - **X symmetry**, with a second cursor showing where the mirrored stroke lands.
-- **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke and mesh change.
+- **Dynamic topology** (like SculptGL's dynamic mode or ZBrush's Sculptris Pro): long edges under the brush are
+  split and short ones collapsed, so detail appears only where you sculpt. **Detail** sets triangle size relative to
+  the brush (35 % of the radius at 0 down to 3 % at 100 %). Turn it on and off with `T`.
+- **Multiresolution levels** (like ZBrush subdivision levels): **Subdivide** adds a smoother level above the
+  highest one. Step down to rework big shapes and back up without losing fine detail. Detail is stored in each
+  vertex's local frame, so it follows big-shape changes. **Delete lower** and **Delete higher** merge levels.
+  Dynamic topology needs a single level, as in ZBrush.
+- **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
+  mesh change.
 - **Import/export** OBJ and STL. Imported meshes are rescaled for sculpting and exported at their original scale.
 - **Viewport:** WebGL 2 through wgpu, 4× MSAA, six procedural matcaps, wireframe and flat shading.
 
@@ -41,7 +49,9 @@ Like SculptGL, the functions are grouped into dropdown areas:
 | `[` `]` | Brush radius |
 | `X` / `W` / `N` | Toggle symmetry / wireframe / negative |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo / redo |
-| Ctrl+D | Subdivide |
+| Ctrl+D | Subdivide (add a level) |
+| Page Up / Page Down | Higher / lower level |
+| `T` | Dynamic topology on/off |
 | Ctrl+O / Ctrl+S | Import / export OBJ |
 | Home | Frame mesh |
 | `1` `3` `7` (Ctrl for the opposite side) | Front, right, top views |
@@ -64,7 +74,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: meshes, subdivision, picking, brushes, strokes, undo, symmetry, OBJ/STL).
+Tests: `cargo test` (engine: meshes, subdivision, dynamic topology, multiresolution, picking, brushes, strokes, undo, symmetry, OBJ/STL).
 
 ## Windows build
 
@@ -78,4 +88,4 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Dynamic topology (Sculptris-style local remeshing), multiresolution levels, voxel remesh, alpha/stamp textures, layers, vertex painting, and a lasso mask.
+Voxel remesh (DynaMesh-style), ZRemesher-style retopology, alpha/stamp textures, layers, vertex painting, and a lasso mask.

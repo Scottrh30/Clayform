@@ -1,6 +1,7 @@
 //! Sculpting engine: brushes, strokes, symmetry helpers and undo/redo.
 
 use crate::bvh::{Bvh, Hit};
+use crate::dyntopo::remesh_region;
 use crate::mesh::{Marker, Mesh};
 use glam::Vec3;
 
@@ -85,19 +86,51 @@ pub struct DabParams {
     pub intensity: f32,
     pub negative: bool,
     pub seed_tri: u32,
+    /// Dynamic topology: target edge length (world units), or None.
+    pub detail: Option<f32>,
+}
+
+/// One multiresolution level. The active level's mesh lives in
+/// `Sculptor::mesh` (its slot here is `None`); every other level keeps its
+/// topology here. Level k > 0 also keeps the Loop stencils that build it
+/// from level k-1, and its detail: per-vertex offsets from that smooth
+/// subdivision, in each vertex's local frame so they follow the surface.
+#[derive(Clone)]
+struct Level {
+    mesh: Option<Mesh>,
+    odd: Vec<[u32; 4]>,
+    details: Vec<Vec3>,
+}
+
+/// Everything about the sculpt that a topology change can affect.
+#[derive(Clone)]
+struct State {
+    mesh: Mesh,
+    levels: Vec<Level>,
+    level: usize,
+}
+
+fn mesh_bytes(m: &Mesh) -> usize {
+    m.positions.len() * 100 + m.tris.len() * 40
 }
 
 /// A state to restore; applying one returns its inverse.
 enum Undo {
     Verts { idx: Vec<u32>, pos: Vec<Vec3>, mask: Vec<f32> },
-    Mesh(Box<Mesh>),
+    State(Box<State>),
 }
 
 impl Undo {
     fn bytes(&self) -> usize {
         match self {
             Undo::Verts { idx, .. } => idx.len() * 20,
-            Undo::Mesh(m) => m.positions.len() * 40 + m.tris.len() * 36,
+            Undo::State(s) => {
+                mesh_bytes(&s.mesh)
+                    + s.levels
+                        .iter()
+                        .map(|l| l.mesh.as_ref().map_or(0, mesh_bytes) + l.odd.len() * 16 + l.details.len() * 12)
+                        .sum::<usize>()
+            }
         }
     }
 }
@@ -134,11 +167,18 @@ struct Stroke {
     old_pos: Vec<Vec3>,
     old_mask: Vec<f32>,
     grab: Vec<GrabSet>,
+    /// Dynamic-topology strokes undo by restoring this whole snapshot.
+    snapshot: Option<Box<State>>,
+    modified: bool,
 }
 
 impl Stroke {
     #[inline]
     fn touch(&mut self, v: u32, mesh: &Mesh) {
+        self.modified = true;
+        if self.snapshot.is_some() {
+            return;
+        }
         if self.mark.mark(v) {
             self.touched.push(v);
             self.old_pos.push(mesh.positions[v as usize]);
@@ -163,6 +203,8 @@ pub struct Sculptor {
     region: Vec<(u32, f32)>,
     stack: Vec<u32>,
     scratch: Vec<Vec3>,
+    levels: Vec<Level>,
+    level: usize,
     pub dirty: GpuDirty,
 }
 
@@ -196,12 +238,54 @@ impl Sculptor {
             region: Vec::new(),
             stack: Vec::new(),
             scratch: Vec::new(),
+            levels: vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
+            level: 0,
             dirty: GpuDirty { topology: true, range: None },
         }
     }
 
     pub fn tri_count(&self) -> usize {
-        self.mesh.tris.len()
+        self.mesh.live_tri_count()
+    }
+
+    /// Number of multiresolution levels (1 = no levels).
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Active level, 0 = lowest.
+    pub fn level(&self) -> usize {
+        self.level
+    }
+
+    /// Dynamic topology needs a single level (like ZBrush's Sculptris Pro).
+    pub fn dyntopo_allowed(&self) -> bool {
+        self.levels.len() == 1
+    }
+
+    /// Triangle count of the highest level.
+    pub fn top_tri_count(&self) -> usize {
+        let top = self.levels.len() - 1;
+        if top == self.level {
+            self.mesh.tris.len()
+        } else {
+            self.levels[top].mesh.as_ref().map_or(0, |m| m.tris.len())
+        }
+    }
+
+    fn snapshot(&self) -> Box<State> {
+        Box::new(State { mesh: self.mesh.clone(), levels: self.levels.clone(), level: self.level })
+    }
+
+    fn restore(&mut self, s: Box<State>) -> Box<State> {
+        let s = *s;
+        let cur = Box::new(State {
+            mesh: std::mem::replace(&mut self.mesh, s.mesh),
+            levels: std::mem::replace(&mut self.levels, s.levels),
+            level: std::mem::replace(&mut self.level, s.level),
+        });
+        self.topology_changed();
+        cur
     }
 
     pub fn can_undo(&self) -> bool {
@@ -223,8 +307,11 @@ impl Sculptor {
     /// Replaces the mesh (new primitive, import, subdivision), undoable.
     pub fn set_mesh(&mut self, mesh: Mesh) {
         self.end_stroke();
-        let old = std::mem::replace(&mut self.mesh, mesh);
-        self.push_undo(Undo::Mesh(Box::new(old)));
+        let snap = self.snapshot();
+        self.push_undo(Undo::State(snap));
+        self.mesh = mesh;
+        self.levels = vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }];
+        self.level = 0;
         self.topology_changed();
     }
 
@@ -235,21 +322,144 @@ impl Sculptor {
         self.dirty.range = None;
     }
 
+    /// Adds a multiresolution level above the highest one (moving there).
     pub fn subdivide(&mut self) -> Result<(), String> {
-        if self.mesh.tris.len() * 4 > MAX_TRIANGLES {
-            return Err(format!(
-                "Subdividing would exceed {} M triangles",
-                MAX_TRIANGLES / 1_000_000
-            ));
+        self.end_stroke();
+        if self.top_tri_count() * 4 > MAX_TRIANGLES {
+            return Err(format!("Subdividing would exceed {} M triangles", MAX_TRIANGLES / 1_000_000));
         }
-        let m = self.mesh.subdivide(true);
-        self.set_mesh(m);
+        let snap = self.snapshot();
+        self.push_undo(Undo::State(snap));
+        while self.level + 1 < self.levels.len() {
+            self.step_up();
+        }
+        self.mesh.compact();
+        let (fine, odd) = self.mesh.subdivide_with_stencil(true);
+        let details = vec![Vec3::ZERO; fine.positions.len()];
+        let coarse = std::mem::replace(&mut self.mesh, fine);
+        self.levels[self.level].mesh = Some(coarse);
+        self.levels.push(Level { mesh: None, odd, details });
+        self.level += 1;
+        self.topology_changed();
         Ok(())
+    }
+
+    /// Moves to another multiresolution level (undoable).
+    pub fn set_level(&mut self, target: usize) {
+        self.end_stroke();
+        let target = target.min(self.levels.len() - 1);
+        if target == self.level {
+            return;
+        }
+        let snap = self.snapshot();
+        self.push_undo(Undo::State(snap));
+        while self.level < target {
+            self.step_up();
+        }
+        while self.level > target {
+            self.step_down();
+        }
+        self.topology_changed();
+    }
+
+    /// Level k-1 -> k: smooth-subdivide the current shape and add back the
+    /// stored detail in each vertex's local frame.
+    fn step_up(&mut self) {
+        let k = self.level + 1;
+        let mut fine = self.levels[k].mesh.take().expect("level mesh");
+        let s = self.mesh.loop_positions(&self.levels[k].odd);
+        fine.positions = s;
+        fine.compute_all_normals();
+        // frames come from the smooth positions, so measure them all first
+        let details = &self.levels[k].details;
+        let offsets: Vec<Vec3> = (0..fine.positions.len())
+            .map(|v| {
+                let d = details[v];
+                if d == Vec3::ZERO {
+                    return Vec3::ZERO;
+                }
+                let (t, b, n) = fine.frame(v as u32);
+                t * d.x + b * d.y + n * d.z
+            })
+            .collect();
+        for (p, o) in fine.positions.iter_mut().zip(offsets) {
+            *p += o;
+        }
+        let n = self.mesh.positions.len();
+        fine.mask[..n].copy_from_slice(&self.mesh.mask);
+        for (i, st) in self.levels[k].odd.iter().enumerate() {
+            fine.mask[n + i] = (self.mesh.mask[st[0] as usize] + self.mesh.mask[st[1] as usize]) * 0.5;
+        }
+        fine.compute_all_normals();
+        let coarse = std::mem::replace(&mut self.mesh, fine);
+        self.levels[k - 1].mesh = Some(coarse);
+        self.levels[k].mesh = None;
+        self.level = k;
+    }
+
+    /// Level k -> k-1: the lower level takes the shared (even) vertices'
+    /// current positions, and level k's detail is re-measured against the
+    /// smooth subdivision of that, so going back up reproduces it exactly.
+    fn step_down(&mut self) {
+        let k = self.level;
+        let mut coarse = self.levels[k - 1].mesh.take().expect("level mesh");
+        let n = coarse.positions.len();
+        coarse.positions.copy_from_slice(&self.mesh.positions[..n]);
+        coarse.mask.copy_from_slice(&self.mesh.mask[..n]);
+        coarse.compute_all_normals();
+        let s = coarse.loop_positions(&self.levels[k].odd);
+        let actual = std::mem::replace(&mut self.mesh.positions, s);
+        self.mesh.compute_all_normals();
+        let mut details = Vec::with_capacity(actual.len());
+        for (v, p) in actual.iter().enumerate() {
+            let off = *p - self.mesh.positions[v];
+            let (t, b, nn) = self.mesh.frame(v as u32);
+            details.push(Vec3::new(off.dot(t), off.dot(b), off.dot(nn)));
+        }
+        self.mesh.positions = actual;
+        self.mesh.compute_all_normals();
+        self.levels[k].details = details;
+        let fine = std::mem::replace(&mut self.mesh, coarse);
+        self.levels[k].mesh = Some(fine);
+        self.levels[k - 1].mesh = None;
+        self.level = k - 1;
+    }
+
+    /// Bakes the current level as the new lowest level (ZBrush "Del Lower").
+    pub fn delete_lower(&mut self) {
+        self.end_stroke();
+        if self.level == 0 {
+            return;
+        }
+        let snap = self.snapshot();
+        self.push_undo(Undo::State(snap));
+        self.levels.drain(0..self.level);
+        self.levels[0].odd = Vec::new();
+        self.levels[0].details = Vec::new();
+        self.level = 0;
+        self.topology_changed();
+    }
+
+    /// Removes every level above the current one (ZBrush "Del Higher").
+    pub fn delete_higher(&mut self) {
+        self.end_stroke();
+        if self.level + 1 >= self.levels.len() {
+            return;
+        }
+        let snap = self.snapshot();
+        self.push_undo(Undo::State(snap));
+        self.levels.truncate(self.level + 1);
+        self.topology_changed();
     }
 
     /// Refit the picking hierarchy if the surface moved. Call once per frame.
     pub fn refresh_bvh(&mut self) {
-        if self.bvh_dirty {
+        // dynamic topology adds faces the hierarchy doesn't index yet
+        let extra = self.bvh.unindexed(&self.mesh);
+        if extra > 20_000.max(self.bvh.indexed() / 3) {
+            self.bvh = Bvh::build(&self.mesh);
+            self.bvh_dirty = false;
+        } else if self.bvh_dirty {
             self.bvh.refit(&self.mesh);
             self.bvh_dirty = false;
         }
@@ -259,8 +469,10 @@ impl Sculptor {
         self.bvh.raycast(&self.mesh, origin, dir)
     }
 
-    pub fn begin_stroke(&mut self) {
+    /// `dynamic` = the stroke may change topology (undo takes a snapshot).
+    pub fn begin_stroke(&mut self, dynamic: bool) {
         self.end_stroke();
+        let snapshot = (dynamic && self.dyntopo_allowed()).then(|| self.snapshot());
         let mut mark = Marker::new();
         mark.begin(self.mesh.vertex_count());
         self.stroke = Some(Stroke {
@@ -269,12 +481,21 @@ impl Sculptor {
             old_pos: Vec::new(),
             old_mask: Vec::new(),
             grab: Vec::new(),
+            snapshot,
+            modified: false,
         });
     }
 
     pub fn end_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
-            if !st.touched.is_empty() {
+            if let Some(snap) = st.snapshot {
+                if st.modified {
+                    if self.mesh.compact() {
+                        self.topology_changed();
+                    }
+                    self.push_undo(Undo::State(snap));
+                }
+            } else if !st.touched.is_empty() {
                 self.push_undo(Undo::Verts { idx: st.touched, pos: st.old_pos, mask: st.old_mask });
             }
         }
@@ -286,7 +507,7 @@ impl Sculptor {
         let Sculptor { mesh, vmark, region, stack, .. } = self;
         region.clear();
         stack.clear();
-        if seed_tri as usize >= mesh.tris.len() || radius <= 0.0 {
+        if seed_tri as usize >= mesh.tris.len() || !mesh.is_alive(seed_tri) || radius <= 0.0 {
             return;
         }
         vmark.begin(mesh.vertex_count());
@@ -344,7 +565,14 @@ impl Sculptor {
         if p.tool == Tool::Grab {
             return;
         }
-        self.collect_region(p.center, p.radius, p.seed_tri, p.tool != Tool::Mask);
+        let mut seed = p.seed_tri;
+        if let Some(detail) = p.detail {
+            let dynamic_stroke = self.stroke.as_ref().is_some_and(|s| s.snapshot.is_some());
+            if p.tool != Tool::Mask && dynamic_stroke {
+                seed = self.remesh(seed, p.center, p.radius, detail);
+            }
+        }
+        self.collect_region(p.center, p.radius, seed, p.tool != Tool::Mask);
         if self.region.is_empty() {
             return;
         }
@@ -457,6 +685,36 @@ impl Sculptor {
         self.after_deform(true, None);
     }
 
+    /// Dynamic topology for one dab. Returns a live face to start the brush
+    /// region from (the hit face may have been collapsed away).
+    fn remesh(&mut self, seed: u32, center: Vec3, radius: f32, detail: f32) -> u32 {
+        let mut changed = Vec::new();
+        let stats = {
+            let Sculptor { mesh, fmark, vmark, .. } = self;
+            remesh_region(mesh, seed, center, radius, detail, fmark, vmark, &mut changed)
+        };
+        if stats.splits + stats.collapses == 0 {
+            return seed;
+        }
+        if let Some(st) = self.stroke.as_mut() {
+            st.modified = true;
+        }
+        {
+            let Sculptor { mesh, fmark, vmark2, .. } = self;
+            mesh.update_normals(&changed, fmark, vmark2);
+        }
+        self.dirty.topology = true;
+        self.bvh_dirty = true;
+        if self.mesh.is_alive(seed) {
+            return seed;
+        }
+        changed
+            .iter()
+            .filter_map(|&v| self.mesh.vert_faces(v).first().map(|&f| (self.mesh.positions[v as usize].distance_squared(center), f)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(seed, |(_, f)| f)
+    }
+
     /// Starts a grab region (call once per symmetry side at stroke start).
     pub fn grab_begin(&mut self, center: Vec3, radius: f32, seed_tri: u32, mirror: bool) {
         self.collect_region(center, radius, seed_tri, true);
@@ -474,7 +732,8 @@ impl Sculptor {
         for set in &st.grab {
             let d = if set.mirror { mirror_x(delta) } else { delta };
             for (k, &(v, w)) in set.verts.iter().enumerate() {
-                if st.mark.mark(v) {
+                st.modified = true;
+                if st.snapshot.is_none() && st.mark.mark(v) {
                     st.touched.push(v);
                     st.old_pos.push(self.mesh.positions[v as usize]);
                     st.old_mask.push(self.mesh.mask[v as usize]);
@@ -501,11 +760,7 @@ impl Sculptor {
                 self.after_deform(false, Some(&idx));
                 Undo::Verts { idx, pos: cur_pos, mask: cur_mask }
             }
-            Undo::Mesh(m) => {
-                let old = std::mem::replace(&mut self.mesh, *m);
-                self.topology_changed();
-                Undo::Mesh(Box::new(old))
-            }
+            Undo::State(s) => Undo::State(self.restore(s)),
         }
     }
 
@@ -557,7 +812,7 @@ mod tests {
 
     fn dab(s: &mut Sculptor, tool: Tool, negative: bool) {
         let h = front_hit(s);
-        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri });
+        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri, detail: None });
         s.refresh_bvh();
     }
 
@@ -565,7 +820,7 @@ mod tests {
     fn draw_raises_and_undo_restores() {
         let mut s = Sculptor::new(Mesh::icosphere(4));
         let before = front_hit(&s).point.z;
-        s.begin_stroke();
+        s.begin_stroke(false);
         for _ in 0..5 {
             dab(&mut s, Tool::Draw, false);
         }
@@ -584,7 +839,7 @@ mod tests {
     fn negative_draw_digs() {
         let mut s = Sculptor::new(Mesh::icosphere(4));
         let before = front_hit(&s).point.z;
-        s.begin_stroke();
+        s.begin_stroke(false);
         dab(&mut s, Tool::Draw, true);
         s.end_stroke();
         assert!(front_hit(&s).point.z < before);
@@ -593,13 +848,13 @@ mod tests {
     #[test]
     fn mask_blocks_draw() {
         let mut s = Sculptor::new(Mesh::icosphere(4));
-        s.begin_stroke();
+        s.begin_stroke(false);
         for _ in 0..10 {
             dab(&mut s, Tool::Mask, false);
         }
         s.end_stroke();
         let before = front_hit(&s).point.z;
-        s.begin_stroke();
+        s.begin_stroke(false);
         dab(&mut s, Tool::Draw, false);
         s.end_stroke();
         assert!((front_hit(&s).point.z - before).abs() < 0.01);
@@ -609,7 +864,7 @@ mod tests {
     fn smooth_and_others_stay_finite() {
         let mut s = Sculptor::new(Mesh::icosphere(4));
         for t in Tool::ALL {
-            s.begin_stroke();
+            s.begin_stroke(false);
             dab(&mut s, t, false);
             dab(&mut s, t, true);
             s.end_stroke();
@@ -623,7 +878,7 @@ mod tests {
         let mut s = Sculptor::new(Mesh::icosphere(4));
         let h = s.raycast(Vec3::new(0.7, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let hm = s.raycast(Vec3::new(-0.7, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
-        s.begin_stroke();
+        s.begin_stroke(false);
         s.grab_begin(h.point, 0.3, h.tri, false);
         s.grab_begin(hm.point, 0.3, hm.tri, true);
         s.grab_update(Vec3::new(0.5, 0.0, 0.0));
@@ -631,6 +886,110 @@ mod tests {
         let maxx = s.mesh.positions.iter().map(|p| p.x).fold(f32::MIN, f32::max);
         let minx = s.mesh.positions.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         assert!(maxx > 1.2 && minx < -1.2, "{minx} {maxx}");
+    }
+
+    fn closed_manifold(m: &Mesh) -> bool {
+        let mut count = std::collections::HashMap::new();
+        for t in m.tris.iter().filter(|t| t[0] != crate::mesh::NONE) {
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        count.values().all(|&c| c == 2)
+    }
+
+    #[test]
+    fn dynamic_stroke_adds_detail_and_undoes() {
+        let mut s = Sculptor::new(Mesh::icosphere(3));
+        let n0 = s.tri_count();
+        let before = front_hit(&s).point.z;
+        s.begin_stroke(true);
+        for _ in 0..6 {
+            let h = front_hit(&s);
+            s.dab(&DabParams {
+                tool: Tool::Draw,
+                center: h.point,
+                radius: 0.4,
+                intensity: 1.0,
+                negative: false,
+                seed_tri: h.tri,
+                detail: Some(0.03),
+            });
+            s.refresh_bvh();
+        }
+        s.end_stroke();
+        assert!(s.tri_count() > n0 * 2, "{} -> {}", n0, s.tri_count());
+        assert!(closed_manifold(&s.mesh));
+        assert!(s.mesh.tris.iter().all(|t| t[0] != crate::mesh::NONE), "compacted after the stroke");
+        assert!(front_hit(&s).point.z > before + 0.05);
+        s.undo();
+        assert_eq!(s.tri_count(), n0);
+        s.redo();
+        assert!(s.tri_count() > n0 * 2);
+    }
+
+    #[test]
+    fn dynamic_topology_needs_one_level() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        assert!(!s.dyntopo_allowed());
+        let n = s.tri_count();
+        s.begin_stroke(true);
+        let h = front_hit(&s);
+        s.dab(&DabParams { tool: Tool::Draw, center: h.point, radius: 0.4, intensity: 1.0, negative: false, seed_tri: h.tri, detail: Some(0.01) });
+        s.end_stroke();
+        assert_eq!(s.tri_count(), n);
+        s.delete_lower();
+        assert!(s.dyntopo_allowed());
+        assert_eq!(s.tri_count(), n);
+    }
+
+    #[test]
+    fn multires_round_trip_keeps_detail() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        s.subdivide().unwrap();
+        assert_eq!((s.level(), s.level_count()), (2, 3));
+        // sculpt fine detail at the top level
+        s.begin_stroke(false);
+        for _ in 0..4 {
+            dab(&mut s, Tool::Draw, false);
+        }
+        s.end_stroke();
+        let top = s.mesh.positions.clone();
+        s.set_level(0);
+        assert_eq!(s.tri_count(), 320);
+        s.set_level(2);
+        let err = top.iter().zip(&s.mesh.positions).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max);
+        assert!(err < 1e-4, "detail lost: {err}");
+    }
+
+    #[test]
+    fn multires_low_level_edit_moves_high_level() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        s.begin_stroke(false);
+        for _ in 0..4 {
+            dab(&mut s, Tool::Draw, false);
+        }
+        s.end_stroke();
+        let fine_detail = s.mesh.positions.clone();
+        s.set_level(0);
+        // move the whole base mesh right
+        for p in &mut s.mesh.positions {
+            p.x += 0.5;
+        }
+        s.mesh.compute_all_normals();
+        s.set_level(1);
+        let avg: f32 = s.mesh.positions.iter().zip(&fine_detail).map(|(a, b)| a.x - b.x).sum::<f32>()
+            / fine_detail.len() as f32;
+        assert!((avg - 0.5).abs() < 0.02, "{avg}");
+        // and the sculpted bump survives the move (relative to the shifted shape)
+        let bump = s.mesh.positions.iter().map(|p| p.z).fold(f32::MIN, f32::max);
+        assert!(bump > 1.05, "{bump}");
+        s.undo();
+        assert_eq!(s.level(), 0);
     }
 
     #[test]
