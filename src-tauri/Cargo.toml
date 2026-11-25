@@ -9,6 +9,7 @@ description = "Clayform: a SculptGL-style sculpting app (Tauri shell around the 
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+clayform-core = { path = "../core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-window-state = "2"

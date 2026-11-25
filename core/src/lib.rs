@@ -9,5 +9,6 @@ pub mod io;
 pub mod mesh;
 pub mod remesh;
 pub mod sculpt;
+pub mod wire;
 
 pub use glam;

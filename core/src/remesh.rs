@@ -90,7 +90,17 @@ fn for_each_small_triangle(a: Vec3, b: Vec3, c: Vec3, max_len: f32, f: &mut impl
     for_each_small_triangle(ab, bc, ca, max_len, f);
 }
 
+/// Error text used when a progress callback asks to stop.
+pub const CANCELLED: &str = "Cancelled";
+
 pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
+    voxel_remesh_with(src, s, &mut |_| true)
+}
+
+/// Like `voxel_remesh`, reporting progress (0..1) to `progress`, which
+/// returns false to cancel.
+pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut(f32) -> bool) -> Result<Mesh, String> {
+    let mut report = |p: f32| if progress(p) { Ok(()) } else { Err(CANCELLED.to_string()) };
     let tris: Vec<[Vec3; 3]> = src
         .tris
         .iter()
@@ -117,7 +127,10 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
     // corners of cells next to the surface are within sqrt(3)*h of it
     let band = 1.8 * h;
     let mut dist: FastMap<f32> = FastMap::default();
-    for t in &tris {
+    for (ti, t) in tris.iter().enumerate() {
+        if ti % 2048 == 0 {
+            report(0.45 * ti as f32 / tris.len() as f32)?;
+        }
         for_each_small_triangle(t[0], t[1], t[2], 2.0 * h, &mut |a, b, c| {
             let n = (b - a).cross(c - a).normalize_or_zero();
             let lo = ((a.min(b).min(c) - Vec3::splat(band) - grid.origin) / h).ceil();
@@ -149,7 +162,10 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
         let mut columns: Vec<Vec<(f32, i8)>> = vec![Vec::new(); (ny * nz) as usize];
         // a tiny irrational offset keeps column centres off triangle edges
         let jit = h * 1.234_567e-4;
-        for t in &tris {
+        for (ti, t) in tris.iter().enumerate() {
+            if ti % 4096 == 0 {
+                report(0.45 + 0.1 * ti as f32 / tris.len() as f32)?;
+            }
             let [a, b, c] = *t;
             let n = (b - a).cross(c - a);
             if n.x.abs() < 1e-20 {
@@ -188,6 +204,7 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
             }
         }
         for k in 0..nz {
+            report(0.55 + 0.1 * k as f32 / nz as f32)?;
             for j in 0..ny {
                 let col = &mut columns[(j + ny * k) as usize];
                 if col.is_empty() {
@@ -263,7 +280,11 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
     let mut out_tris: Vec<[u32; 3]> = Vec::new();
     let mut keys: Vec<u64> = dist.keys().copied().collect();
     keys.sort_unstable();
-    for key in keys {
+    let nkeys = keys.len().max(1);
+    for (ki, key) in keys.into_iter().enumerate() {
+        if ki % 8192 == 0 {
+            report(0.65 + 0.2 * ki as f32 / nkeys as f32)?;
+        }
         let key = key as i64;
         let i = key % dims[0];
         let j = (key / dims[0]) % dims[1];
@@ -305,7 +326,9 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
         return Err("The remesh produced no surface; try a higher resolution".into());
     }
 
+    report(0.85)?;
     let mut mesh = Mesh::new(positions, out_tris);
+    report(0.9)?;
 
     // ---- 4. relax, then project onto the original surface
     for _ in 0..s.smooth {
@@ -322,7 +345,11 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
     if s.project {
         let bvh = Bvh::build(src);
         let reach = 2.0 * h;
-        for p in &mut mesh.positions {
+        let nv = mesh.positions.len().max(1);
+        for (vi, p) in mesh.positions.iter_mut().enumerate() {
+            if vi % 8192 == 0 {
+                report(0.9 + 0.1 * vi as f32 / nv as f32)?;
+            }
             if let Some(q) = bvh.closest_point(src, *p, reach) {
                 *p = q;
             }
@@ -408,6 +435,24 @@ mod tests {
         }
         let (_, bad) = edge_counts(&m);
         assert!(bad < 20, "{bad}");
+    }
+
+    #[test]
+    fn progress_rises_and_cancel_stops() {
+        let src = Mesh::icosphere(3);
+        let mut seen = Vec::new();
+        voxel_remesh_with(&src, &VoxelSettings { resolution: 48, ..Default::default() }, &mut |p| {
+            seen.push(p);
+            true
+        })
+        .unwrap();
+        assert!(seen.len() > 5 && seen.windows(2).all(|w| w[1] >= w[0]) && *seen.last().unwrap() >= 0.9);
+        let mut calls = 0;
+        let r = voxel_remesh_with(&src, &VoxelSettings::default(), &mut |_| {
+            calls += 1;
+            calls < 3
+        });
+        assert_eq!(r.err().as_deref(), Some(CANCELLED));
     }
 
     #[test]

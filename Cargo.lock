@@ -469,9 +469,10 @@ dependencies = [
 
 [[package]]
 name = "clayform"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "clayform-core",
  "serde",
  "serde_json",
  "tauri",
@@ -482,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "clayform-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -499,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "clayform-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "glam",
 ]

@@ -5,11 +5,12 @@
 mod host;
 mod render;
 
-use clayform_core::editor::{Brush, Button, Drag, Editor, Mods, ViewDir};
+use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mods, ViewDir};
 use clayform_core::glam::Vec2;
 use clayform_core::io;
 use clayform_core::mesh::Mesh;
-use clayform_core::remesh::{VoxelSettings, MAX_RESOLUTION, MIN_RESOLUTION};
+use clayform_core::remesh::{VoxelSettings, CANCELLED, MAX_RESOLUTION, MIN_RESOLUTION};
+use clayform_core::wire;
 use clayform_core::sculpt::{Tool, MAX_TRIANGLES};
 use leptos::ev;
 use leptos::prelude::*;
@@ -50,6 +51,10 @@ struct Ui {
     top_tris: RwSignal<usize>,
     voxel: RwSignal<VoxelSettings>,
     busy: RwSignal<bool>,
+    /// Background job shown in the progress card: (label, progress 0..1).
+    job: RwSignal<Option<(&'static str, f32)>>,
+    detail_mode: RwSignal<DetailMode>,
+    smooth_reduces: RwSignal<bool>,
     view: RwSignal<ViewSettings>,
     fov: RwSignal<f32>,
     panel_right: RwSignal<bool>,
@@ -82,6 +87,9 @@ impl Ui {
             top_tris: RwSignal::new(0),
             voxel: RwSignal::new(VoxelSettings::default()),
             busy: RwSignal::new(false),
+            job: RwSignal::new(None),
+            detail_mode: RwSignal::new(b.detail_mode),
+            smooth_reduces: RwSignal::new(b.smooth_reduces),
             view: RwSignal::new(ViewSettings { material: 0, show_mask: true, flat: false, wireframe: false, background: 0 }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
@@ -158,6 +166,14 @@ enum Action {
 
 fn act(ui: Ui, a: Action) {
     ui.menu.set(None);
+    let changes_mesh = !matches!(
+        a,
+        Action::FrameMesh | Action::ResetCamera | Action::View(_) | Action::TogglePanelSide | Action::ExportObj | Action::ExportStl
+    );
+    if changes_mesh && ui.busy.get_untracked() {
+        ui.status.set("Please wait for the current job to finish (or cancel it)".into());
+        return;
+    }
     match a {
         Action::NewSphere => new_mesh(ui, Mesh::icosphere(ui.sphere_detail.get_untracked()), "sphere"),
         Action::NewCube => new_mesh(ui, Mesh::cube(6), "cube"),
@@ -188,13 +204,44 @@ fn act(ui: Ui, a: Action) {
         }
         Action::Undo => with_ed(|e| e.undo()),
         Action::Redo => with_ed(|e| e.redo()),
-        Action::Subdivide => match with_ed(|e| e.subdivide()) {
-            Ok(()) => {
-                let (lv, n) = with_ed(|e| (e.sculptor.level_count(), e.sculptor.tri_count()));
-                ui.status.set(format!("Added level {lv} — {} triangles", fmt_count(n)));
+        Action::Subdivide => {
+            if host::in_desktop_app() {
+                // subdivide on a background thread in the desktop backend
+                let bytes = match with_ed(|e| e.begin_subdivide().map(|_| wire::encode(&e.sculptor.mesh, &[]))) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        ui.status.set(e);
+                        return;
+                    }
+                };
+                start_job(ui, "Subdividing");
+                spawn_local(async move {
+                    let result = host::invoke_bytes("subdivide", &bytes, &[]).await.and_then(|b| wire::decode(&b));
+                    match result {
+                        Ok((fine, odd)) => match with_ed(|e| e.finish_subdivide(fine, odd)) {
+                            Ok(()) => {
+                                let (lv, n) = with_ed(|e| (e.sculptor.level_count(), e.sculptor.tri_count()));
+                                ui.status.set(format!("Added level {lv} — {} triangles", fmt_count(n)));
+                            }
+                            Err(e) => ui.status.set(e),
+                        },
+                        Err(e) => {
+                            with_ed(|ed| ed.abort_subdivide());
+                            ui.status.set(job_error("Subdivide", &e));
+                        }
+                    }
+                    end_job(ui);
+                });
+            } else {
+                match with_ed(|e| e.subdivide()) {
+                    Ok(()) => {
+                        let (lv, n) = with_ed(|e| (e.sculptor.level_count(), e.sculptor.tri_count()));
+                        ui.status.set(format!("Added level {lv} — {} triangles", fmt_count(n)));
+                    }
+                    Err(e) => ui.status.set(e),
+                }
             }
-            Err(e) => ui.status.set(e),
-        },
+        }
         Action::LevelUp => with_ed(|e| e.set_level(e.sculptor.level() + 1)),
         Action::LevelDown => with_ed(|e| e.set_level(e.sculptor.level().saturating_sub(1))),
         Action::DeleteLower => {
@@ -210,6 +257,36 @@ fn act(ui: Ui, a: Action) {
                 return;
             }
             let settings = ui.voxel.get_untracked();
+            if host::in_desktop_app() {
+                let bytes = with_ed(|e| {
+                    e.cancel_drag();
+                    wire::encode(&e.sculptor.mesh, &[])
+                });
+                start_job(ui, "Remeshing");
+                spawn_local(async move {
+                    let t0 = now_ms();
+                    let headers = [
+                        ("resolution", settings.resolution.to_string()),
+                        ("smooth", settings.smooth.to_string()),
+                        ("project", if settings.project { "1" } else { "0" }.to_string()),
+                    ];
+                    let result = host::invoke_bytes("remesh", &bytes, &headers).await.and_then(|b| wire::decode(&b));
+                    match result {
+                        Ok((m, _)) => {
+                            let n = m.tris.len();
+                            with_ed(|e| e.apply_remeshed(m));
+                            ui.status.set(format!(
+                                "Remeshed — {} triangles in {:.1} s",
+                                fmt_count(n),
+                                (now_ms() - t0) / 1000.0
+                            ));
+                        }
+                        Err(e) => ui.status.set(job_error("Remesh", &e)),
+                    }
+                    end_job(ui);
+                });
+                return;
+            }
             ui.busy.set(true);
             ui.status.set(format!("Remeshing at resolution {}…", settings.resolution));
             spawn_local(async move {
@@ -249,6 +326,22 @@ fn act(ui: Ui, a: Action) {
         Action::TogglePanelSide => ui.panel_right.update(|r| *r = !*r),
     }
     ui.refresh();
+}
+
+fn start_job(ui: Ui, label: &'static str) {
+    ui.busy.set(true);
+    ui.job.set(Some((label, 0.0)));
+    ui.status.set(format!("{label}…"));
+}
+
+fn end_job(ui: Ui) {
+    ui.busy.set(false);
+    ui.job.set(None);
+    ui.refresh();
+}
+
+fn job_error(what: &str, e: &str) -> String {
+    if e.contains(CANCELLED) { format!("{what} cancelled") } else { format!("{what} failed: {e}") }
 }
 
 async fn sleep_ms(ms: i32) {
@@ -370,7 +463,9 @@ fn Viewport(ui: Ui) -> impl IntoView {
             2 => Button::Right,
             _ => Button::Left,
         };
-        let mods = Mods { shift: ev.shift_key(), ctrl: ev.ctrl_key() || ev.meta_key(), alt: ev.alt_key() };
+        // while a background job runs, the left button only orbits
+        let busy = ui.busy.get_untracked();
+        let mods = Mods { shift: ev.shift_key(), ctrl: ev.ctrl_key() || ev.meta_key(), alt: ev.alt_key() || busy };
         let size = canvas_size(&ev);
         let d = with_ed(|e| e.pointer_down(button, local_pos(&ev), size, mods));
         ui.dragging.set(d);
@@ -440,6 +535,22 @@ fn Viewport(ui: Ui) -> impl IntoView {
                     fill="none" stroke=brush_color stroke-width="1" stroke-opacity="0.45"
                 ></circle>
             </svg>
+            <Show when=move || ui.job.get().is_some()>
+                <div class="job-card">
+                    <div class="job-row">
+                        <span class="job-label">{move || ui.job.get().map(|j| j.0).unwrap_or("")}"…"</span>
+                        <span class="job-pct">{move || format!("{:.0}%", ui.job.get().map(|j| j.1).unwrap_or(0.0) * 100.0)}</span>
+                        <button class="job-cancel" on:click=move |_| {
+                            ui.status.set("Cancelling…".into());
+                            spawn_local(host::cancel_job());
+                        }>"Cancel"</button>
+                    </div>
+                    <div class="job-bar">
+                        <div class="job-fill" style:width=move || format!("{:.1}%", ui.job.get().map(|j| j.1).unwrap_or(0.0) * 100.0)></div>
+                    </div>
+                    <div class="job-hint">"You can keep rotating the view while this runs."</div>
+                </div>
+            </Show>
             <Show when=move || ui.gpu.get().is_some()>
                 <div class="gpu-error">
                     <b>"The 3D view could not start"</b>
@@ -646,7 +757,8 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"Left drag off mesh, Alt + left, right drag"</td><td>"Rotate"</td></tr>
                         <tr><td>"Middle drag, Shift + right drag"</td><td>"Pan"</td></tr>
                         <tr><td>"Wheel"</td><td>"Zoom"</td></tr>
-                        <tr><td>"D C S F I P E G M"</td><td>"Brush tools"</td></tr>
+                        <tr><td>"D C B S F Y Q I"</td><td>"Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate"</td></tr>
+                        <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask"</td></tr>
                         <tr><td>"[  ]"</td><td>"Brush radius"</td></tr>
                         <tr><td>"X / W / N"</td><td>"Symmetry / wireframe / negative"</td></tr>
                         <tr><td>"Ctrl+D"</td><td>"Subdivide (add a level)"</td></tr>
@@ -694,7 +806,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                             .map(|t| {
                                 let t = *t;
                                 view! {
-                                    <option value=t.index().to_string() selected=move || ui.tool.get() == t>
+                                    <option value=t.index().to_string() title=t.description() selected=move || ui.tool.get() == t>
                                         {format!("{}  ({})", t.name(), t.shortcut())}
                                     </option>
                                 }
@@ -702,6 +814,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                             .collect_view()}
                     </select>
                 </label>
+                <div class="row info tool-desc">{move || ui.tool.get().description()}</div>
                 <Slider
                     label="Radius"
                     min=4f32.ln() max=400f32.ln() step=0.01
@@ -770,12 +883,39 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     on_change=move |v| ui.dyntopo.set(v)
                     disabled=multi
                 />
+                <div class="row">
+                    <span class="label">"Size by"</span>
+                    <div class="segmented">
+                        <button
+                            title="Triangle size follows the brush: zoom in or use a smaller brush for finer detail"
+                            class:on=move || ui.detail_mode.get() == DetailMode::Brush
+                            on:click=move |_| ui.detail_mode.set(DetailMode::Brush)
+                        >"Brush"</button>
+                        <button
+                            title="Triangle size is fixed on the model, whatever the brush size or zoom"
+                            class:on=move || ui.detail_mode.get() == DetailMode::Constant
+                            on:click=move |_| ui.detail_mode.set(DetailMode::Constant)
+                        >"Constant"</button>
+                    </div>
+                </div>
                 <Slider
                     label="Detail"
                     min=0.0 max=1.0 step=0.01
                     value=ui.detail
                     on_change=move |v| ui.detail.set(v)
                     format=|v| format!("{:.0}%", v * 100.0)
+                />
+                <div class="row info">{move || {
+                    let d = ui.detail.get();
+                    match ui.detail_mode.get() {
+                        DetailMode::Brush => format!("Triangles ≈ {:.0}% of the brush radius", Editor::detail_ratio(d) * 100.0),
+                        DetailMode::Constant => format!("≈ {:.0} triangles across the model", Editor::constant_resolution(d)),
+                    }
+                }}</div>
+                <Check
+                    label="Smooth brush reduces detail"
+                    value=ui.smooth_reduces
+                    on_change=move |v| ui.smooth_reduces.set(v)
                 />
                 <Show when=move || multi.get()>
                     <div class="hint">"Works on a single level. Use Delete lower / Delete higher to merge the levels first."</div>
@@ -802,7 +942,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                 />
                 <div class="row buttons">
                     <button class="primary" disabled=move || ui.busy.get() on:click=move |_| act(ui, Action::VoxelRemesh)>
-                        {move || if ui.busy.get() { "Remeshing…" } else { "Remesh  (R)" }}
+                        {move || if ui.job.get().is_some_and(|j| j.0 == "Remeshing") { "Remeshing…" } else { "Remesh  (R)" }}
                     </button>
                 </div>
                 <div class="hint">"Rebuilds an even, closed mesh: merges overlapping parts, closes holes and evens out dynamic-topology strokes. Replaces all levels."</div>
@@ -932,6 +1072,8 @@ fn App() -> impl IntoView {
             symmetry: ui.symmetry.get(),
             dyntopo: ui.dyntopo.get(),
             detail: ui.detail.get(),
+            detail_mode: ui.detail_mode.get(),
+            smooth_reduces: ui.smooth_reduces.get(),
         };
         with_ed(|e| e.brush = brush);
     });
@@ -951,6 +1093,14 @@ fn App() -> impl IntoView {
             let _ = s.set_item(PANEL_SIDE_KEY, if right { "right" } else { "left" });
         }
         with_ed(|e| e.redraw = true);
+    });
+
+    host::listen_progress(move |p| {
+        ui.job.update(|j| {
+            if let Some(j) = j {
+                j.1 = j.1.max(p);
+            }
+        })
     });
 
     let keydown = window_event_listener(ev::keydown, move |ev| handle_key(ui, &ev));

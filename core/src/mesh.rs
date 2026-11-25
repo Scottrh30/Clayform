@@ -449,11 +449,25 @@ impl Mesh {
     /// Like `subdivide`, also returning the odd-vertex stencils so later
     /// position updates (multiresolution) don't need to rebuild topology.
     pub fn subdivide_with_stencil(&self, smooth: bool) -> (Mesh, Vec<[u32; 4]>) {
+        self.subdivide_with_progress(smooth, &mut |_| true).expect("not cancelled")
+    }
+
+    /// `subdivide_with_stencil` reporting progress (0..1); the callback
+    /// returns false to cancel, which gives `Err(())`.
+    pub fn subdivide_with_progress(
+        &self,
+        smooth: bool,
+        progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<(Mesh, Vec<[u32; 4]>), ()> {
         let n = self.positions.len() as u32;
+        let total = self.tris.len().max(1);
         let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(self.tris.len() * 3 / 2);
         let mut odd: Vec<[u32; 4]> = Vec::with_capacity(self.tris.len() * 3 / 2);
         let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
-        for t in self.tris.iter().filter(|t| t[0] != NONE) {
+        for (ti, t) in self.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
+            if ti % 16384 == 0 && !progress(0.6 * ti as f32 / total as f32) {
+                return Err(());
+            }
             let mut mids = [0u32; 3];
             for e in 0..3 {
                 let a = t[e];
@@ -486,11 +500,15 @@ impl Mesh {
         };
         let mut mask = self.mask.clone();
         mask.extend(odd.iter().map(|s| (self.mask[s[0] as usize] + self.mask[s[1] as usize]) * 0.5));
+        if !progress(0.7) {
+            return Err(());
+        }
         let mut out = Mesh::new(positions, new_tris);
         out.mask = mask;
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;
-        (out, odd)
+        progress(1.0);
+        Ok((out, odd))
     }
 
     // ---------------------------------------------------------------- primitives

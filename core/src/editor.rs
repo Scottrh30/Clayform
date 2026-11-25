@@ -7,6 +7,15 @@ use crate::remesh::{voxel_remesh, VoxelSettings};
 use crate::sculpt::{mirror_x, DabParams, Sculptor, Tool};
 use glam::{Vec2, Vec3, Vec4};
 
+/// How dynamic topology picks its triangle size.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DetailMode {
+    /// Relative to the brush on screen (zoom in or shrink the brush for finer detail).
+    Brush,
+    /// A fixed size in the model, whatever the brush size or zoom.
+    Constant,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Brush {
     pub tool: Tool,
@@ -18,6 +27,9 @@ pub struct Brush {
     pub dyntopo: bool,
     /// Dynamic-topology detail, 0 (coarse) to 1 (fine).
     pub detail: f32,
+    pub detail_mode: DetailMode,
+    /// With dynamic topology, the Smooth brush also lowers triangle density.
+    pub smooth_reduces: bool,
 }
 
 impl Default for Brush {
@@ -30,6 +42,8 @@ impl Default for Brush {
             symmetry: true,
             dyntopo: false,
             detail: 0.7,
+            detail_mode: DetailMode::Brush,
+            smooth_reduces: true,
         }
     }
 }
@@ -76,6 +90,8 @@ pub struct Editor {
     last_dab: Vec2,
     last_pos: Vec2,
     grab: Option<(Vec3, Vec3)>,
+    /// Size of the model when the stroke started (constant-detail mode).
+    stroke_extent: f32,
     /// Set whenever the picture changes; the interface clears it after drawing.
     pub redraw: bool,
 }
@@ -98,6 +114,7 @@ impl Editor {
             last_dab: Vec2::ZERO,
             last_pos: Vec2::ZERO,
             grab: None,
+            stroke_extent: 2.0,
             redraw: true,
         };
         e.frame_mesh();
@@ -128,6 +145,25 @@ impl Editor {
     /// Whether strokes currently change topology.
     pub fn dyntopo_active(&self) -> bool {
         self.brush.dyntopo && self.sculptor.dyntopo_allowed()
+    }
+
+    /// Constant detail: edges per longest side of the model, from 20 at
+    /// detail 0 to 500 at detail 1.
+    pub fn constant_resolution(detail: f32) -> f32 {
+        20.0 * 25f32.powf(detail.clamp(0.0, 1.0))
+    }
+
+    /// Dynamic-topology edge length for a dab with world radius `r`.
+    fn dab_detail(&self, r: f32) -> Option<f32> {
+        if !self.dyntopo_active() {
+            return None;
+        }
+        let base = match self.brush.detail_mode {
+            DetailMode::Brush => r * Self::detail_ratio(self.brush.detail),
+            DetailMode::Constant => self.stroke_extent / Self::constant_resolution(self.brush.detail),
+        };
+        // smoothing with dynamic topology evens out and coarsens, like Sculptris Pro
+        Some(if self.stroke_tool == Tool::Smooth && self.brush.smooth_reduces { base * 4.0 } else { base })
     }
 
     /// Target edge length as a fraction of the brush radius: 35 % at
@@ -170,6 +206,31 @@ impl Editor {
         self.sculptor.set_mesh(m);
         self.redraw = true;
         Ok(n)
+    }
+
+    /// Replaces the sculpt with a remeshed version (undoable, keeps the view).
+    pub fn apply_remeshed(&mut self, m: Mesh) {
+        self.cancel_drag();
+        self.sculptor.set_mesh(m);
+        self.redraw = true;
+    }
+
+    pub fn begin_subdivide(&mut self) -> Result<(), String> {
+        self.cancel_drag();
+        let r = self.sculptor.begin_subdivide();
+        self.redraw = true;
+        r
+    }
+
+    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>) -> Result<(), String> {
+        let r = self.sculptor.finish_subdivide(fine, odd);
+        self.redraw = true;
+        r
+    }
+
+    pub fn abort_subdivide(&mut self) {
+        self.sculptor.abort_subdivide();
+        self.redraw = true;
     }
 
     pub fn set_mesh(&mut self, m: Mesh) {
@@ -220,7 +281,7 @@ impl Editor {
         }
     }
 
-    fn cancel_drag(&mut self) {
+    pub fn cancel_drag(&mut self) {
         if self.drag == Drag::Sculpt {
             self.sculptor.end_stroke();
         }
@@ -284,10 +345,16 @@ impl Editor {
         }
     }
 
-    fn dab_at(&mut self, p: Vec2, size: Vec2) {
+    fn dab_at(&mut self, p: Vec2, size: Vec2, screen_motion: Vec2) {
         let (o, d) = self.camera.ray(p, size);
         let Some(h) = self.sculptor.raycast(o, d) else { return };
-        let r = self.brush.radius_px * self.camera.world_per_point(h.point, size.y);
+        let wpp = self.camera.world_per_point(h.point, size.y);
+        let r = self.brush.radius_px * wpp;
+        // screen movement since the last dab, as a world-space vector in the view plane
+        let f = self.camera.forward();
+        let right = f.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(f);
+        let motion = (right * screen_motion.x - up * screen_motion.y) * wpp;
         let mut params = DabParams {
             tool: self.stroke_tool,
             center: h.point,
@@ -295,13 +362,15 @@ impl Editor {
             intensity: self.brush.intensity[self.stroke_tool.index()],
             negative: self.stroke_negative,
             seed_tri: h.tri,
-            detail: self.dyntopo_active().then(|| r * Self::detail_ratio(self.brush.detail)),
+            detail: self.dab_detail(r),
+            motion,
         };
         self.sculptor.dab(&params);
         if self.brush.symmetry {
             if let Some(hm) = self.sculptor.raycast(mirror_x(o), mirror_x(d)) {
                 params.center = hm.point;
                 params.seed_tri = hm.tri;
+                params.motion = mirror_x(motion);
                 self.sculptor.dab(&params);
             }
         }
@@ -313,6 +382,10 @@ impl Editor {
         let Some(h) = self.sculptor.raycast(o, d) else { return false };
         self.stroke_tool = if mods.shift && self.brush.tool != Tool::Mask { Tool::Smooth } else { self.brush.tool };
         self.stroke_negative = self.brush.negative ^ mods.ctrl;
+        if self.dyntopo_active() && self.brush.detail_mode == DetailMode::Constant {
+            let (mn, mx) = self.sculptor.mesh.bounds();
+            self.stroke_extent = (mx - mn).max_element().max(1e-6);
+        }
         self.sculptor.begin_stroke(self.dyntopo_active());
         if self.stroke_tool == Tool::Grab {
             let r = self.brush.radius_px * self.camera.world_per_point(h.point, size.y);
@@ -326,7 +399,7 @@ impl Editor {
         } else {
             // the drag state must be Sculpt while the first dab is applied
             self.drag = Drag::Sculpt;
-            self.dab_at(p, size);
+            self.dab_at(p, size, Vec2::ZERO);
             self.last_dab = p;
         }
         true
@@ -351,7 +424,7 @@ impl Editor {
             let dir = (p - from) / dist;
             from += dir * spacing;
             dist -= spacing;
-            self.dab_at(from, size);
+            self.dab_at(from, size, dir * spacing);
         }
         self.last_dab = from;
     }
@@ -430,6 +503,81 @@ mod tests {
         e.undo();
         assert_eq!(e.sculptor.tri_count(), n0);
         assert_eq!(e.sculptor.level_count(), 2);
+    }
+
+    fn stroke(e: &mut Editor, mods: Mods) {
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, mods);
+        for i in 1..=10 {
+            e.pointer_move(SIZE * 0.5 + Vec2::X * (i as f32 * 6.0), SIZE);
+        }
+        e.pointer_up();
+    }
+
+    fn mean_edge(m: &Mesh) -> f32 {
+        let (mut s, mut n) = (0.0, 0);
+        for t in &m.tris {
+            for k in 0..3 {
+                s += m.positions[t[k] as usize].distance(m.positions[t[(k + 1) % 3] as usize]);
+                n += 1;
+            }
+        }
+        s / n as f32
+    }
+
+    #[test]
+    fn constant_detail_ignores_brush_size() {
+        let tri_counts: Vec<usize> = [30.0, 90.0]
+            .iter()
+            .map(|&radius| {
+                let mut e = Editor::new();
+                e.set_mesh(Mesh::icosphere(2));
+                e.view_from(ViewDir::Front);
+                e.brush.dyntopo = true;
+                e.brush.detail_mode = DetailMode::Constant;
+                e.brush.detail = 0.5;
+                e.brush.radius_px = radius;
+                e.brush.intensity = [0.0; Tool::ALL.len()];
+                stroke(&mut e, Mods::default());
+                // edges near the stroke should approach extent / resolution
+                let target = 2.0 / Editor::constant_resolution(0.5);
+                let m = &e.sculptor.mesh;
+                let near: Vec<f32> = m
+                    .tris
+                    .iter()
+                    .filter(|t| m.positions[t[0] as usize].z > 0.97)
+                    .map(|t| m.positions[t[0] as usize].distance(m.positions[t[1] as usize]))
+                    .collect();
+                let avg = near.iter().sum::<f32>() / near.len() as f32;
+                assert!(avg < target * 1.6, "radius {radius}: {avg} vs {target}");
+                e.sculptor.tri_count()
+            })
+            .collect();
+        assert!(tri_counts[1] > tri_counts[0], "bigger brush covers more area at the same size");
+    }
+
+    #[test]
+    fn smooth_with_dyntopo_reduces_triangles() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(5));
+        e.view_from(ViewDir::Front);
+        e.brush.dyntopo = true;
+        e.brush.detail = 0.6;
+        let n0 = e.sculptor.tri_count();
+        let edge0 = mean_edge(&e.sculptor.mesh);
+        e.brush.tool = Tool::Smooth;
+        stroke(&mut e, Mods::default());
+        assert!(e.sculptor.tri_count() < n0, "{n0} -> {}", e.sculptor.tri_count());
+        assert!(mean_edge(&e.sculptor.mesh) > edge0);
+        // and with the option off it doesn't coarsen
+        let mut e2 = Editor::new();
+        e2.set_mesh(Mesh::icosphere(5));
+        e2.view_from(ViewDir::Front);
+        e2.brush.dyntopo = true;
+        e2.brush.detail = 0.6;
+        e2.brush.smooth_reduces = false;
+        e2.brush.tool = Tool::Smooth;
+        stroke(&mut e2, Mods::default());
+        assert!(e2.sculptor.tri_count() > e.sculptor.tri_count());
     }
 
     #[test]

@@ -20,12 +20,21 @@ Like SculptGL, the functions are grouped into dropdown areas:
 
 ## Features
 
-- **Brushes:** Draw, Clay, Smooth, Flatten, Inflate, Pinch, Crease, Grab and Mask, each with its own radius and
-  intensity. Hold Ctrl to invert a brush and Shift to smooth.
+- **16 brushes**, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
+  - **Draw, Clay, Clay Buildup:** add material. Clay Buildup lays down fast, square-edged strips.
+  - **Smooth, Flatten, Trim Dynamic, Scrape:** level the surface. Trim cuts peaks to crisp planes, and Scrape shaves
+    high spots (Ctrl fills low ones).
+  - **Inflate, Pinch, Crease, Dam Standard:** inflate, pinch, cut soft creases, or cut sharp, deep crease lines.
+  - **Layer:** raises the surface to a fixed height per stroke, however many times you go over it.
+  - **Grab, Snakehook, Nudge:** move the surface. Snakehook pulls out horns and tentacles (best with dynamic
+    topology), and Nudge smears it along the stroke.
+  - **Mask:** protects areas from the other brushes.
 - **X symmetry**, with a second cursor showing where the mirrored stroke lands.
 - **Dynamic topology** (like SculptGL's dynamic mode or ZBrush's Sculptris Pro): long edges under the brush are
-  split and short ones collapsed, so detail appears only where you sculpt. **Detail** sets triangle size relative to
-  the brush (35 % of the radius at 0 down to 3 % at 100 %). Turn it on and off with `T`.
+  split and short ones collapsed, so detail appears only where you sculpt. **Size by Brush** keeps triangles at a
+  share of the brush radius (35 % at Detail 0 down to 3 % at 100 %). **Size by Constant** keeps them a fixed size on
+  the model (20 to 500 across it), whatever the brush or zoom. With **Smooth brush reduces detail** on, smoothing
+  also coarsens the mesh, as in Sculptris Pro. Turn dynamic topology on and off with `T`.
 - **Multiresolution levels** (like ZBrush subdivision levels): **Subdivide** adds a smoother level above the
   highest one. Step down to rework big shapes and back up without losing fine detail. Detail is stored in each
   vertex's local frame, so it follows big-shape changes. **Delete lower** and **Delete higher** merge levels.
@@ -34,6 +43,8 @@ Like SculptGL, the functions are grouped into dropdown areas:
   merges overlapping parts into one surface, closes holes (open meshes become a thin shell) and evens out stretched
   or dynamic-topology areas. **Resolution** is the number of voxels across the longest side (16–512). **Smooth**
   relaxes the new mesh. **Project** snaps it back onto the original shape so it stays crisp. Press `R` to remesh.
+- **Background jobs:** in the desktop app, voxel remesh and subdivide run on a separate thread. A progress card with
+  **Cancel** appears, and you can keep rotating the view.
 - **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
   mesh change.
 - **Import/export** OBJ and STL. Imported meshes are rescaled for sculpting and exported at their original scale.
@@ -49,7 +60,8 @@ Like SculptGL, the functions are grouped into dropdown areas:
 | Left drag on background, Alt + left, right drag | Rotate |
 | Middle drag, Shift + right drag | Pan |
 | Wheel | Zoom |
-| `D C S F I P E G M` | Draw, Clay, Smooth, Flatten, Inflate, Pinch, Crease, Grab, Mask |
+| `D C B S F Y Q I` | Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate |
+| `P E V L G K U M` | Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask |
 | `[` `]` | Brush radius |
 | `X` / `W` / `N` | Toggle symmetry / wireframe / negative |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo / redo |
@@ -67,7 +79,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 |---|---|
 | `core/` | **clayform-core**: the engine. Mesh, brushes, undo, BVH picking, camera, editor input logic, OBJ/STL. No interface code. |
 | `app/` | **clayform-app**: the Leptos interface and wgpu (WebGL 2) viewport, compiled to WebAssembly together with the engine, so strokes never wait on the desktop backend. |
-| `src-tauri/` | **clayform**: the Tauri desktop shell. It opens the window and provides native Open/Save dialogs. |
+| `src-tauri/` | **clayform**: the Tauri desktop shell. It opens the window, provides native Open/Save dialogs, and runs remesh and subdivide jobs on a background thread (meshes travel in a compact binary format, `core/src/wire.rs`). |
 
 ## Run
 

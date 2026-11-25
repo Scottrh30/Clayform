@@ -118,3 +118,54 @@ fn browser_download(name: &str, bytes: &[u8]) -> Result<(), String> {
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
 }
+
+/// Calls a backend command with a binary body (and string headers) and
+/// returns its binary reply.
+pub async fn invoke_bytes(cmd: &str, body: &[u8], headers: &[(&str, String)]) -> Result<Vec<u8>, String> {
+    let core = tauri_core().ok_or("Not running in the desktop app")?;
+    let f: Function = Reflect::get(&core, &"invoke".into())
+        .map_err(js_err)?
+        .dyn_into()
+        .map_err(|_| "invoke is not a function".to_string())?;
+    let hdrs = js_sys::Object::new();
+    for (k, v) in headers {
+        Reflect::set(&hdrs, &(*k).into(), &v.into()).map_err(js_err)?;
+    }
+    let opts = js_sys::Object::new();
+    Reflect::set(&opts, &"headers".into(), &hdrs).map_err(js_err)?;
+    let p: Promise = f
+        .call3(&core, &cmd.into(), &Uint8Array::from(body), &opts)
+        .map_err(js_err)?
+        .dyn_into()
+        .map_err(|_| "invoke did not return a promise".to_string())?;
+    let v = JsFuture::from(p).await.map_err(js_err)?;
+    Ok(Uint8Array::new(&v).to_vec())
+}
+
+pub async fn cancel_job() {
+    let _ = invoke("cancel_job", serde_json::json!({})).await;
+}
+
+/// Calls `on_progress` with each progress value (0..1) the backend reports.
+pub fn listen_progress(on_progress: impl Fn(f32) + 'static) {
+    let Some(w) = web_sys::window() else { return };
+    let Some(event) = Reflect::get(&w, &"__TAURI__".into())
+        .ok()
+        .filter(|t| !t.is_undefined())
+        .and_then(|t| Reflect::get(&t, &"event".into()).ok())
+        .filter(|e| !e.is_undefined())
+    else {
+        return;
+    };
+    let Ok(listen) = Reflect::get(&event, &"listen".into()).and_then(|f| f.dyn_into::<Function>().map_err(|v| v.into()))
+    else {
+        return;
+    };
+    let cb = Closure::<dyn Fn(JsValue)>::new(move |e: JsValue| {
+        if let Some(p) = Reflect::get(&e, &"payload".into()).ok().and_then(|p| p.as_f64()) {
+            on_progress(p as f32);
+        }
+    });
+    let _ = listen.call2(&event, &"clayform-progress".into(), cb.as_ref());
+    cb.forget();
+}

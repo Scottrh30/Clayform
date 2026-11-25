@@ -9,25 +9,39 @@ use glam::Vec3;
 pub enum Tool {
     Draw,
     Clay,
+    ClayBuildup,
     Smooth,
     Flatten,
+    TrimDynamic,
+    Scrape,
     Inflate,
     Pinch,
     Crease,
+    DamStandard,
+    Layer,
     Grab,
+    Snakehook,
+    Nudge,
     Mask,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 9] = [
+    pub const ALL: [Tool; 16] = [
         Tool::Draw,
         Tool::Clay,
+        Tool::ClayBuildup,
         Tool::Smooth,
         Tool::Flatten,
+        Tool::TrimDynamic,
+        Tool::Scrape,
         Tool::Inflate,
         Tool::Pinch,
         Tool::Crease,
+        Tool::DamStandard,
+        Tool::Layer,
         Tool::Grab,
+        Tool::Snakehook,
+        Tool::Nudge,
         Tool::Mask,
     ];
 
@@ -39,12 +53,19 @@ impl Tool {
         match self {
             Tool::Draw => "Draw",
             Tool::Clay => "Clay",
+            Tool::ClayBuildup => "Clay Buildup",
             Tool::Smooth => "Smooth",
             Tool::Flatten => "Flatten",
+            Tool::TrimDynamic => "Trim Dynamic",
+            Tool::Scrape => "Scrape",
             Tool::Inflate => "Inflate",
             Tool::Pinch => "Pinch",
             Tool::Crease => "Crease",
+            Tool::DamStandard => "Dam Standard",
+            Tool::Layer => "Layer",
             Tool::Grab => "Grab",
+            Tool::Snakehook => "Snakehook",
+            Tool::Nudge => "Nudge",
             Tool::Mask => "Mask",
         }
     }
@@ -53,29 +74,67 @@ impl Tool {
         match self {
             Tool::Draw => 'D',
             Tool::Clay => 'C',
+            Tool::ClayBuildup => 'B',
             Tool::Smooth => 'S',
             Tool::Flatten => 'F',
+            Tool::TrimDynamic => 'Y',
+            Tool::Scrape => 'Q',
             Tool::Inflate => 'I',
             Tool::Pinch => 'P',
             Tool::Crease => 'E',
+            Tool::DamStandard => 'V',
+            Tool::Layer => 'L',
             Tool::Grab => 'G',
+            Tool::Snakehook => 'K',
+            Tool::Nudge => 'U',
             Tool::Mask => 'M',
+        }
+    }
+
+    /// One line describing what the brush does (shown as a tooltip).
+    pub fn description(self) -> &'static str {
+        match self {
+            Tool::Draw => "Raises the surface along the brush's average normal",
+            Tool::Clay => "Builds up material with a flattened top",
+            Tool::ClayBuildup => "Fast, square-edged clay strips for blocking in forms",
+            Tool::Smooth => "Relaxes the surface (also Shift with any brush)",
+            Tool::Flatten => "Pulls the surface onto a plane",
+            Tool::TrimDynamic => "Cuts peaks down to a plane, leaving crisp planar facets",
+            Tool::Scrape => "Shaves high spots off; Ctrl fills low spots instead",
+            Tool::Inflate => "Pushes each point out along its own normal",
+            Tool::Pinch => "Pulls the surface towards the brush centre",
+            Tool::Crease => "Cuts a soft groove and pinches its edges",
+            Tool::DamStandard => "Cuts a sharp, deep crease line (wrinkles, seams)",
+            Tool::Layer => "Raises the surface to a fixed height per stroke",
+            Tool::Grab => "Drags a region of the surface",
+            Tool::Snakehook => "Pulls out horns and tentacles (best with dynamic topology)",
+            Tool::Nudge => "Smears the surface sideways along the stroke",
+            Tool::Mask => "Paints a mask that protects the surface; Ctrl erases",
         }
     }
 
     pub fn default_intensity(self) -> f32 {
         match self {
             Tool::Smooth => 0.6,
-            Tool::Grab => 1.0,
+            Tool::Grab | Tool::Snakehook => 1.0,
             Tool::Mask => 0.8,
-            Tool::Flatten => 0.5,
+            Tool::Flatten | Tool::TrimDynamic | Tool::Scrape => 0.5,
+            Tool::Layer => 0.3,
+            Tool::Nudge => 0.6,
+            Tool::ClayBuildup => 0.5,
+            Tool::DamStandard => 0.45,
             _ => 0.4,
         }
     }
 
     /// Whether Ctrl / the negative toggle has a meaning for this tool.
     pub fn has_negative(self) -> bool {
-        !matches!(self, Tool::Smooth | Tool::Flatten | Tool::Grab)
+        !matches!(self, Tool::Smooth | Tool::Flatten | Tool::Grab | Tool::Snakehook | Tool::Nudge | Tool::TrimDynamic)
+    }
+
+    /// Brushes that move geometry along the stroke instead of the normal.
+    pub fn uses_motion(self) -> bool {
+        matches!(self, Tool::Snakehook | Tool::Nudge)
     }
 }
 
@@ -88,6 +147,9 @@ pub struct DabParams {
     pub seed_tri: u32,
     /// Dynamic topology: target edge length (world units), or None.
     pub detail: Option<f32>,
+    /// How far (world units, in the view plane) the brush moved since the
+    /// previous dab. Used by Snakehook and Nudge.
+    pub motion: Vec3,
 }
 
 /// One multiresolution level. The active level's mesh lives in
@@ -170,6 +232,8 @@ struct Stroke {
     /// Dynamic-topology strokes undo by restoring this whole snapshot.
     snapshot: Option<Box<State>>,
     modified: bool,
+    /// Layer brush: each vertex's position when the stroke first reached it.
+    layer_base: std::collections::HashMap<u32, Vec3>,
 }
 
 impl Stroke {
@@ -324,17 +388,38 @@ impl Sculptor {
 
     /// Adds a multiresolution level above the highest one (moving there).
     pub fn subdivide(&mut self) -> Result<(), String> {
+        self.begin_subdivide()?;
+        let (fine, odd) = self.mesh.subdivide_with_stencil(true);
+        self.finish_subdivide(fine, odd)
+    }
+
+    /// First half of a subdivision that runs elsewhere (a background
+    /// thread): records undo, moves to the top level and returns. The
+    /// current `mesh` is then the one to subdivide; finish with
+    /// `finish_subdivide` or roll back with `abort_subdivide`.
+    pub fn begin_subdivide(&mut self) -> Result<(), String> {
         self.end_stroke();
         if self.top_tri_count() * 4 > MAX_TRIANGLES {
             return Err(format!("Subdividing would exceed {} M triangles", MAX_TRIANGLES / 1_000_000));
         }
         let snap = self.snapshot();
         self.push_undo(Undo::State(snap));
+        let moved = self.level + 1 < self.levels.len();
         while self.level + 1 < self.levels.len() {
             self.step_up();
         }
-        self.mesh.compact();
-        let (fine, odd) = self.mesh.subdivide_with_stencil(true);
+        if self.mesh.compact() || moved {
+            self.topology_changed();
+        }
+        Ok(())
+    }
+
+    /// Installs a subdivided top level computed from the current mesh.
+    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>) -> Result<(), String> {
+        if fine.positions.len() != self.mesh.positions.len() + odd.len() {
+            self.abort_subdivide();
+            return Err("The subdivided mesh doesn't match the current one".into());
+        }
         let details = vec![Vec3::ZERO; fine.positions.len()];
         let coarse = std::mem::replace(&mut self.mesh, fine);
         self.levels[self.level].mesh = Some(coarse);
@@ -342,6 +427,13 @@ impl Sculptor {
         self.level += 1;
         self.topology_changed();
         Ok(())
+    }
+
+    /// Undoes `begin_subdivide` (cancelled or failed), leaving no redo entry.
+    pub fn abort_subdivide(&mut self) {
+        if let Some(Undo::State(s)) = self.undo.pop() {
+            self.restore(s);
+        }
     }
 
     /// Moves to another multiresolution level (undoable).
@@ -483,6 +575,7 @@ impl Sculptor {
             grab: Vec::new(),
             snapshot,
             modified: false,
+            layer_base: std::collections::HashMap::new(),
         });
     }
 
@@ -670,6 +763,79 @@ impl Sculptor {
                     mesh.positions[v as usize] = pv + t * (w * i * 0.25) + push * w;
                 }
             }
+            Tool::DamStandard => {
+                // deep, narrow groove: cubic falloff for the cut, strong pinch
+                let push = an * (-s * 0.07 * r * i);
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let mut t = p.center - pv;
+                    t -= an * t.dot(an);
+                    mesh.positions[v as usize] = pv + t * (w * i * 0.4) + push * (w * w * w);
+                }
+            }
+            Tool::ClayBuildup => {
+                let plane = ac + an * (s * r * 0.15);
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let d = (pv - plane).dot(an);
+                    if d * s < 0.0 {
+                        // square-edged strips: a harder falloff than Clay
+                        let w = w.sqrt();
+                        mesh.positions[v as usize] = pv - an * (d * w * i * 0.6);
+                    }
+                }
+            }
+            Tool::TrimDynamic => {
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let d = (pv - ac).dot(an);
+                    if d > 0.0 {
+                        let w = (w * 2.0).min(1.0);
+                        mesh.positions[v as usize] = pv - an * (d * w * i);
+                    }
+                }
+            }
+            Tool::Scrape => {
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let d = (pv - ac).dot(an);
+                    if d * s > 0.0 {
+                        mesh.positions[v as usize] = pv - an * (d * w * i * 0.5);
+                    }
+                }
+            }
+            Tool::Layer => {
+                // raise towards a fixed height above where the stroke found
+                // each point, so overlapping dabs don't pile up
+                let height = s * r * 0.12 * i;
+                let bases = self.stroke.as_mut().map(|st| &mut st.layer_base);
+                let mut scratch = std::collections::HashMap::new();
+                let bases = bases.unwrap_or(&mut scratch);
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let base = *bases.entry(v).or_insert(pv);
+                    let current = (pv - base).dot(an);
+                    let target = height * w.min(1.0);
+                    let step = target - current;
+                    if step * s > 0.0 {
+                        mesh.positions[v as usize] = pv + an * (step * 0.5);
+                    }
+                }
+            }
+            Tool::Snakehook => {
+                let m = p.motion * i;
+                for &(v, w) in region {
+                    mesh.positions[v as usize] += m * w;
+                }
+            }
+            Tool::Nudge => {
+                let mut m = p.motion;
+                m -= an * m.dot(an);
+                let m = m * (i * 0.7);
+                for &(v, w) in region {
+                    mesh.positions[v as usize] += m * w;
+                }
+            }
             Tool::Mask => {
                 for &(v, w) in region {
                     let m = &mut mesh.mask[v as usize];
@@ -698,6 +864,22 @@ impl Sculptor {
         }
         if let Some(st) = self.stroke.as_mut() {
             st.modified = true;
+            // Layer heights: new vertices start between their edge's ends
+            if !st.layer_base.is_empty() {
+                let pos = &self.mesh.positions;
+                let base = |b: &std::collections::HashMap<u32, Vec3>, v: u32| {
+                    b.get(&v).copied().unwrap_or(pos[v as usize])
+                };
+                for &(nv, a, b) in &stats.split_log {
+                    let mid = (base(&st.layer_base, a) + base(&st.layer_base, b)) * 0.5;
+                    st.layer_base.insert(nv, mid);
+                }
+                for &(a, b) in &stats.collapse_log {
+                    let mid = (base(&st.layer_base, a) + base(&st.layer_base, b)) * 0.5;
+                    st.layer_base.insert(a, mid);
+                    st.layer_base.remove(&b);
+                }
+            }
         }
         {
             let Sculptor { mesh, fmark, vmark2, .. } = self;
@@ -812,7 +994,7 @@ mod tests {
 
     fn dab(s: &mut Sculptor, tool: Tool, negative: bool) {
         let h = front_hit(s);
-        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri, detail: None });
+        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri, detail: None, motion: Vec3::new(0.05, 0.0, 0.0) });
         s.refresh_bvh();
     }
 
@@ -873,6 +1055,93 @@ mod tests {
         assert!(s.mesh.normals.iter().all(|n| n.is_finite()));
     }
 
+    fn top_z(s: &Sculptor) -> f32 {
+        s.mesh.positions.iter().map(|p| p.z).fold(f32::MIN, f32::max)
+    }
+
+    #[test]
+    fn trim_and_scrape_never_raise() {
+        for tool in [Tool::TrimDynamic, Tool::Scrape] {
+            let mut s = Sculptor::new(Mesh::icosphere(4));
+            let before = top_z(&s);
+            s.begin_stroke(false);
+            for _ in 0..5 {
+                dab(&mut s, tool, false);
+            }
+            s.end_stroke();
+            assert!(top_z(&s) < before - 0.005, "{tool:?} should cut the dome down");
+        }
+    }
+
+    #[test]
+    fn layer_height_is_capped_per_stroke() {
+        let mut s = Sculptor::new(Mesh::icosphere(4));
+        let before = front_hit(&s).point.z;
+        s.begin_stroke(false);
+        for _ in 0..40 {
+            dab(&mut s, Tool::Layer, false);
+        }
+        s.end_stroke();
+        let rise = front_hit(&s).point.z - before;
+        assert!(rise > 0.02 && rise <= 0.4 * 0.12 + 1e-3, "{rise}");
+    }
+
+    #[test]
+    fn layer_with_dynamic_topology_stays_level() {
+        let mut s = Sculptor::new(Mesh::icosphere(3));
+        let before = front_hit(&s).point.z;
+        s.begin_stroke(true);
+        for _ in 0..30 {
+            let h = front_hit(&s);
+            s.dab(&DabParams {
+                tool: Tool::Layer,
+                center: h.point,
+                radius: 0.4,
+                intensity: 1.0,
+                negative: false,
+                seed_tri: h.tri,
+                detail: Some(0.03),
+                motion: Vec3::ZERO,
+            });
+            s.refresh_bvh();
+        }
+        s.end_stroke();
+        // no point may rise above the layer height (no spikes from new vertices)
+        let max_rise = s.mesh.positions.iter().map(|p| p.length() - 1.0).fold(f32::MIN, f32::max);
+        assert!(max_rise <= 0.4 * 0.12 + 0.01, "{max_rise}");
+        assert!(front_hit(&s).point.z > before + 0.02);
+    }
+
+    #[test]
+    fn dam_standard_digs_deeper_than_crease() {
+        let depth = |tool| {
+            let mut s = Sculptor::new(Mesh::icosphere(4));
+            let before = front_hit(&s).point.z;
+            s.begin_stroke(false);
+            for _ in 0..3 {
+                dab(&mut s, tool, false);
+            }
+            s.end_stroke();
+            before - front_hit(&s).point.z
+        };
+        assert!(depth(Tool::DamStandard) > depth(Tool::Crease));
+    }
+
+    #[test]
+    fn snakehook_and_nudge_follow_motion() {
+        for tool in [Tool::Snakehook, Tool::Nudge] {
+            let mut s = Sculptor::new(Mesh::icosphere(4));
+            let cx: f32 = s.mesh.positions.iter().map(|p| p.x).sum();
+            s.begin_stroke(false);
+            for _ in 0..4 {
+                dab(&mut s, tool, false);
+            }
+            s.end_stroke();
+            let after: f32 = s.mesh.positions.iter().map(|p| p.x).sum();
+            assert!(after > cx + 0.05, "{tool:?} should move points along +x");
+        }
+    }
+
     #[test]
     fn grab_moves_with_mirror() {
         let mut s = Sculptor::new(Mesh::icosphere(4));
@@ -915,6 +1184,7 @@ mod tests {
                 negative: false,
                 seed_tri: h.tri,
                 detail: Some(0.03),
+                motion: Vec3::ZERO,
             });
             s.refresh_bvh();
         }
@@ -937,7 +1207,7 @@ mod tests {
         let n = s.tri_count();
         s.begin_stroke(true);
         let h = front_hit(&s);
-        s.dab(&DabParams { tool: Tool::Draw, center: h.point, radius: 0.4, intensity: 1.0, negative: false, seed_tri: h.tri, detail: Some(0.01) });
+        s.dab(&DabParams { tool: Tool::Draw, center: h.point, radius: 0.4, intensity: 1.0, negative: false, seed_tri: h.tri, detail: Some(0.01), motion: Vec3::ZERO });
         s.end_stroke();
         assert_eq!(s.tri_count(), n);
         s.delete_lower();
@@ -990,6 +1260,31 @@ mod tests {
         assert!(bump > 1.05, "{bump}");
         s.undo();
         assert_eq!(s.level(), 0);
+    }
+
+    #[test]
+    fn split_subdivide_matches_and_aborts_cleanly() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        s.set_level(0);
+        let undo_depth = s.undo.len();
+        s.begin_subdivide().unwrap();
+        assert_eq!(s.level(), 1, "moves to the top level first");
+        s.abort_subdivide();
+        assert_eq!((s.level(), s.level_count(), s.undo.len()), (0, 2, undo_depth));
+        assert!(!s.can_redo());
+        s.begin_subdivide().unwrap();
+        let (fine, odd) = s.mesh.subdivide_with_stencil(true);
+        let bytes = crate::wire::encode(&fine, &odd);
+        let (fine, odd) = crate::wire::decode(&bytes).unwrap();
+        s.finish_subdivide(fine, odd).unwrap();
+        assert_eq!((s.level(), s.level_count()), (2, 3));
+        s.set_level(0);
+        s.set_level(2);
+        s.undo();
+        s.undo();
+        s.undo();
+        assert_eq!(s.level_count(), 2);
     }
 
     #[test]

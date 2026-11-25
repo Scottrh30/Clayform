@@ -99,11 +99,17 @@ pub fn collapse_edge(m: &mut Mesh, a: u32, b: u32, touched: &mut Vec<u32>) {
     touched.push(b);
 }
 
-/// Statistics from one remesh pass.
-#[derive(Default, Debug, Clone, Copy)]
+/// Statistics from one remesh pass, plus what happened to which vertices
+/// (so per-vertex stroke data can follow the new topology).
+#[derive(Default, Debug, Clone)]
 pub struct RemeshStats {
     pub splits: usize,
     pub collapses: usize,
+    /// (new vertex, edge end a, edge end b) for every split.
+    pub split_log: Vec<(u32, u32, u32)>,
+    /// (kept vertex, removed vertex) for every collapse; the kept one moved
+    /// to their midpoint.
+    pub collapse_log: Vec<(u32, u32)>,
 }
 
 /// Re-tessellates the part of the surface inside the brush sphere so edges
@@ -187,8 +193,9 @@ pub fn remesh_region(
             if m.positions[a as usize].distance_squared(m.positions[b as usize]) <= split2 {
                 continue;
             }
-            split_edge(m, a, b, &mut touched);
+            let nv = split_edge(m, a, b, &mut touched);
             stats.splits += 1;
+            stats.split_log.push((nv, a, b));
         }
         faces.extend(before as u32..m.tris.len() as u32);
         // rings of touched vertices must be current for the next pass
@@ -231,6 +238,7 @@ pub fn remesh_region(
         }
         collapse_edge(m, a, b, &mut touched);
         stats.collapses += 1;
+        stats.collapse_log.push((a, b));
         touched.sort_unstable();
         touched.dedup();
         for &v in &touched {
