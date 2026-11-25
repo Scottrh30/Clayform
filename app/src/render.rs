@@ -7,6 +7,9 @@ use clayform_core::sculpt::GpuDirty;
 use std::collections::HashSet;
 use web_sys::HtmlCanvasElement;
 
+/// First GPU error reported by wgpu (shown in the viewport).
+pub static GPU_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 pub const SAMPLES: u32 = 4;
 
@@ -16,7 +19,28 @@ struct GpuVertex {
     pos: [f32; 3],
     nrm: [f32; 3],
     mask: f32,
-    _pad: f32,
+    /// Local concavity (+ in creases, - on ridges) for cavity shading.
+    cavity: f32,
+}
+
+/// How far a vertex sits below (+) or above (-) the average of its
+/// neighbours, relative to their spacing.
+fn cavity(mesh: &Mesh, i: usize) -> f32 {
+    let nb = mesh.neighbors(i as u32);
+    if nb.is_empty() {
+        return 0.0;
+    }
+    let p = mesh.positions[i];
+    let mut avg = clayform_core::glam::Vec3::ZERO;
+    let mut len = 0.0;
+    for &u in nb {
+        let q = mesh.positions[u as usize];
+        avg += q;
+        len += q.distance(p);
+    }
+    let k = nb.len() as f32;
+    let l = len / k;
+    if l <= 0.0 { 0.0 } else { mesh.normals[i].dot(avg / k - p) / l }
 }
 
 #[repr(C)]
@@ -24,10 +48,14 @@ struct GpuVertex {
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
+    proj: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
     params: [f32; 4],
     wire_color: [f32; 4],
     bg_top: [f32; 4],
     bg_bottom: [f32; 4],
+    viewport: [f32; 4],
+    shading: [f32; 4],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -37,6 +65,12 @@ pub struct ViewSettings {
     pub flat: bool,
     pub wireframe: bool,
     pub background: u32,
+    /// Screen-space ambient occlusion.
+    pub ao: bool,
+    pub ao_strength: f32,
+    /// Cavity shading (darken creases, lighten ridges).
+    pub cavity: bool,
+    pub cavity_strength: f32,
 }
 
 /// Background presets: (name, top colour, bottom colour), linear RGB.
@@ -47,12 +81,22 @@ pub const BACKGROUNDS: [(&str, [f32; 3], [f32; 3]); 4] = [
     ("Black", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
 ];
 
-pub const MATERIALS: [&str; 6] = ["Clay", "Red wax", "Pearl", "Jade", "Chrome", "Normals"];
+pub const MATERIALS: [&str; 7] = ["Clay", "Red wax", "Pearl", "Jade", "Chrome", "Normals", "Custom matcap"];
+/// Index of the "Custom matcap" material (a loaded image).
+pub const CUSTOM_MATCAP: u32 = 6;
+const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+const PACKED_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 struct Targets {
     size: [u32; 2],
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    /// Half-resolution packed linear depth for SSAO, its z-buffer, and the AO result.
+    ao_depth: wgpu::TextureView,
+    ao_zbuf: wgpu::TextureView,
+    ao_view: wgpu::TextureView,
+    main_bind: wgpu::BindGroup,
+    ssao_bind: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -64,6 +108,14 @@ pub struct Renderer {
     mesh_pipe: wgpu::RenderPipeline,
     wire_pipe: wgpu::RenderPipeline,
     bg_pipe: wgpu::RenderPipeline,
+    depth_pipe: wgpu::RenderPipeline,
+    ssao_pipe: wgpu::RenderPipeline,
+    main_bgl: wgpu::BindGroupLayout,
+    ssao_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    matcap_view: wgpu::TextureView,
+    /// Why ambient occlusion is unavailable on this GPU, if it is.
+    pub ao_error: Option<String>,
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     vbuf: Option<wgpu::Buffer>,
@@ -79,8 +131,8 @@ pub struct Renderer {
 }
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRS: [wgpu::VertexAttribute; 3] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
+    const ATTRS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GpuVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
@@ -117,6 +169,13 @@ impl Renderer {
             )
             .await
             .map_err(|e| format!("Could not open the graphics device: {e}"))?;
+        device.on_uncaptured_error(Box::new(|e| {
+            if let Ok(mut slot) = GPU_ERROR.lock() {
+                if slot.is_none() {
+                    *slot = Some(e.to_string());
+                }
+            }
+        }));
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
@@ -159,11 +218,122 @@ impl Renderer {
             layout: &bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
         });
+        let tex_entry = |binding: u32, sample_type: wgpu::TextureSampleType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let main_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("main textures"),
+            entries: &[
+                tex_entry(0, wgpu::TextureSampleType::Float { filterable: true }),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                tex_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
+            ],
+        });
+        let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao depth"),
+            entries: &[tex_entry(0, wgpu::TextureSampleType::Float { filterable: false })],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("layout"),
+            bind_group_layouts: &[&bgl, &main_bgl],
+            push_constant_ranges: &[],
+        });
+        let ssao_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssao layout"),
+            bind_group_layouts: &[&bgl, &ssao_bgl],
+            push_constant_ranges: &[],
+        });
+        let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("depth layout"),
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
+        // If this GPU can't build the AO passes, ambient occlusion turns
+        // itself off instead of breaking the view.
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ssao shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ssao.wgsl").into()),
+        });
+        let depth_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ao depth"),
+            layout: Some(&depth_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_shader,
+                entry_point: Some("vs_depth"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_shader,
+                entry_point: Some("fs_depth"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: PACKED_DEPTH_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let ssao_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ssao"),
+            layout: Some(&ssao_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_shader,
+                entry_point: Some("vs_full"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_shader,
+                entry_point: Some("fs_ssao"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: AO_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let ao_error = device.pop_error_scope().await;
+        if let Some(e) = &ao_error {
+            web_sys::console::warn_1(&format!("Ambient occlusion unavailable: {e}").into());
+        }
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linear clamp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let matcap_view = Self::make_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
 
         let make = |label: &str,
                     vs: &str,
@@ -247,6 +417,13 @@ impl Renderer {
             mesh_pipe,
             wire_pipe,
             bg_pipe,
+            depth_pipe,
+            ssao_pipe,
+            main_bgl,
+            ssao_bgl,
+            sampler,
+            matcap_view,
+            ao_error: ao_error.map(|e| e.to_string()),
             ubuf,
             bind,
             vbuf: None,
@@ -285,7 +462,83 @@ impl Renderer {
         };
         let msaa_view = tex("msaa", self.config.format);
         let depth_view = tex("depth", DEPTH_FORMAT);
-        self.targets = Some(Targets { size, msaa_view, depth_view });
+        let ao_size = [(size[0] / 2).max(1), (size[1] / 2).max(1)];
+        let half = |label: &str, format| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: ao_size[0], height: ao_size[1], depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let ao_depth = half("ao depth", PACKED_DEPTH_FORMAT);
+        let ao_zbuf = half("ao zbuf", DEPTH_FORMAT);
+        let ao_view = half("ao", AO_FORMAT);
+        let ssao_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssao bind"),
+            layout: &self.ssao_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&ao_depth) }],
+        });
+        let main_bind = self.main_bind_group(&ao_view);
+        self.targets = Some(Targets { size, msaa_view, depth_view, ao_depth, ao_zbuf, ao_view, main_bind, ssao_bind });
+    }
+
+    fn main_bind_group(&self, ao_view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("main bind"),
+            layout: &self.main_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(ao_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.matcap_view) },
+            ],
+        })
+    }
+
+    fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> wgpu::TextureView {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("matcap"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        tex.create_view(&Default::default())
+    }
+
+    /// Uses an RGBA8 image (sRGB) as the custom matcap.
+    pub fn set_matcap(&mut self, w: u32, h: u32, rgba: &[u8]) {
+        self.matcap_view = Self::make_texture(&self.device, &self.queue, w, h, rgba);
+        if let Some(t) = self.targets.as_mut() {
+            let bind = {
+                let ao = &t.ao_view;
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("main bind"),
+                    layout: &self.main_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(ao) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.matcap_view) },
+                    ],
+                })
+            };
+            t.main_bind = bind;
+        }
     }
 
     /// Uploads whatever changed in the mesh since the last frame.
@@ -295,7 +548,7 @@ impl Renderer {
             pos: mesh.positions[i].to_array(),
             nrm: mesh.normals[i].to_array(),
             mask: mesh.mask[i],
-            _pad: 0.0,
+            cavity: cavity(mesh, i),
         };
         if dirty.topology || self.vbuf.is_none() {
             // Dynamic topology re-uploads every frame while sculpting, so
@@ -369,12 +622,16 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, size_px: [u32; 2], view: Mat4, proj: Mat4, s: &ViewSettings) {
+    /// `ao_radius` is the ambient-occlusion sampling radius in world units.
+    pub fn render(&mut self, size_px: [u32; 2], view: Mat4, proj: Mat4, s: &ViewSettings, ao_radius: f32) {
         self.ensure_size(size_px);
+        let size = self.targets.as_ref().unwrap().size;
         let (_, top, bottom) = BACKGROUNDS[(s.background as usize).min(BACKGROUNDS.len() - 1)];
         let u = Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
             view: view.to_cols_array_2d(),
+            proj: proj.to_cols_array_2d(),
+            inv_proj: proj.inverse().to_cols_array_2d(),
             params: [
                 s.material as f32,
                 s.show_mask as u32 as f32,
@@ -384,6 +641,13 @@ impl Renderer {
             wire_color: [0.0, 0.0, 0.0, 0.35],
             bg_top: [top[0], top[1], top[2], 1.0],
             bg_bottom: [bottom[0], bottom[1], bottom[2], 1.0],
+            viewport: [size[0] as f32, size[1] as f32, 1.0 / size[0] as f32, 1.0 / size[1] as f32],
+            shading: [
+                (s.ao && self.vbuf.is_some() && self.ao_error.is_none()) as u32 as f32,
+                s.ao_strength,
+                if s.cavity { s.cavity_strength } else { 0.0 },
+                ao_radius,
+            ],
         };
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
 
@@ -397,6 +661,49 @@ impl Renderer {
         let target = frame.texture.create_view(&Default::default());
         let t = self.targets.as_ref().unwrap();
         let mut enc = self.device.create_command_encoder(&Default::default());
+        if s.ao && self.ao_error.is_none() {
+            if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {
+                // 1. depth of the sculpt at half resolution
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ao depth"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &t.ao_depth,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &t.ao_zbuf,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.depth_pipe);
+                pass.set_bind_group(0, &self.bind, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+            // 2. occlusion from that depth
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ssao"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.ao_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if self.vbuf.is_some() {
+                pass.set_pipeline(&self.ssao_pipe);
+                pass.set_bind_group(0, &self.bind, &[]);
+                pass.set_bind_group(1, &t.ssao_bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport"),
@@ -414,6 +721,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_bind_group(1, &t.main_bind, &[]);
             pass.set_pipeline(&self.bg_pipe);
             pass.draw(0..3, 0..1);
             if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {

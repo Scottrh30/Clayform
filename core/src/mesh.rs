@@ -76,24 +76,135 @@ impl Default for Marker {
     }
 }
 
-impl Mesh {
+/// Builds a mesh's connectivity and normals a slice at a time, so an
+/// interface can spread the work of a big mesh over several frames.
+pub struct MeshBuilder {
+    mesh: Mesh,
+    phase: u8,
+    i: usize,
+    tmp: Vec<u32>,
+}
+
+impl MeshBuilder {
     pub fn new(positions: Vec<Vec3>, tris: Vec<[u32; 3]>) -> Self {
         let n = positions.len();
-        let mut m = Mesh {
-            normals: vec![Vec3::Y; n],
-            mask: vec![0.0; n],
-            face_normals: vec![Vec3::Y; tris.len()],
-            positions,
-            tris,
-            vf: Vec::new(),
-            nbr: Vec::new(),
-            boundary: Vec::new(),
-            export_center: Vec3::ZERO,
-            export_scale: 1.0,
-        };
-        m.build_topology();
-        m.compute_all_normals();
-        m
+        let nt = tris.len();
+        MeshBuilder {
+            mesh: Mesh {
+                normals: vec![Vec3::Y; n],
+                mask: vec![0.0; n],
+                face_normals: vec![Vec3::Y; nt],
+                positions,
+                tris,
+                vf: vec![Vec::new(); n],
+                nbr: vec![Vec::new(); n],
+                boundary: vec![false; n],
+                export_center: Vec3::ZERO,
+                export_scale: 1.0,
+            },
+            phase: 0,
+            i: 0,
+            tmp: Vec::with_capacity(32),
+        }
+    }
+
+    /// Sets per-vertex mask and the export transform (before `finish`).
+    pub fn with_extras(mut self, mask: Option<Vec<f32>>, center: Vec3, scale: f32) -> Self {
+        if let Some(m) = mask {
+            if m.len() == self.mesh.positions.len() {
+                self.mesh.mask = m;
+            }
+        }
+        self.mesh.export_center = center;
+        self.mesh.export_scale = scale;
+        self
+    }
+
+    /// Fraction done, 0..1.
+    pub fn progress(&self) -> f32 {
+        let (nv, nt) = (self.mesh.positions.len().max(1) as f32, self.mesh.tris.len().max(1) as f32);
+        let i = self.i as f32;
+        match self.phase {
+            0 => 0.25 * i / nt,
+            1 => 0.25 + 0.45 * i / nv,
+            2 => 0.7 + 0.15 * i / nt,
+            3 => 0.85 + 0.15 * i / nv,
+            _ => 1.0,
+        }
+    }
+
+    /// Does work until finished (returns true) or until `keep_going`
+    /// (checked every few thousand items) returns false.
+    pub fn step(&mut self, keep_going: &mut dyn FnMut() -> bool) -> bool {
+        const CHUNK: usize = 4096;
+        let m = &mut self.mesh;
+        loop {
+            match self.phase {
+                0 => {
+                    let end = (self.i + CHUNK).min(m.tris.len());
+                    for fi in self.i..end {
+                        let t = m.tris[fi];
+                        if t[0] != NONE {
+                            for v in t {
+                                m.vf[v as usize].push(fi as u32);
+                            }
+                        }
+                    }
+                    self.i = end;
+                    if end == m.tris.len() {
+                        self.phase = 1;
+                        self.i = 0;
+                    }
+                }
+                1 => {
+                    let end = (self.i + CHUNK).min(m.positions.len());
+                    for v in self.i..end {
+                        m.rebuild_ring_with(v as u32, &mut self.tmp);
+                    }
+                    self.i = end;
+                    if end == m.positions.len() {
+                        self.phase = 2;
+                        self.i = 0;
+                    }
+                }
+                2 => {
+                    let end = (self.i + CHUNK).min(m.tris.len());
+                    for f in self.i..end {
+                        m.face_normals[f] = m.face_normal_raw(f);
+                    }
+                    self.i = end;
+                    if end == m.tris.len() {
+                        self.phase = 3;
+                        self.i = 0;
+                    }
+                }
+                3 => {
+                    let end = (self.i + CHUNK).min(m.positions.len());
+                    for v in self.i..end {
+                        m.normals[v] = m.vertex_normal_from_faces(v as u32);
+                    }
+                    self.i = end;
+                    if end == m.positions.len() {
+                        self.phase = 4;
+                    }
+                }
+                _ => return true,
+            }
+            if !keep_going() {
+                return self.phase >= 4;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Mesh {
+        self.step(&mut || true);
+        self.mesh
+    }
+}
+
+impl Mesh {
+    pub fn new(positions: Vec<Vec3>, tris: Vec<[u32; 3]>) -> Self {
+        MeshBuilder::new(positions, tris).finish()
     }
 
     /// Builds a mesh from a triangle soup, welding coincident vertices.
@@ -146,25 +257,6 @@ impl Mesh {
     #[inline]
     pub fn vert_faces(&self, v: u32) -> &[u32] {
         &self.vf[v as usize]
-    }
-
-    fn build_topology(&mut self) {
-        let n = self.positions.len();
-        self.vf = vec![Vec::new(); n];
-        for (fi, t) in self.tris.iter().enumerate() {
-            if t[0] == NONE {
-                continue;
-            }
-            for &v in t {
-                self.vf[v as usize].push(fi as u32);
-            }
-        }
-        self.nbr = vec![Vec::new(); n];
-        self.boundary = vec![false; n];
-        let mut tmp = Vec::with_capacity(32);
-        for v in 0..n as u32 {
-            self.rebuild_ring_with(v, &mut tmp);
-        }
     }
 
     /// Recomputes the neighbour list and boundary flag of `v` from its faces.

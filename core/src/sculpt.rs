@@ -3,7 +3,7 @@
 use crate::bvh::{Bvh, Hit};
 use crate::dyntopo::remesh_region;
 use crate::mesh::{Marker, Mesh};
-use glam::Vec3;
+use glam::{Mat3, Vec3};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -180,12 +180,23 @@ fn mesh_bytes(m: &Mesh) -> usize {
 enum Undo {
     Verts { idx: Vec<u32>, pos: Vec<Vec3>, mask: Vec<f32> },
     State(Box<State>),
+    /// Go back to this multiresolution level (level changes are exactly
+    /// reversible, so nothing needs copying).
+    Level(usize),
+    /// Remove the top level (undoes a subdivision), then go to `then_level`.
+    DropTop { then_level: usize },
+    /// Put a removed top level back (redoes a subdivision).
+    AddTop { level: Box<Level>, then_level: usize },
 }
 
 impl Undo {
     fn bytes(&self) -> usize {
         match self {
             Undo::Verts { idx, .. } => idx.len() * 20,
+            Undo::Level(_) | Undo::DropTop { .. } => 16,
+            Undo::AddTop { level, .. } => {
+                level.mesh.as_ref().map_or(0, mesh_bytes) + level.odd.len() * 16 + level.details.len() * 12
+            }
             Undo::State(s) => {
                 mesh_bytes(&s.mesh)
                     + s.levels
@@ -220,7 +231,9 @@ impl GpuDirty {
 struct GrabSet {
     verts: Vec<(u32, f32)>,
     orig: Vec<Vec3>,
-    mirror: bool,
+    /// Linear part of the symmetry copy this set belongs to (identity for
+    /// the original); the drag delta is transformed by it.
+    xf: Mat3,
 }
 
 struct Stroke {
@@ -269,6 +282,10 @@ pub struct Sculptor {
     scratch: Vec<Vec3>,
     levels: Vec<Level>,
     level: usize,
+    /// Level to return to while a split subdivision is in progress.
+    pending_level: Option<usize>,
+    /// Counts changes, so the interface can tell when there's unsaved work.
+    revision: u64,
     pub dirty: GpuDirty,
 }
 
@@ -304,6 +321,8 @@ impl Sculptor {
             scratch: Vec::new(),
             levels: vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
             level: 0,
+            pending_level: None,
+            revision: 0,
             dirty: GpuDirty { topology: true, range: None },
         }
     }
@@ -359,7 +378,13 @@ impl Sculptor {
         !self.redo.is_empty() && self.stroke.is_none()
     }
 
+    /// Changes every time the sculpt changes (strokes, undo, levels...).
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn push_undo(&mut self, u: Undo) {
+        self.revision += 1;
         self.undo.push(u);
         self.redo.clear();
         let mut total: usize = self.undo.iter().map(|u| u.bytes()).sum();
@@ -370,13 +395,36 @@ impl Sculptor {
 
     /// Replaces the mesh (new primitive, import, subdivision), undoable.
     pub fn set_mesh(&mut self, mesh: Mesh) {
+        self.set_mesh_built(mesh, None);
+    }
+
+    /// Like `set_mesh`, optionally with a picking hierarchy built elsewhere
+    /// (e.g. a slice at a time by the interface). The old sculpt moves into
+    /// the undo history instead of being copied.
+    pub fn set_mesh_built(&mut self, mesh: Mesh, bvh: Option<Bvh>) {
         self.end_stroke();
-        let snap = self.snapshot();
-        self.push_undo(Undo::State(snap));
-        self.mesh = mesh;
-        self.levels = vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }];
-        self.level = 0;
-        self.topology_changed();
+        let old = State {
+            mesh: std::mem::replace(&mut self.mesh, mesh),
+            levels: std::mem::replace(
+                &mut self.levels,
+                vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
+            ),
+            level: std::mem::replace(&mut self.level, 0),
+        };
+        self.push_undo(Undo::State(Box::new(old)));
+        self.install(bvh);
+    }
+
+    fn install(&mut self, bvh: Option<Bvh>) {
+        match bvh {
+            Some(b) => {
+                self.bvh = b;
+                self.bvh_dirty = false;
+                self.dirty.topology = true;
+                self.dirty.range = None;
+            }
+            None => self.topology_changed(),
+        }
     }
 
     fn topology_changed(&mut self) {
@@ -390,7 +438,7 @@ impl Sculptor {
     pub fn subdivide(&mut self) -> Result<(), String> {
         self.begin_subdivide()?;
         let (fine, odd) = self.mesh.subdivide_with_stencil(true);
-        self.finish_subdivide(fine, odd)
+        self.finish_subdivide(fine, odd, None)
     }
 
     /// First half of a subdivision that runs elsewhere (a background
@@ -402,8 +450,7 @@ impl Sculptor {
         if self.top_tri_count() * 4 > MAX_TRIANGLES {
             return Err(format!("Subdividing would exceed {} M triangles", MAX_TRIANGLES / 1_000_000));
         }
-        let snap = self.snapshot();
-        self.push_undo(Undo::State(snap));
+        self.pending_level = Some(self.level);
         let moved = self.level + 1 < self.levels.len();
         while self.level + 1 < self.levels.len() {
             self.step_up();
@@ -415,25 +462,78 @@ impl Sculptor {
     }
 
     /// Installs a subdivided top level computed from the current mesh.
-    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>) -> Result<(), String> {
+    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>, bvh: Option<Bvh>) -> Result<(), String> {
         if fine.positions.len() != self.mesh.positions.len() + odd.len() {
             self.abort_subdivide();
             return Err("The subdivided mesh doesn't match the current one".into());
         }
+        let then_level = self.pending_level.take().unwrap_or(self.level);
         let details = vec![Vec3::ZERO; fine.positions.len()];
         let coarse = std::mem::replace(&mut self.mesh, fine);
         self.levels[self.level].mesh = Some(coarse);
         self.levels.push(Level { mesh: None, odd, details });
         self.level += 1;
-        self.topology_changed();
+        self.install(bvh);
+        self.push_undo(Undo::DropTop { then_level });
         Ok(())
     }
 
-    /// Undoes `begin_subdivide` (cancelled or failed), leaving no redo entry.
+    /// Undoes `begin_subdivide` (cancelled or failed): back to the level
+    /// you were on, with no undo or redo entry.
     pub fn abort_subdivide(&mut self) {
-        if let Some(Undo::State(s)) = self.undo.pop() {
-            self.restore(s);
+        if let Some(l) = self.pending_level.take() {
+            self.goto_level(l);
         }
+    }
+
+    /// Changes level without recording undo.
+    fn goto_level(&mut self, target: usize) {
+        let target = target.min(self.levels.len() - 1);
+        if target == self.level {
+            return;
+        }
+        while self.level < target {
+            self.step_up();
+        }
+        while self.level > target {
+            self.step_down();
+        }
+        self.topology_changed();
+    }
+
+    /// Every level for saving: (mesh, stencils from the level below, detail).
+    pub fn project_levels(&self) -> (Vec<crate::project::LevelData<&Mesh>>, usize) {
+        let levels = self
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| crate::project::LevelData {
+                mesh: if i == self.level { &self.mesh } else { l.mesh.as_ref().expect("level mesh") },
+                stencils: l.odd.clone(),
+                details: l.details.clone(),
+            })
+            .collect();
+        (levels, self.level)
+    }
+
+    /// Replaces the whole sculpt with loaded levels (the old sculpt moves
+    /// into the undo history, so opening a project can be undone).
+    pub fn load_levels(&mut self, mut levels: Vec<crate::project::LevelData<Mesh>>, active: usize, bvh: Option<Bvh>) {
+        self.end_stroke();
+        let active = active.min(levels.len() - 1);
+        let mesh = std::mem::replace(&mut levels[active].mesh, Mesh::new(Vec::new(), Vec::new()));
+        let new_levels: Vec<Level> = levels
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| Level { mesh: (i != active).then_some(l.mesh), odd: l.stencils, details: l.details })
+            .collect();
+        let old = State {
+            mesh: std::mem::replace(&mut self.mesh, mesh),
+            levels: std::mem::replace(&mut self.levels, new_levels),
+            level: std::mem::replace(&mut self.level, active),
+        };
+        self.push_undo(Undo::State(Box::new(old)));
+        self.install(bvh);
     }
 
     /// Moves to another multiresolution level (undoable).
@@ -443,15 +543,9 @@ impl Sculptor {
         if target == self.level {
             return;
         }
-        let snap = self.snapshot();
-        self.push_undo(Undo::State(snap));
-        while self.level < target {
-            self.step_up();
-        }
-        while self.level > target {
-            self.step_down();
-        }
-        self.topology_changed();
+        let from = self.level;
+        self.goto_level(target);
+        self.push_undo(Undo::Level(from));
     }
 
     /// Level k-1 -> k: smooth-subdivide the current shape and add back the
@@ -898,12 +992,12 @@ impl Sculptor {
     }
 
     /// Starts a grab region (call once per symmetry side at stroke start).
-    pub fn grab_begin(&mut self, center: Vec3, radius: f32, seed_tri: u32, mirror: bool) {
+    pub fn grab_begin(&mut self, center: Vec3, radius: f32, seed_tri: u32, xf: Mat3) {
         self.collect_region(center, radius, seed_tri, true);
         let verts = self.region.clone();
         let orig = verts.iter().map(|&(v, _)| self.mesh.positions[v as usize]).collect();
         if let Some(st) = self.stroke.as_mut() {
-            st.grab.push(GrabSet { verts, orig, mirror });
+            st.grab.push(GrabSet { verts, orig, xf });
         }
     }
 
@@ -912,7 +1006,7 @@ impl Sculptor {
         let Some(mut st) = self.stroke.take() else { return };
         let mut moved: Vec<u32> = Vec::new();
         for set in &st.grab {
-            let d = if set.mirror { mirror_x(delta) } else { delta };
+            let d = set.xf * delta;
             for (k, &(v, w)) in set.verts.iter().enumerate() {
                 st.modified = true;
                 if st.snapshot.is_none() && st.mark.mark(v) {
@@ -929,6 +1023,7 @@ impl Sculptor {
     }
 
     fn apply(&mut self, e: Undo) -> Undo {
+        self.revision += 1;
         match e {
             Undo::Verts { idx, pos, mask } => {
                 let mut cur_pos = Vec::with_capacity(idx.len());
@@ -943,6 +1038,38 @@ impl Sculptor {
                 Undo::Verts { idx, pos: cur_pos, mask: cur_mask }
             }
             Undo::State(s) => Undo::State(self.restore(s)),
+            Undo::Level(l) => {
+                let cur = self.level;
+                self.goto_level(l);
+                Undo::Level(cur)
+            }
+            Undo::DropTop { then_level } => {
+                let cur = self.level;
+                let top = self.levels.len() - 1;
+                self.goto_level(top);
+                let coarse = self.levels[top - 1].mesh.take().expect("level mesh");
+                let fine = std::mem::replace(&mut self.mesh, coarse);
+                let mut level = self.levels.pop().expect("top level");
+                level.mesh = Some(fine);
+                self.level = top - 1;
+                self.topology_changed();
+                self.goto_level(then_level);
+                Undo::AddTop { level: Box::new(level), then_level: cur }
+            }
+            Undo::AddTop { level, then_level } => {
+                let cur = self.level;
+                let top = self.levels.len() - 1;
+                self.goto_level(top);
+                let mut level = *level;
+                let fine = level.mesh.take().expect("level mesh");
+                let coarse = std::mem::replace(&mut self.mesh, fine);
+                self.levels[top].mesh = Some(coarse);
+                self.levels.push(level);
+                self.level = top + 1;
+                self.topology_changed();
+                self.goto_level(then_level);
+                Undo::DropTop { then_level: cur }
+            }
         }
     }
 
@@ -1148,8 +1275,8 @@ mod tests {
         let h = s.raycast(Vec3::new(0.7, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         let hm = s.raycast(Vec3::new(-0.7, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         s.begin_stroke(false);
-        s.grab_begin(h.point, 0.3, h.tri, false);
-        s.grab_begin(hm.point, 0.3, hm.tri, true);
+        s.grab_begin(h.point, 0.3, h.tri, Mat3::IDENTITY);
+        s.grab_begin(hm.point, 0.3, hm.tri, Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)));
         s.grab_update(Vec3::new(0.5, 0.0, 0.0));
         s.end_stroke();
         let maxx = s.mesh.positions.iter().map(|p| p.x).fold(f32::MIN, f32::max);
@@ -1277,7 +1404,7 @@ mod tests {
         let (fine, odd) = s.mesh.subdivide_with_stencil(true);
         let bytes = crate::wire::encode(&fine, &odd);
         let (fine, odd) = crate::wire::decode(&bytes).unwrap();
-        s.finish_subdivide(fine, odd).unwrap();
+        s.finish_subdivide(fine, odd, None).unwrap();
         assert_eq!((s.level(), s.level_count()), (2, 3));
         s.set_level(0);
         s.set_level(2);
@@ -1285,6 +1412,71 @@ mod tests {
         s.undo();
         s.undo();
         assert_eq!(s.level_count(), 2);
+        assert_eq!(s.level(), 0, "back where the subdivision started");
+        s.redo();
+        assert_eq!((s.level(), s.level_count()), (2, 3));
+    }
+
+    #[test]
+    fn level_and_subdivide_undo_round_trip_detail() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        s.begin_stroke(false);
+        for _ in 0..3 {
+            dab(&mut s, Tool::Draw, false);
+        }
+        s.end_stroke();
+        let sculpted = s.mesh.positions.clone();
+        s.subdivide().unwrap();
+        s.undo(); // drop level 3
+        assert_eq!((s.level(), s.level_count()), (1, 2));
+        let err = sculpted.iter().zip(&s.mesh.positions).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max);
+        assert!(err < 1e-4, "{err}");
+        s.redo();
+        assert_eq!((s.level(), s.level_count()), (2, 3));
+        s.set_level(0);
+        s.undo();
+        assert_eq!(s.level(), 2);
+        s.redo();
+        assert_eq!(s.level(), 0);
+    }
+
+    #[test]
+    fn project_round_trip_keeps_levels_and_detail() {
+        let mut s = Sculptor::new(Mesh::icosphere(2));
+        s.subdivide().unwrap();
+        s.subdivide().unwrap();
+        s.begin_stroke(false);
+        for _ in 0..3 {
+            dab(&mut s, Tool::Draw, false);
+        }
+        s.end_stroke();
+        s.set_level(1);
+        let (levels, active) = s.project_levels();
+        let bytes = crate::project::encode(&levels, active, r#"{"hello":1}"#);
+        let p = crate::project::decode(&bytes).unwrap();
+        assert_eq!(p.settings_json, r#"{"hello":1}"#);
+        let loaded: Vec<crate::project::LevelData<Mesh>> = p
+            .levels
+            .into_iter()
+            .map(|l| {
+                let (b, st) = l.mesh.into_builder();
+                crate::project::LevelData { mesh: b.finish(), stencils: st, details: l.details }
+            })
+            .collect();
+        let mut t = Sculptor::new(Mesh::icosphere(1));
+        let rev = t.revision();
+        t.load_levels(loaded, p.active, None);
+        assert!(t.revision() > rev);
+        assert_eq!((t.level(), t.level_count()), (1, 3));
+        s.set_level(2);
+        t.set_level(2);
+        let err = s.mesh.positions.iter().zip(&t.mesh.positions).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max);
+        assert!(err < 1e-5, "{err}");
+        t.undo(); // back to level 1
+        t.undo(); // opening the project is undoable too
+        assert_eq!(t.level_count(), 1);
+        assert!(crate::project::decode(&bytes[..30]).is_err());
     }
 
     #[test]

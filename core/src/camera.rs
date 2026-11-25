@@ -17,6 +17,11 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// (target, yaw, pitch, distance), for saving.
+    pub fn clone_state(&self) -> ([f32; 3], f32, f32, f32) {
+        (self.target.to_array(), self.yaw, self.pitch, self.dist)
+    }
+
     pub fn eye(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();

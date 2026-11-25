@@ -57,7 +57,7 @@ pub async fn open_mesh() -> Result<Option<Opened>, String> {
         let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
         Ok(Some(Opened { name, bytes }))
     } else {
-        browser_pick().await
+        browser_pick(".obj,.stl").await
     }
 }
 
@@ -78,12 +78,12 @@ pub async fn save_mesh(suggested_name: &str, extension: &str, bytes: Vec<u8>) ->
     }
 }
 
-async fn browser_pick() -> Result<Option<Opened>, String> {
+async fn browser_pick(accept: &str) -> Result<Option<Opened>, String> {
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let input: web_sys::HtmlInputElement =
         doc.create_element("input").map_err(js_err)?.dyn_into().map_err(|_| "not an input".to_string())?;
     input.set_type("file");
-    input.set_accept(".obj,.stl");
+    input.set_accept(accept);
     let target = input.clone();
     let done = Promise::new(&mut |resolve: Function, _reject: Function| {
         let r1 = resolve.clone();
@@ -122,6 +122,11 @@ fn browser_download(name: &str, bytes: &[u8]) -> Result<(), String> {
 /// Calls a backend command with a binary body (and string headers) and
 /// returns its binary reply.
 pub async fn invoke_bytes(cmd: &str, body: &[u8], headers: &[(&str, String)]) -> Result<Vec<u8>, String> {
+    let v = invoke_body(cmd, body, headers).await?;
+    Ok(Uint8Array::new(&v).to_vec())
+}
+
+async fn invoke_body(cmd: &str, body: &[u8], headers: &[(&str, String)]) -> Result<JsValue, String> {
     let core = tauri_core().ok_or("Not running in the desktop app")?;
     let f: Function = Reflect::get(&core, &"invoke".into())
         .map_err(js_err)?
@@ -138,8 +143,78 @@ pub async fn invoke_bytes(cmd: &str, body: &[u8], headers: &[(&str, String)]) ->
         .map_err(js_err)?
         .dyn_into()
         .map_err(|_| "invoke did not return a promise".to_string())?;
-    let v = JsFuture::from(p).await.map_err(js_err)?;
-    Ok(Uint8Array::new(&v).to_vec())
+    JsFuture::from(p).await.map_err(js_err)
+}
+
+fn uri(s: &str) -> String {
+    js_sys::encode_uri_component(s).into()
+}
+
+pub struct OpenedProject {
+    pub name: String,
+    /// Where it lives on disk (desktop app only).
+    pub path: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+pub async fn open_project() -> Result<Option<OpenedProject>, String> {
+    open_with("open_project", ".clayform").await
+}
+
+/// Asks for a PNG or JPEG image.
+pub async fn open_image() -> Result<Option<OpenedProject>, String> {
+    open_with("open_image", "image/png,image/jpeg").await
+}
+
+async fn open_with(cmd: &str, accept: &str) -> Result<Option<OpenedProject>, String> {
+    if in_desktop_app() {
+        let v = invoke(cmd, serde_json::json!({})).await?;
+        let b = Uint8Array::new(&v).to_vec();
+        if b.len() < 4 {
+            return Ok(None);
+        }
+        let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        let path = String::from_utf8_lossy(b.get(4..4 + n).ok_or("bad reply")?).into_owned();
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+        Ok(Some(OpenedProject { name, path: Some(path), bytes: b[4 + n..].to_vec() }))
+    } else {
+        Ok(browser_pick(accept).await?.map(|o| OpenedProject { name: o.name, path: None, bytes: o.bytes }))
+    }
+}
+
+/// Saves a project to `path` (or asks where, if None). Returns the path or
+/// file name written, or None if the user cancelled.
+pub async fn save_project(bytes: Vec<u8>, path: Option<&str>, suggested_name: &str) -> Result<Option<String>, String> {
+    if in_desktop_app() {
+        let headers = [("path", uri(path.unwrap_or(""))), ("name", uri(suggested_name))];
+        let v = invoke_body("save_project", &bytes, &headers).await?;
+        Ok(v.as_string())
+    } else {
+        browser_download(suggested_name, &bytes)?;
+        Ok(Some(suggested_name.to_string()))
+    }
+}
+
+/// Window title (the native title bar in the desktop app).
+pub fn set_title(title: &str) {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        doc.set_title(title);
+    }
+    let Some(w) = web_sys::window() else { return };
+    let win = Reflect::get(&w, &"__TAURI__".into())
+        .ok()
+        .filter(|t| !t.is_undefined())
+        .and_then(|t| Reflect::get(&t, &"window".into()).ok())
+        .filter(|v| !v.is_undefined());
+    let Some(win) = win else { return };
+    let Ok(get) = Reflect::get(&win, &"getCurrentWindow".into()).and_then(|f| f.dyn_into::<Function>().map_err(|v| v.into()))
+    else {
+        return;
+    };
+    let Ok(current) = get.call0(&win) else { return };
+    if let Ok(set) = Reflect::get(&current, &"setTitle".into()).and_then(|f| f.dyn_into::<Function>().map_err(|v| v.into())) {
+        let _ = set.call1(&current, &title.into());
+    }
 }
 
 pub async fn cancel_job() {

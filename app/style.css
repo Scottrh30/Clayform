@@ -42,6 +42,7 @@ button, select, input { font: inherit; color: inherit; }
 .item:hover:not(:disabled) { background: var(--accent-2); color: #fff; }
 .item:disabled { color: #5d5e66; }
 .item .key { color: var(--dim); }
+.item span { white-space: nowrap; }
 .item:hover:not(:disabled) .key { color: #ffe1d0; }
 .item.radio::before { content: "○"; margin-right: 8px; color: var(--dim); }
 .item.radio.checked::before { content: "●"; color: var(--accent); }
@@ -138,3 +139,7 @@ button, select, input { font: inherit; color: inherit; }
 .job-fill { height: 100%; background: var(--accent); transition: width 0.12s linear; }
 .job-hint { margin-top: 6px; font-size: 11px; color: var(--dim); }
 .tool-desc { min-height: 30px; line-height: 1.3; }
+
+.doc-name { align-self: center; color: var(--dim); padding-right: 10px; margin-right: 4px; border-right: 1px solid var(--line); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-name .dirty { color: var(--accent); }
+.segmented.toggles button { min-width: 34px; }

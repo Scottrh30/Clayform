@@ -59,8 +59,32 @@ impl Reader<'_> {
     }
 }
 
+/// A decoded mesh before its connectivity is built (see `MeshBuilder`).
+pub struct Parts {
+    pub positions: Vec<Vec3>,
+    pub mask: Vec<f32>,
+    pub tris: Vec<[u32; 3]>,
+    pub stencils: Vec<[u32; 4]>,
+    pub center: Vec3,
+    pub scale: f32,
+}
+
+impl Parts {
+    /// Starts building the mesh (call `step` / `finish` on the result).
+    pub fn into_builder(self) -> (crate::mesh::MeshBuilder, Vec<[u32; 4]>) {
+        let b = crate::mesh::MeshBuilder::new(self.positions, self.tris).with_extras(Some(self.mask), self.center, self.scale);
+        (b, self.stencils)
+    }
+}
+
 /// Decodes a mesh (topology is rebuilt) and its stencils.
 pub fn decode(bytes: &[u8]) -> Result<(Mesh, Vec<[u32; 4]>), String> {
+    let (b, st) = decode_parts(bytes)?.into_builder();
+    Ok((b.finish(), st))
+}
+
+/// Decodes the raw arrays without building connectivity.
+pub fn decode_parts(bytes: &[u8]) -> Result<Parts, String> {
     if bytes.len() < 32 || &bytes[..4] != MAGIC {
         return Err("not Clayform mesh data".into());
     }
@@ -92,11 +116,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Mesh, Vec<[u32; 4]>), String> {
     for _ in 0..ns {
         stencils.push([r.u32()?, r.u32()?, r.u32()?, r.u32()?]);
     }
-    let mut mesh = Mesh::new(positions, tris);
-    mesh.mask = mask;
-    mesh.export_center = center;
-    mesh.export_scale = scale;
-    Ok((mesh, stencils))
+    Ok(Parts { positions, mask, tris, stencils, center, scale })
 }
 
 #[cfg(test)]

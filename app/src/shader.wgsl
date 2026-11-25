@@ -1,19 +1,29 @@
 struct Uniforms {
     view_proj: mat4x4<f32>,
     view: mat4x4<f32>,
+    proj: mat4x4<f32>,
+    inv_proj: mat4x4<f32>,
     // x: material id, y: show mask, z: flat shading, w: encode sRGB in the shader
     params: vec4<f32>,
     wire_color: vec4<f32>,
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    // xy: viewport size in pixels, zw: 1 / size
+    viewport: vec4<f32>,
+    // x: ambient occlusion on, y: AO strength, z: cavity strength, w: AO radius
+    shading: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var ao_tex: texture_2d<f32>;
+@group(1) @binding(1) var lin_samp: sampler;
+@group(1) @binding(2) var matcap_tex: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
     @location(1) nrm: vec3<f32>,
     @location(2) mask: f32,
+    @location(3) cavity: f32,
 };
 
 struct VOut {
@@ -21,6 +31,7 @@ struct VOut {
     @location(0) vn: vec3<f32>,
     @location(1) mask: f32,
     @location(2) vpos: vec3<f32>,
+    @location(3) cavity: f32,
 };
 
 @vertex
@@ -30,6 +41,7 @@ fn vs_mesh(v: VIn) -> VOut {
     o.vn = (u.view * vec4<f32>(v.nrm, 0.0)).xyz;
     o.vpos = (u.view * vec4<f32>(v.pos, 1.0)).xyz;
     o.mask = v.mask;
+    o.cavity = v.cavity;
     return o;
 }
 
@@ -78,6 +90,10 @@ fn material(n: vec3<f32>, id: i32) -> vec3<f32> {
         case 4: { // Chrome
             return chrome(n);
         }
+        case 6: { // Custom matcap image
+            let uv = vec2<f32>(n.x, -n.y) * 0.49 + vec2<f32>(0.5);
+            return textureSampleLevel(matcap_tex, lin_samp, uv, 0.0).rgb;
+        }
         default: { // Normals
             return srgb(n * 0.5 + vec3<f32>(0.5));
         }
@@ -94,6 +110,22 @@ fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         n = -n;
     }
     var c = material(n, i32(u.params.x + 0.5));
+    // cavity: darken creases, lift ridges
+    let k = u.shading.z;
+    if (k > 0.0) {
+        let cav = clamp(i.cavity * 7.0, -1.0, 1.0);
+        c = c * (1.0 - max(cav, 0.0) * 0.75 * k) + c * max(-cav, 0.0) * 0.35 * k;
+    }
+    // ambient occlusion (half-resolution buffer, softened with four taps)
+    if (u.shading.x > 0.5) {
+        let uv = i.clip.xy * u.viewport.zw;
+        let o = u.viewport.zw * 1.5;
+        let ao = 0.25 * (textureSampleLevel(ao_tex, lin_samp, uv + vec2<f32>(o.x, o.y), 0.0).r
+            + textureSampleLevel(ao_tex, lin_samp, uv + vec2<f32>(-o.x, o.y), 0.0).r
+            + textureSampleLevel(ao_tex, lin_samp, uv + vec2<f32>(o.x, -o.y), 0.0).r
+            + textureSampleLevel(ao_tex, lin_samp, uv + vec2<f32>(-o.x, -o.y), 0.0).r);
+        c = c * mix(1.0, ao, u.shading.y);
+    }
     if (u.params.y > 0.5) {
         let m = clamp(i.mask, 0.0, 1.0);
         c = mix(c, c * vec3<f32>(0.18, 0.2, 0.28), m * 0.85);

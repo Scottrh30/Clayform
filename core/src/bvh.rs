@@ -32,80 +32,161 @@ pub struct Hit {
 
 const LEAF_SIZE: usize = 4;
 
-impl Bvh {
-    pub fn build(mesh: &Mesh) -> Self {
-        let mut order: Vec<u32> = (0..mesh.tris.len() as u32).filter(|&f| mesh.is_alive(f)).collect();
+/// Builds a `Bvh` a slice at a time (see `MeshBuilder`).
+pub struct BvhBuilder {
+    nodes: Vec<Node>,
+    order: Vec<u32>,
+    centroids: Vec<Vec3>,
+    stack: Vec<(usize, usize, usize)>,
+    phase: u8,
+    i: usize,
+    indexed: usize,
+}
+
+impl BvhBuilder {
+    pub fn new(mesh: &Mesh) -> Self {
+        let order: Vec<u32> = (0..mesh.tris.len() as u32).filter(|&f| mesh.is_alive(f)).collect();
         let nt = order.len();
-        let centroids: Vec<Vec3> = mesh
-            .tris
-            .iter()
-            .map(|t| {
-                if t[0] == NONE {
-                    return Vec3::ZERO;
-                }
-                (mesh.positions[t[0] as usize] + mesh.positions[t[1] as usize] + mesh.positions[t[2] as usize])
-                    / 3.0
-            })
-            .collect();
         let mut nodes = Vec::with_capacity(nt.max(1) * 2 / LEAF_SIZE + 2);
         nodes.push(Node { min: Vec3::ZERO, max: Vec3::ZERO, first: 0, count: nt as u32 });
-        let mut stack = vec![(0usize, 0usize, nt)];
-        while let Some((ni, start, end)) = stack.pop() {
-            let count = end - start;
-            // centroid bounds
-            let mut cmin = Vec3::splat(f32::MAX);
-            let mut cmax = Vec3::splat(f32::MIN);
-            for &t in &order[start..end] {
-                let c = centroids[t as usize];
-                cmin = cmin.min(c);
-                cmax = cmax.max(c);
+        BvhBuilder {
+            nodes,
+            order,
+            centroids: Vec::new(),
+            stack: vec![(0, 0, nt)],
+            phase: 0,
+            i: 0,
+            indexed: mesh.tris.len(),
+        }
+    }
+
+    /// Fraction done, 0..1 (approximate while splitting nodes).
+    pub fn progress(&self) -> f32 {
+        match self.phase {
+            0 => 0.2 * self.i as f32 / self.indexed.max(1) as f32,
+            1 => 0.2 + 0.6 * (self.nodes.len() as f32 / (2.0 * self.order.len().max(1) as f32 / LEAF_SIZE as f32)).min(1.0),
+            2 => 0.8 + 0.2 * (1.0 - self.i as f32 / self.nodes.len().max(1) as f32),
+            _ => 1.0,
+        }
+    }
+
+    /// Works until done (true) or until `keep_going` returns false.
+    pub fn step(&mut self, mesh: &Mesh, keep_going: &mut dyn FnMut() -> bool) -> bool {
+        loop {
+            match self.phase {
+                0 => {
+                    let end = (self.i + 8192).min(mesh.tris.len());
+                    self.centroids.extend(mesh.tris[self.i..end].iter().map(|t| {
+                        if t[0] == NONE {
+                            Vec3::ZERO
+                        } else {
+                            (mesh.positions[t[0] as usize] + mesh.positions[t[1] as usize] + mesh.positions[t[2] as usize])
+                                / 3.0
+                        }
+                    }));
+                    self.i = end;
+                    if end == mesh.tris.len() {
+                        self.phase = 1;
+                    }
+                }
+                1 => {
+                    for _ in 0..256 {
+                        let Some((ni, start, end)) = self.stack.pop() else {
+                            self.phase = 2;
+                            self.i = self.nodes.len();
+                            break;
+                        };
+                        self.split(ni, start, end);
+                    }
+                }
+                2 => {
+                    // refit bottom-up in slices (children have larger indices)
+                    let start = self.i.saturating_sub(16384);
+                    for i in (start..self.i).rev() {
+                        refit_node(&mut self.nodes, &self.order, mesh, i);
+                    }
+                    self.i = start;
+                    if start == 0 {
+                        self.phase = 3;
+                    }
+                }
+                _ => return true,
             }
-            let ext = cmax - cmin;
-            if count <= LEAF_SIZE || ext.max_element() <= 0.0 {
-                nodes[ni] = Node { min: Vec3::ZERO, max: Vec3::ZERO, first: start as u32, count: count as u32 };
+            if !keep_going() {
+                return self.phase >= 3;
+            }
+        }
+    }
+
+    fn split(&mut self, ni: usize, start: usize, end: usize) {
+        let count = end - start;
+        let centroids = &self.centroids;
+        let mut cmin = Vec3::splat(f32::MAX);
+        let mut cmax = Vec3::splat(f32::MIN);
+        for &t in &self.order[start..end] {
+            let c = centroids[t as usize];
+            cmin = cmin.min(c);
+            cmax = cmax.max(c);
+        }
+        let ext = cmax - cmin;
+        if count <= LEAF_SIZE || ext.max_element() <= 0.0 {
+            self.nodes[ni] = Node { min: Vec3::ZERO, max: Vec3::ZERO, first: start as u32, count: count as u32 };
+            return;
+        }
+        let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+        let mid = start + count / 2;
+        self.order[start..end].select_nth_unstable_by(count / 2, |&a, &b| {
+            centroids[a as usize][axis].total_cmp(&centroids[b as usize][axis])
+        });
+        let left = self.nodes.len();
+        self.nodes.push(Node { min: Vec3::ZERO, max: Vec3::ZERO, first: 0, count: 0 });
+        self.nodes.push(Node { min: Vec3::ZERO, max: Vec3::ZERO, first: 0, count: 0 });
+        self.nodes[ni] = Node { min: Vec3::ZERO, max: Vec3::ZERO, first: left as u32, count: 0 };
+        self.stack.push((left, start, mid));
+        self.stack.push((left + 1, mid, end));
+    }
+
+    pub fn finish(mut self, mesh: &Mesh) -> Bvh {
+        self.step(mesh, &mut || true);
+        Bvh { nodes: self.nodes, order: self.order, indexed: self.indexed }
+    }
+}
+
+fn refit_node(nodes: &mut [Node], order: &[u32], mesh: &Mesh, i: usize) {
+    let n = nodes[i];
+    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    if n.count > 0 {
+        for &t in &order[n.first as usize..(n.first + n.count) as usize] {
+            if !mesh.is_alive(t) {
                 continue;
             }
-            let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
-            let mid = start + count / 2;
-            order[start..end].select_nth_unstable_by(count / 2, |&a, &b| {
-                centroids[a as usize][axis].total_cmp(&centroids[b as usize][axis])
-            });
-            let left = nodes.len();
-            nodes.push(Node { min: Vec3::ZERO, max: Vec3::ZERO, first: 0, count: 0 });
-            nodes.push(Node { min: Vec3::ZERO, max: Vec3::ZERO, first: 0, count: 0 });
-            nodes[ni] = Node { min: Vec3::ZERO, max: Vec3::ZERO, first: left as u32, count: 0 };
-            stack.push((left, start, mid));
-            stack.push((left + 1, mid, end));
+            for &v in &mesh.tris[t as usize] {
+                let p = mesh.positions[v as usize];
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
         }
-        let mut bvh = Bvh { nodes, order, indexed: mesh.tris.len() };
-        bvh.refit(mesh);
-        bvh
+    } else {
+        let l = nodes[n.first as usize];
+        let r = nodes[n.first as usize + 1];
+        mn = l.min.min(r.min);
+        mx = l.max.max(r.max);
+    }
+    nodes[i].min = mn;
+    nodes[i].max = mx;
+}
+
+impl Bvh {
+    pub fn build(mesh: &Mesh) -> Self {
+        let mut b = BvhBuilder::new(mesh);
+        b.step(mesh, &mut || true);
+        b.finish(mesh)
     }
 
     /// Recomputes all bounds bottom-up (children always have larger indices).
     pub fn refit(&mut self, mesh: &Mesh) {
         for i in (0..self.nodes.len()).rev() {
-            let n = self.nodes[i];
-            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            if n.count > 0 {
-                for &t in &self.order[n.first as usize..(n.first + n.count) as usize] {
-                    if !mesh.is_alive(t) {
-                        continue;
-                    }
-                    for &v in &mesh.tris[t as usize] {
-                        let p = mesh.positions[v as usize];
-                        mn = mn.min(p);
-                        mx = mx.max(p);
-                    }
-                }
-            } else {
-                let l = self.nodes[n.first as usize];
-                let r = self.nodes[n.first as usize + 1];
-                mn = l.min.min(r.min);
-                mx = l.max.max(r.max);
-            }
-            self.nodes[i].min = mn;
-            self.nodes[i].max = mx;
+            refit_node(&mut self.nodes, &self.order, mesh, i);
         }
     }
 

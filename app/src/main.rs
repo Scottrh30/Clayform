@@ -8,14 +8,17 @@ mod render;
 use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mods, ViewDir};
 use clayform_core::glam::Vec2;
 use clayform_core::io;
+use clayform_core::bvh::{Bvh, BvhBuilder};
 use clayform_core::mesh::Mesh;
+use clayform_core::project::{self, LevelData};
+use clayform_core::symmetry::{Symmetry, AXIS_NAMES, MAX_RADIAL};
 use clayform_core::remesh::{VoxelSettings, CANCELLED, MAX_RESOLUTION, MIN_RESOLUTION};
 use clayform_core::wire;
 use clayform_core::sculpt::{Tool, MAX_TRIANGLES};
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use render::{Renderer, ViewSettings, BACKGROUNDS, MATERIALS};
+use render::{Renderer, ViewSettings, BACKGROUNDS, CUSTOM_MATCAP, MATERIALS};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -43,7 +46,7 @@ struct Ui {
     radius: RwSignal<f32>,
     intensity: RwSignal<[f32; Tool::ALL.len()]>,
     negative: RwSignal<bool>,
-    symmetry: RwSignal<bool>,
+    symmetry: RwSignal<Symmetry>,
     dyntopo: RwSignal<bool>,
     detail: RwSignal<f32>,
     level: RwSignal<usize>,
@@ -65,7 +68,13 @@ struct Ui {
     status: RwSignal<String>,
     menu: RwSignal<Option<&'static str>>,
     cursor: RwSignal<Option<(f32, f32)>>,
-    mirror: RwSignal<Option<(f32, f32)>>,
+    mirror: RwSignal<Vec<(f32, f32)>>,
+    /// Open project: where it's saved (desktop), its file name, and the
+    /// engine revision at the last save (to show unsaved changes).
+    project_path: RwSignal<Option<String>>,
+    project_name: RwSignal<String>,
+    saved_rev: RwSignal<u64>,
+    rev: RwSignal<u64>,
     mods: RwSignal<(bool, bool)>,
     dragging: RwSignal<Drag>,
     gpu: RwSignal<Option<String>>,
@@ -90,7 +99,17 @@ impl Ui {
             job: RwSignal::new(None),
             detail_mode: RwSignal::new(b.detail_mode),
             smooth_reduces: RwSignal::new(b.smooth_reduces),
-            view: RwSignal::new(ViewSettings { material: 0, show_mask: true, flat: false, wireframe: false, background: 0 }),
+            view: RwSignal::new(ViewSettings {
+                material: 0,
+                show_mask: true,
+                flat: false,
+                wireframe: false,
+                background: 0,
+                ao: true,
+                ao_strength: 0.8,
+                cavity: true,
+                cavity_strength: 0.6,
+            }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
                 storage().and_then(|s| s.get_item(PANEL_SIDE_KEY).ok().flatten()).is_some_and(|v| v == "right"),
@@ -102,7 +121,11 @@ impl Ui {
             status: RwSignal::new("Ready — drag on the sphere to sculpt".into()),
             menu: RwSignal::new(None),
             cursor: RwSignal::new(None),
-            mirror: RwSignal::new(None),
+            mirror: RwSignal::new(Vec::new()),
+            project_path: RwSignal::new(None),
+            project_name: RwSignal::new("Untitled".into()),
+            saved_rev: RwSignal::new(0),
+            rev: RwSignal::new(0),
             mods: RwSignal::new((false, false)),
             dragging: RwSignal::new(Drag::None),
             gpu: RwSignal::new(None),
@@ -111,10 +134,20 @@ impl Ui {
 
     /// Pulls mesh statistics and undo state from the engine.
     fn refresh(self) {
-        let (v, t, u, r, lv, lc, top) = with_ed(|e| {
+        let (v, t, u, r, lv, lc, top, rev) = with_ed(|e| {
             let s = &e.sculptor;
-            (s.mesh.vertex_count(), s.tri_count(), s.can_undo(), s.can_redo(), s.level(), s.level_count(), s.top_tri_count())
+            (
+                s.mesh.vertex_count(),
+                s.tri_count(),
+                s.can_undo(),
+                s.can_redo(),
+                s.level(),
+                s.level_count(),
+                s.top_tri_count(),
+                s.revision(),
+            )
         });
+        self.rev.set(rev);
         self.stats.set((v, t));
         self.can_undo.set(u);
         self.can_redo.set(r);
@@ -145,6 +178,9 @@ enum Action {
     NewCube,
     NewPlane,
     Import,
+    OpenProject,
+    SaveProject,
+    SaveProjectAs,
     ExportObj,
     ExportStl,
     Undo,
@@ -156,6 +192,7 @@ enum Action {
     DeleteHigher,
     ToggleDyntopo,
     VoxelRemesh,
+    LoadMatcap,
     ClearMask,
     InvertMask,
     FrameMesh,
@@ -168,7 +205,14 @@ fn act(ui: Ui, a: Action) {
     ui.menu.set(None);
     let changes_mesh = !matches!(
         a,
-        Action::FrameMesh | Action::ResetCamera | Action::View(_) | Action::TogglePanelSide | Action::ExportObj | Action::ExportStl
+        Action::FrameMesh
+            | Action::ResetCamera
+            | Action::View(_)
+            | Action::TogglePanelSide
+            | Action::ExportObj
+            | Action::ExportStl
+            | Action::SaveProject
+            | Action::SaveProjectAs
     );
     if changes_mesh && ui.busy.get_untracked() {
         ui.status.set("Please wait for the current job to finish (or cancel it)".into());
@@ -188,6 +232,23 @@ fn act(ui: Ui, a: Action) {
                 Err(e) => ui.status.set(format!("Import failed: {e}")),
             }
         }),
+        Action::OpenProject => spawn_local(open_project(ui)),
+        Action::LoadMatcap => spawn_local(async move {
+            match host::open_image().await {
+                Ok(Some(f)) => match use_matcap(&f.bytes) {
+                    Ok(()) => {
+                        store_matcap(&f.bytes);
+                        ui.view.update(|v| v.material = CUSTOM_MATCAP);
+                        ui.status.set(format!("Matcap: {}", f.name));
+                    }
+                    Err(e) => ui.status.set(format!("Couldn't use that image: {e}")),
+                },
+                Ok(None) => {}
+                Err(e) => ui.status.set(format!("Couldn't open the image: {e}")),
+            }
+        }),
+        Action::SaveProject => spawn_local(save_project(ui, false)),
+        Action::SaveProjectAs => spawn_local(save_project(ui, true)),
         Action::ExportObj | Action::ExportStl => {
             let ext = if matches!(a, Action::ExportStl) { "stl" } else { "obj" };
             let bytes = with_ed(|e| {
@@ -216,9 +277,13 @@ fn act(ui: Ui, a: Action) {
                 };
                 start_job(ui, "Subdividing");
                 spawn_local(async move {
-                    let result = host::invoke_bytes("subdivide", &bytes, &[]).await.and_then(|b| wire::decode(&b));
+                    let result = host::invoke_bytes("subdivide", &bytes, &[]).await.and_then(|b| wire::decode_parts(&b));
+                    let result = match result {
+                        Ok(parts) => Ok(build_in_slices(ui, parts).await),
+                        Err(e) => Err(e),
+                    };
                     match result {
-                        Ok((fine, odd)) => match with_ed(|e| e.finish_subdivide(fine, odd)) {
+                        Ok((fine, odd, bvh)) => match with_ed(|e| e.finish_subdivide(fine, odd, Some(bvh))) {
                             Ok(()) => {
                                 let (lv, n) = with_ed(|e| (e.sculptor.level_count(), e.sculptor.tri_count()));
                                 ui.status.set(format!("Added level {lv} — {} triangles", fmt_count(n)));
@@ -270,11 +335,15 @@ fn act(ui: Ui, a: Action) {
                         ("smooth", settings.smooth.to_string()),
                         ("project", if settings.project { "1" } else { "0" }.to_string()),
                     ];
-                    let result = host::invoke_bytes("remesh", &bytes, &headers).await.and_then(|b| wire::decode(&b));
+                    let result = host::invoke_bytes("remesh", &bytes, &headers).await.and_then(|b| wire::decode_parts(&b));
+                    let result = match result {
+                        Ok(parts) => Ok(build_in_slices(ui, parts).await),
+                        Err(e) => Err(e),
+                    };
                     match result {
-                        Ok((m, _)) => {
+                        Ok((m, _, bvh)) => {
                             let n = m.tris.len();
-                            with_ed(|e| e.apply_remeshed(m));
+                            with_ed(|e| e.apply_remeshed(m, Some(bvh)));
                             ui.status.set(format!(
                                 "Remeshed — {} triangles in {:.1} s",
                                 fmt_count(n),
@@ -326,6 +395,285 @@ fn act(ui: Ui, a: Action) {
         Action::TogglePanelSide => ui.panel_right.update(|r| *r = !*r),
     }
     ui.refresh();
+}
+
+/// Builds a mesh's connectivity and picking hierarchy a slice at a time,
+/// yielding between slices so the window keeps drawing and responding.
+async fn build_in_slices(ui: Ui, parts: wire::Parts) -> (Mesh, Vec<[u32; 4]>, Bvh) {
+    let (mut b, stencils) = parts.into_builder();
+    ui.job.set(Some(("Finishing", 0.0)));
+    loop {
+        let t0 = now_ms();
+        let done = b.step(&mut || now_ms() - t0 < 12.0);
+        ui.job.set(Some(("Finishing", b.progress() * 0.7)));
+        if done {
+            break;
+        }
+        sleep_ms(0).await;
+    }
+    let mesh = b.finish();
+    let mut bb = BvhBuilder::new(&mesh);
+    loop {
+        let t0 = now_ms();
+        let done = bb.step(&mesh, &mut || now_ms() - t0 < 12.0);
+        ui.job.set(Some(("Finishing", 0.7 + bb.progress() * 0.3)));
+        if done {
+            break;
+        }
+        sleep_ms(0).await;
+    }
+    let bvh = bb.finish(&mesh);
+    (mesh, stencils, bvh)
+}
+
+/// Interface settings stored in a project file.
+fn settings_json(ui: Ui) -> String {
+    let (cam, brush) = with_ed(|e| (e.camera.clone_state(), e.brush));
+    let v = ui.view.get_untracked();
+    let vx = ui.voxel.get_untracked();
+    serde_json::json!({
+        "camera": { "target": cam.0, "yaw": cam.1, "pitch": cam.2, "dist": cam.3, "fov": ui.fov.get_untracked() },
+        "brush": {
+            "tool": brush.tool.index(),
+            "radius": brush.radius_px,
+            "intensity": brush.intensity.to_vec(),
+            "negative": brush.negative,
+            "mirror": brush.symmetry.mirror,
+            "radial": brush.symmetry.radial,
+            "radial_axis": brush.symmetry.radial_axis,
+            "local": brush.symmetry.local,
+            "dyntopo": brush.dyntopo,
+            "detail": brush.detail,
+            "constant_detail": brush.detail_mode == DetailMode::Constant,
+            "smooth_reduces": brush.smooth_reduces,
+        },
+        "view": {
+            "material": v.material, "show_mask": v.show_mask, "flat": v.flat, "wireframe": v.wireframe,
+            "background": v.background, "ao": v.ao, "ao_strength": v.ao_strength,
+            "cavity": v.cavity, "cavity_strength": v.cavity_strength,
+        },
+        "voxel": { "resolution": vx.resolution, "smooth": vx.smooth, "project": vx.project },
+    })
+    .to_string()
+}
+
+fn apply_settings(ui: Ui, json: &str) {
+    let Ok(j) = serde_json::from_str::<serde_json::Value>(json) else { return };
+    let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
+    let b = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_bool());
+    if let Some(c) = j.get("camera") {
+        let t = c.get("target").and_then(|t| t.as_array()).map(|a| {
+            let g = |i: usize| a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+            clayform_core::glam::Vec3::new(g(0), g(1), g(2))
+        });
+        with_ed(|e| {
+            if let Some(t) = t {
+                e.camera.target = t;
+            }
+            if let Some(y) = f(c, "yaw") {
+                e.camera.yaw = y;
+            }
+            if let Some(p) = f(c, "pitch") {
+                e.camera.pitch = p;
+            }
+            if let Some(d) = f(c, "dist") {
+                e.camera.dist = d;
+            }
+            e.redraw = true;
+        });
+        if let Some(fov) = f(c, "fov") {
+            ui.fov.set(fov);
+        }
+    }
+    if let Some(br) = j.get("brush") {
+        if let Some(i) = br.get("tool").and_then(|x| x.as_u64()) {
+            if let Some(t) = Tool::ALL.get(i as usize) {
+                ui.tool.set(*t);
+            }
+        }
+        if let Some(r) = f(br, "radius") {
+            ui.radius.set(r);
+        }
+        if let Some(a) = br.get("intensity").and_then(|x| x.as_array()) {
+            ui.intensity.update(|arr| {
+                for (k, v) in a.iter().enumerate().take(arr.len()) {
+                    if let Some(v) = v.as_f64() {
+                        arr[k] = v as f32;
+                    }
+                }
+            });
+        }
+        if let Some(n) = b(br, "negative") {
+            ui.negative.set(n);
+        }
+        ui.symmetry.update(|s| {
+            if let Some(m) = br.get("mirror").and_then(|x| x.as_array()) {
+                for (k, v) in m.iter().enumerate().take(3) {
+                    s.mirror[k] = v.as_bool().unwrap_or(false);
+                }
+            }
+            if let Some(r) = br.get("radial").and_then(|x| x.as_u64()) {
+                s.radial = (r as u32).clamp(1, MAX_RADIAL);
+            }
+            if let Some(a) = br.get("radial_axis").and_then(|x| x.as_u64()) {
+                s.radial_axis = (a as usize).min(2);
+            }
+            if let Some(l) = b(br, "local") {
+                s.local = l;
+            }
+        });
+        if let Some(d) = b(br, "dyntopo") {
+            ui.dyntopo.set(d);
+        }
+        if let Some(d) = f(br, "detail") {
+            ui.detail.set(d);
+        }
+        if let Some(c) = b(br, "constant_detail") {
+            ui.detail_mode.set(if c { DetailMode::Constant } else { DetailMode::Brush });
+        }
+        if let Some(r) = b(br, "smooth_reduces") {
+            ui.smooth_reduces.set(r);
+        }
+    }
+    if let Some(v) = j.get("view") {
+        ui.view.update(|s| {
+            if let Some(m) = v.get("material").and_then(|x| x.as_u64()) {
+                s.material = m as u32;
+            }
+            s.show_mask = b(v, "show_mask").unwrap_or(s.show_mask);
+            s.flat = b(v, "flat").unwrap_or(s.flat);
+            s.wireframe = b(v, "wireframe").unwrap_or(s.wireframe);
+            if let Some(bg) = v.get("background").and_then(|x| x.as_u64()) {
+                s.background = bg as u32;
+            }
+            s.ao = b(v, "ao").unwrap_or(s.ao);
+            s.ao_strength = f(v, "ao_strength").unwrap_or(s.ao_strength);
+            s.cavity = b(v, "cavity").unwrap_or(s.cavity);
+            s.cavity_strength = f(v, "cavity_strength").unwrap_or(s.cavity_strength);
+        });
+    }
+    if let Some(v) = j.get("voxel") {
+        ui.voxel.update(|s| {
+            if let Some(r) = v.get("resolution").and_then(|x| x.as_u64()) {
+                s.resolution = r as u32;
+            }
+            if let Some(m) = v.get("smooth").and_then(|x| x.as_u64()) {
+                s.smooth = m as u32;
+            }
+            s.project = b(v, "project").unwrap_or(s.project);
+        });
+    }
+}
+
+async fn save_project(ui: Ui, ask: bool) {
+    let path = if ask { None } else { ui.project_path.get_untracked() };
+    with_ed(|e| e.cancel_drag());
+    // (settings_json reads the editor itself, so build it first)
+    let settings = settings_json(ui);
+    let bytes = with_ed(|e| {
+        let (levels, active) = e.sculptor.project_levels();
+        project::encode(&levels, active, &settings)
+    });
+    let name = {
+        let n = ui.project_name.get_untracked();
+        if n.ends_with(".clayform") { n } else { format!("{n}.clayform") }
+    };
+    let rev = ui.rev.get_untracked();
+    let mb = bytes.len() as f64 / 1e6;
+    match host::save_project(bytes, path.as_deref(), &name).await {
+        Ok(Some(p)) => {
+            let file = p.rsplit(['/', '\\']).next().unwrap_or(&p).to_string();
+            if host::in_desktop_app() {
+                ui.project_path.set(Some(p.clone()));
+            }
+            ui.project_name.set(file.trim_end_matches(".clayform").to_string());
+            ui.saved_rev.set(rev);
+            ui.status.set(format!("Saved {p} ({mb:.1} MB)"));
+        }
+        Ok(None) => {}
+        Err(e) => ui.status.set(format!("Save failed: {e}")),
+    }
+}
+
+async fn open_project(ui: Ui) {
+    let opened = match host::open_project().await {
+        Ok(Some(o)) => o,
+        Ok(None) => return,
+        Err(e) => {
+            ui.status.set(format!("Open failed: {e}"));
+            return;
+        }
+    };
+    let parts = match project::decode(&opened.bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            ui.status.set(format!("Open failed: {e}"));
+            return;
+        }
+    };
+    start_job(ui, "Opening");
+    let active = parts.active;
+    let mut levels: Vec<LevelData<Mesh>> = Vec::with_capacity(parts.levels.len());
+    let mut active_bvh = None;
+    for (i, l) in parts.levels.into_iter().enumerate() {
+        let (mesh, stencils, bvh) = build_in_slices(ui, l.mesh).await;
+        if i == active {
+            active_bvh = Some(bvh);
+        }
+        levels.push(LevelData { mesh, stencils, details: l.details });
+    }
+    with_ed(|e| {
+        e.cancel_drag();
+        e.sculptor.load_levels(levels, active, active_bvh);
+        e.redraw = true;
+    });
+    apply_settings(ui, &parts.settings_json);
+    ui.project_path.set(opened.path);
+    ui.project_name.set(opened.name.trim_end_matches(".clayform").to_string());
+    end_job(ui);
+    ui.saved_rev.set(ui.rev.get_untracked());
+    ui.status.set(format!("Opened {}", opened.name));
+}
+
+const MATCAP_KEY: &str = "clayform.matcap";
+
+/// Decodes a PNG/JPEG and installs it as the custom matcap.
+fn use_matcap(bytes: &[u8]) -> Result<(), String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let img = if img.width().max(img.height()) > 1024 {
+        img.resize(1024, 1024, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    RENDERER.with(|r| match r.borrow_mut().as_mut() {
+        Some(r) => {
+            r.set_matcap(w, h, rgba.as_raw());
+            Ok(())
+        }
+        None => Err("the 3D view isn't ready".to_string()),
+    })?;
+    with_ed(|e| e.redraw = true);
+    Ok(())
+}
+
+/// Remembers the matcap between sessions (if it's small enough).
+fn store_matcap(bytes: &[u8]) {
+    use base64::Engine as _;
+    if bytes.len() < 3_000_000 {
+        if let Some(s) = storage() {
+            let _ = s.set_item(MATCAP_KEY, &base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+    }
+}
+
+fn restore_matcap() {
+    use base64::Engine as _;
+    let Some(data) = storage().and_then(|s| s.get_item(MATCAP_KEY).ok().flatten()) else { return };
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+        let _ = use_matcap(&bytes);
+    }
 }
 
 fn start_job(ui: Ui, label: &'static str) {
@@ -388,6 +736,10 @@ fn start_frame_loop(canvas: web_sys::HtmlCanvasElement, ui: Ui) {
 }
 
 fn draw_frame(canvas: &web_sys::HtmlCanvasElement, ui: Ui) {
+    if let Some(e) = render::GPU_ERROR.lock().ok().and_then(|mut g| g.take()) {
+        log(&format!("GPU error: {e}"));
+        ui.gpu.set(Some(e));
+    }
     let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
     let (cw, ch) = (canvas.client_width() as f64, canvas.client_height() as f64);
     if cw < 1.0 || ch < 1.0 {
@@ -409,7 +761,7 @@ fn draw_frame(canvas: &web_sys::HtmlCanvasElement, ui: Ui) {
         RENDERER.with(|r| {
             if let Some(r) = r.borrow_mut().as_mut() {
                 r.sync_mesh(&e.sculptor.mesh, &mut e.sculptor.dirty, view.wireframe);
-                r.render([w, h], e.camera.view(), e.camera.proj((cw / ch) as f32), &view);
+                r.render([w, h], e.camera.view(), e.camera.proj((cw / ch) as f32), &view, e.camera.dist * 0.06);
             }
         });
     });
@@ -443,7 +795,11 @@ fn Viewport(ui: Ui) -> impl IntoView {
             match Renderer::new(canvas.clone()).await {
                 Ok(r) => {
                     log(&format!("Clayform renderer: {}", r.adapter_name));
+                    if let Some(e) = &r.ao_error {
+                        ui.status.set(format!("Ambient occlusion isn't available on this GPU: {e}"));
+                    }
                     RENDERER.with(|slot| *slot.borrow_mut() = Some(r));
+                    restore_matcap();
                     with_ed(|e| e.redraw = true);
                     start_frame_loop(canvas, ui);
                 }
@@ -478,10 +834,10 @@ fn Viewport(ui: Ui) -> impl IntoView {
             if e.drag() != Drag::None {
                 e.pointer_move(p, size);
             }
-            e.mirror_screen_point(p, size)
+            e.mirror_screen_points(p, size)
         });
         ui.cursor.set(Some((p.x, p.y)));
-        ui.mirror.set(mirror.map(|m| (m.x, m.y)));
+        ui.mirror.set(mirror.into_iter().map(|m| (m.x, m.y)).collect());
     };
     let on_up = move |_ev: ev::PointerEvent| {
         with_ed(|e| e.pointer_up());
@@ -512,7 +868,7 @@ fn Viewport(ui: Ui) -> impl IntoView {
                 on:pointermove=on_move
                 on:pointerup=on_up
                 on:pointercancel=on_up
-                on:pointerleave=move |_| if ui.dragging.get_untracked() == Drag::None { ui.cursor.set(None); ui.mirror.set(None) }
+                on:pointerleave=move |_| if ui.dragging.get_untracked() == Drag::None { ui.cursor.set(None); ui.mirror.set(Vec::new()) }
                 on:wheel=on_wheel
                 on:contextmenu=|ev: ev::MouseEvent| ev.prevent_default()
             ></canvas>
@@ -528,12 +884,18 @@ fn Viewport(ui: Ui) -> impl IntoView {
                     cy=move || ui.cursor.get().map(|c| c.1).unwrap_or(-999.0)
                     r="1.5" fill=brush_color
                 ></circle>
-                <circle
-                    cx=move || ui.mirror.get().map(|c| c.0).unwrap_or(-999.0)
-                    cy=move || ui.mirror.get().map(|c| c.1).unwrap_or(-999.0)
-                    r=move || ui.radius.get()
-                    fill="none" stroke=brush_color stroke-width="1" stroke-opacity="0.45"
-                ></circle>
+                {move || {
+                    let r = ui.radius.get();
+                    ui.mirror
+                        .get()
+                        .into_iter()
+                        .map(|(x, y)| {
+                            view! {
+                                <circle cx=x cy=y r=r fill="none" stroke=brush_color stroke-width="1" stroke-opacity="0.45"></circle>
+                            }
+                        })
+                        .collect_view()
+                }}
             </svg>
             <Show when=move || ui.job.get().is_some()>
                 <div class="job-card">
@@ -678,10 +1040,17 @@ fn MenuBar(ui: Ui) -> impl IntoView {
     view! {
         <header class="menubar">
             <span class="brand">"Clayform"</span>
+            <span class="doc-name" title=move || ui.project_path.get().unwrap_or_else(|| "Not saved yet".into())>
+                {move || ui.project_name.get()}
+                <span class="dirty" title="Unsaved changes">{move || if ui.rev.get() != ui.saved_rev.get() { " •" } else { "" }}</span>
+            </span>
             <Menu ui id="file" label="File">
-                <Item ui action=Action::Import label="Import OBJ / STL…" key="Ctrl+O" />
+                <Item ui action=Action::OpenProject label="Open project…" key="Ctrl+O" />
+                <Item ui action=Action::SaveProject label="Save project" key="Ctrl+S" />
+                <Item ui action=Action::SaveProjectAs label="Save project as…" key="Ctrl+Shift+S" />
                 <div class="sep"></div>
-                <Item ui action=Action::ExportObj label="Export OBJ…" key="Ctrl+S" />
+                <Item ui action=Action::Import label="Import OBJ / STL…" key="Ctrl+I" />
+                <Item ui action=Action::ExportObj label="Export OBJ…" key="Ctrl+E" />
                 <Item ui action=Action::ExportStl label="Export STL…" />
             </Menu>
             <Menu ui id="edit" label="Edit">
@@ -760,7 +1129,9 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"D C B S F Y Q I"</td><td>"Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate"</td></tr>
                         <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask"</td></tr>
                         <tr><td>"[  ]"</td><td>"Brush radius"</td></tr>
-                        <tr><td>"X / W / N"</td><td>"Symmetry / wireframe / negative"</td></tr>
+                        <tr><td>"X / W / N"</td><td>"Mirror X / wireframe / negative"</td></tr>
+                        <tr><td>"Ctrl+O / Ctrl+S / Ctrl+Shift+S"</td><td>"Open / save / save project as"</td></tr>
+                        <tr><td>"Ctrl+I / Ctrl+E"</td><td>"Import / export mesh"</td></tr>
                         <tr><td>"Ctrl+D"</td><td>"Subdivide (add a level)"</td></tr>
                         <tr><td>"Page Up / Page Down"</td><td>"Higher / lower level"</td></tr>
                         <tr><td>"T"</td><td>"Dynamic topology on/off"</td></tr>
@@ -829,7 +1200,51 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     on_change=move |v| ui.intensity.update(|a| a[ui.tool.get_untracked().index()] = v)
                 />
                 <Check label="Negative  (N / hold Ctrl)" value=ui.negative on_change=move |v| ui.negative.set(v) />
-                <Check label="Symmetry X  (X)" value=ui.symmetry on_change=move |v| ui.symmetry.set(v) />
+                <div class="subhead">"Symmetry"</div>
+                <div class="row">
+                    <span class="label">"Mirror"</span>
+                    <div class="segmented toggles">
+                        {(0..3usize)
+                            .map(|a| {
+                                view! {
+                                    <button
+                                        title=format!("Mirror across {}{}", AXIS_NAMES[a], if a == 0 { "  (X key)" } else { "" })
+                                        class:on=move || ui.symmetry.get().mirror[a]
+                                        on:click=move |_| ui.symmetry.update(|s| s.mirror[a] = !s.mirror[a])
+                                    >{AXIS_NAMES[a]}</button>
+                                }
+                            })
+                            .collect_view()}
+                    </div>
+                </div>
+                <Slider
+                    label="Radial"
+                    min=1.0 max=MAX_RADIAL as f32 step=1.0
+                    value=Signal::derive(move || ui.symmetry.get().radial as f32)
+                    on_change=move |v| ui.symmetry.update(|s| s.radial = v as u32)
+                    format=|v| if v < 1.5 { "Off".to_string() } else { format!("{v:.0}×") }
+                />
+                <div class="row">
+                    <span class="label">"Around"</span>
+                    <div class="segmented">
+                        {(0..3usize)
+                            .map(|a| {
+                                view! {
+                                    <button
+                                        title=format!("Radial copies around the {} axis", AXIS_NAMES[a])
+                                        class:on=move || ui.symmetry.get().radial_axis == a
+                                        on:click=move |_| ui.symmetry.update(|s| s.radial_axis = a)
+                                    >{AXIS_NAMES[a]}</button>
+                                }
+                            })
+                            .collect_view()}
+                    </div>
+                </div>
+                <Check
+                    label="Around the model's centre"
+                    value=Signal::derive(move || ui.symmetry.get().local)
+                    on_change=move |v| ui.symmetry.update(|s| s.local = v)
+                />
             </Folder>
             <Folder title="Masking">
                 <div class="row buttons">
@@ -973,6 +1388,31 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                             .collect_view()}
                     </select>
                 </label>
+                <div class="row buttons">
+                    <button on:click=move |_| act(ui, Action::LoadMatcap)>"Load matcap image…"</button>
+                </div>
+                <Check
+                    label="Ambient occlusion"
+                    value=Signal::derive(move || ui.view.get().ao)
+                    on_change=move |v| ui.view.update(|s| s.ao = v)
+                />
+                <Slider
+                    label="Strength"
+                    min=0.0 max=1.0 step=0.01
+                    value=Signal::derive(move || ui.view.get().ao_strength)
+                    on_change=move |v| ui.view.update(|s| s.ao_strength = v)
+                />
+                <Check
+                    label="Cavity shading"
+                    value=Signal::derive(move || ui.view.get().cavity)
+                    on_change=move |v| ui.view.update(|s| s.cavity = v)
+                />
+                <Slider
+                    label="Strength"
+                    min=0.0 max=1.0 step=0.01
+                    value=Signal::derive(move || ui.view.get().cavity_strength)
+                    on_change=move |v| ui.view.update(|s| s.cavity_strength = v)
+                />
                 <Check
                     label="Flat shading"
                     value=Signal::derive(move || ui.view.get().flat)
@@ -1017,8 +1457,11 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "z" if ev.shift_key() => act(ui, Action::Redo),
             "z" => act(ui, Action::Undo),
             "y" => act(ui, Action::Redo),
-            "o" => act(ui, Action::Import),
-            "s" => act(ui, Action::ExportObj),
+            "o" => act(ui, Action::OpenProject),
+            "s" if ev.shift_key() => act(ui, Action::SaveProjectAs),
+            "s" => act(ui, Action::SaveProject),
+            "i" => act(ui, Action::Import),
+            "e" => act(ui, Action::ExportObj),
             "d" => act(ui, Action::Subdivide),
             "1" => act(ui, Action::View(ViewDir::Back)),
             "3" => act(ui, Action::View(ViewDir::Left)),
@@ -1032,7 +1475,7 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "[" => ui.radius.update(|r| *r = (*r / 1.15).max(4.0)),
             "]" => ui.radius.update(|r| *r = (*r * 1.15).min(400.0)),
             "w" => ui.view.update(|s| s.wireframe = !s.wireframe),
-            "x" => ui.symmetry.update(|s| *s = !*s),
+            "x" => ui.symmetry.update(|s| s.mirror[0] = !s.mirror[0]),
             "n" => ui.negative.update(|s| *s = !*s),
             "home" | "." => act(ui, Action::FrameMesh),
             "1" => act(ui, Action::View(ViewDir::Front)),
@@ -1086,6 +1529,11 @@ fn App() -> impl IntoView {
             e.redraw = true;
         });
     });
+    // window title shows the project and unsaved changes
+    Effect::new(move || {
+        let dirty = ui.rev.get() != ui.saved_rev.get();
+        host::set_title(&format!("{}{} — Clayform", ui.project_name.get(), if dirty { " •" } else { "" }));
+    });
     // remember which side the panel is on
     Effect::new(move || {
         let right = ui.panel_right.get();
@@ -1125,7 +1573,8 @@ fn App() -> impl IntoView {
                 <span class="sep">"|"</span>
                 <span>{move || {
                     let t = ui.tool.get();
-                    format!("{}{}", t.name(), if ui.symmetry.get() { " · Sym X" } else { "" })
+                    let sym = ui.symmetry.get().label();
+                    if sym.is_empty() { t.name().to_string() } else { format!("{} · {}", t.name(), sym) }
                 }}</span>
                 <span class="sep">"|"</span>
                 <span>{move || {

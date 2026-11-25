@@ -29,7 +29,8 @@ Like SculptGL, the functions are grouped into dropdown areas:
   - **Grab, Snakehook, Nudge:** move the surface. Snakehook pulls out horns and tentacles (best with dynamic
     topology), and Nudge smears it along the stroke.
   - **Mask:** protects areas from the other brushes.
-- **X symmetry**, with a second cursor showing where the mirrored stroke lands.
+- **Symmetry:** mirror across X, Y and/or Z, plus **radial** copies (2–32 around X, Y or Z), about the world
+  origin or the model's own centre. Ghost cursors show where every copy lands.
 - **Dynamic topology** (like SculptGL's dynamic mode or ZBrush's Sculptris Pro): long edges under the brush are
   split and short ones collapsed, so detail appears only where you sculpt. **Size by Brush** keeps triangles at a
   share of the brush radius (35 % at Detail 0 down to 3 % at 100 %). **Size by Constant** keeps them a fixed size on
@@ -44,11 +45,16 @@ Like SculptGL, the functions are grouped into dropdown areas:
   or dynamic-topology areas. **Resolution** is the number of voxels across the longest side (16–512). **Smooth**
   relaxes the new mesh. **Project** snaps it back onto the original shape so it stays crisp. Press `R` to remesh.
 - **Background jobs:** in the desktop app, voxel remesh and subdivide run on a separate thread. A progress card with
-  **Cancel** appears, and you can keep rotating the view.
+  **Cancel** appears, and you can keep rotating the view. The finished mesh is then prepared a slice at a time between
+  frames, and undo no longer copies the whole sculpt for level changes, subdivisions or remeshes, so the window
+  doesn't freeze at the end.
 - **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
   mesh change.
-- **Import/export** OBJ and STL. Imported meshes are rescaled for sculpting and exported at their original scale.
-- **Viewport:** WebGL 2 through wgpu, 4× MSAA, six procedural matcaps, wireframe and flat shading.
+- **Import/export** OBJ and STL (Ctrl+I / Ctrl+E). Imported meshes are rescaled for sculpting and exported at their original scale.
+- **Projects (.clayform):** save and open your work with every level, the mask, the camera and all brush and view
+  settings. The title bar shows ` •` when there are unsaved changes, and opening a project can be undone.
+- **Viewport:** ambient occlusion and cavity shading (each with a strength slider), custom matcaps loaded from
+  PNG or JPEG images (remembered between sessions), and WebGL 2 through wgpu, 4× MSAA, six procedural matcaps, wireframe and flat shading.
 
 ## Controls
 
@@ -63,13 +69,14 @@ Like SculptGL, the functions are grouped into dropdown areas:
 | `D C B S F Y Q I` | Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate |
 | `P E V L G K U M` | Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask |
 | `[` `]` | Brush radius |
-| `X` / `W` / `N` | Toggle symmetry / wireframe / negative |
+| `X` / `W` / `N` | Toggle mirror X / wireframe / negative |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo / redo |
+| Ctrl+O / Ctrl+S / Ctrl+Shift+S | Open / save / save project as |
 | Ctrl+D | Subdivide (add a level) |
 | Page Up / Page Down | Higher / lower level |
 | `T` | Dynamic topology on/off |
 | `R` | Voxel remesh |
-| Ctrl+O / Ctrl+S | Import / export OBJ |
+| Ctrl+I / Ctrl+E | Import / export mesh |
 | Home | Frame mesh |
 | `1` `3` `7` (Ctrl for the opposite side) | Front, right, top views |
 
@@ -91,7 +98,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: meshes, subdivision, dynamic topology, multiresolution, voxel remesh, picking, brushes, strokes, undo, symmetry, OBJ/STL).
+Tests: `cargo test` (engine: symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh, picking, brushes, strokes, undo, symmetry, OBJ/STL).
 
 ## Windows build
 
@@ -106,3 +113,9 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 ## Roadmap ideas
 
 ZRemesher-style retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
+
+## Automated testing hook
+
+If the `CLAYFORM_TEST_FILE` environment variable is set, the desktop app's Open project, Save project and Load matcap
+use that file instead of showing a dialog. It exists for scripted UI tests on machines with nobody to click the
+dialogs, and normal use never sets it.

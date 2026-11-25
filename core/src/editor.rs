@@ -4,7 +4,9 @@
 use crate::camera::Camera;
 use crate::mesh::Mesh;
 use crate::remesh::{voxel_remesh, VoxelSettings};
-use crate::sculpt::{mirror_x, DabParams, Sculptor, Tool};
+use crate::sculpt::{DabParams, Sculptor, Tool};
+use crate::symmetry::{apply_point, Symmetry};
+use glam::Mat3;
 use glam::{Vec2, Vec3, Vec4};
 
 /// How dynamic topology picks its triangle size.
@@ -22,7 +24,7 @@ pub struct Brush {
     pub radius_px: f32,
     pub intensity: [f32; Tool::ALL.len()],
     pub negative: bool,
-    pub symmetry: bool,
+    pub symmetry: Symmetry,
     /// Dynamic topology on/off (only applies with a single level).
     pub dyntopo: bool,
     /// Dynamic-topology detail, 0 (coarse) to 1 (fine).
@@ -39,7 +41,7 @@ impl Default for Brush {
             radius_px: 60.0,
             intensity: Tool::ALL.map(|t| t.default_intensity()),
             negative: false,
-            symmetry: true,
+            symmetry: Symmetry::default(),
             dyntopo: false,
             detail: 0.7,
             detail_mode: DetailMode::Brush,
@@ -92,6 +94,8 @@ pub struct Editor {
     grab: Option<(Vec3, Vec3)>,
     /// Size of the model when the stroke started (constant-detail mode).
     stroke_extent: f32,
+    /// Centre for local symmetry, measured when a stroke starts.
+    sym_center: Vec3,
     /// Set whenever the picture changes; the interface clears it after drawing.
     pub redraw: bool,
 }
@@ -115,6 +119,7 @@ impl Editor {
             last_pos: Vec2::ZERO,
             grab: None,
             stroke_extent: 2.0,
+            sym_center: Vec3::ZERO,
             redraw: true,
         };
         e.frame_mesh();
@@ -209,9 +214,9 @@ impl Editor {
     }
 
     /// Replaces the sculpt with a remeshed version (undoable, keeps the view).
-    pub fn apply_remeshed(&mut self, m: Mesh) {
+    pub fn apply_remeshed(&mut self, m: Mesh, bvh: Option<crate::bvh::Bvh>) {
         self.cancel_drag();
-        self.sculptor.set_mesh(m);
+        self.sculptor.set_mesh_built(m, bvh);
         self.redraw = true;
     }
 
@@ -222,8 +227,13 @@ impl Editor {
         r
     }
 
-    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>) -> Result<(), String> {
-        let r = self.sculptor.finish_subdivide(fine, odd);
+    pub fn finish_subdivide(
+        &mut self,
+        fine: Mesh,
+        odd: Vec<[u32; 4]>,
+        bvh: Option<crate::bvh::Bvh>,
+    ) -> Result<(), String> {
+        let r = self.sculptor.finish_subdivide(fine, odd, bvh);
         self.redraw = true;
         r
     }
@@ -345,6 +355,17 @@ impl Editor {
         }
     }
 
+    /// Centre the symmetry copies are made about.
+    pub fn symmetry_center(&self) -> Vec3 {
+        if self.brush.symmetry.local { self.sym_center } else { Vec3::ZERO }
+    }
+
+    /// Re-measures the model centre used by local symmetry.
+    pub fn update_symmetry_center(&mut self) {
+        let (mn, mx) = self.sculptor.mesh.bounds();
+        self.sym_center = (mn + mx) * 0.5;
+    }
+
     fn dab_at(&mut self, p: Vec2, size: Vec2, screen_motion: Vec2) {
         let (o, d) = self.camera.ray(p, size);
         let Some(h) = self.sculptor.raycast(o, d) else { return };
@@ -366,11 +387,12 @@ impl Editor {
             motion,
         };
         self.sculptor.dab(&params);
-        if self.brush.symmetry {
-            if let Some(hm) = self.sculptor.raycast(mirror_x(o), mirror_x(d)) {
+        let c = self.symmetry_center();
+        for m in self.brush.symmetry.copies() {
+            if let Some(hm) = self.sculptor.raycast(apply_point(m, c, o), m * d) {
                 params.center = hm.point;
                 params.seed_tri = hm.tri;
-                params.motion = mirror_x(motion);
+                params.motion = m * motion;
                 self.sculptor.dab(&params);
             }
         }
@@ -386,13 +408,17 @@ impl Editor {
             let (mn, mx) = self.sculptor.mesh.bounds();
             self.stroke_extent = (mx - mn).max_element().max(1e-6);
         }
+        if self.brush.symmetry.local {
+            self.update_symmetry_center();
+        }
         self.sculptor.begin_stroke(self.dyntopo_active());
         if self.stroke_tool == Tool::Grab {
             let r = self.brush.radius_px * self.camera.world_per_point(h.point, size.y);
-            self.sculptor.grab_begin(h.point, r, h.tri, false);
-            if self.brush.symmetry {
-                if let Some(hm) = self.sculptor.raycast(mirror_x(o), mirror_x(d)) {
-                    self.sculptor.grab_begin(hm.point, r, hm.tri, true);
+            self.sculptor.grab_begin(h.point, r, h.tri, Mat3::IDENTITY);
+            let c = self.symmetry_center();
+            for m in self.brush.symmetry.copies() {
+                if let Some(hm) = self.sculptor.raycast(apply_point(m, c, o), m * d) {
+                    self.sculptor.grab_begin(hm.point, r, hm.tri, m);
                 }
             }
             self.grab = Some((h.point, self.camera.forward()));
@@ -429,20 +455,34 @@ impl Editor {
         self.last_dab = from;
     }
 
-    /// Where the mirrored brush lands on screen, if symmetry is on and the
-    /// cursor is over the mesh.
-    pub fn mirror_screen_point(&self, p: Vec2, size: Vec2) -> Option<Vec2> {
-        if !self.brush.symmetry {
-            return None;
+    /// Where each symmetric copy of the brush lands on screen (cursor over
+    /// the mesh, copies facing the camera only).
+    pub fn mirror_screen_points(&self, p: Vec2, size: Vec2) -> Vec<Vec2> {
+        let copies = self.brush.symmetry.copies();
+        if copies.is_empty() {
+            return Vec::new();
         }
         let (o, d) = self.camera.ray(p, size);
-        let h = self.sculptor.raycast(o, d)?;
-        let clip = self.camera.proj(size.x / size.y) * self.camera.view() * Vec4::from((mirror_x(h.point), 1.0));
-        if clip.w <= 0.0 {
-            return None;
-        }
-        let ndc = clip.truncate() / clip.w;
-        Some(Vec2::new((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y))
+        let Some(h) = self.sculptor.raycast(o, d) else { return Vec::new() };
+        let n = self.sculptor.mesh.face_normal_raw(h.tri as usize);
+        let c = self.symmetry_center();
+        let vp = self.camera.proj(size.x / size.y) * self.camera.view();
+        let eye = self.camera.eye();
+        copies
+            .into_iter()
+            .filter_map(|m| {
+                let q = apply_point(m, c, h.point);
+                if (m * n).dot(eye - q) <= 0.0 {
+                    return None; // on the far side of the model
+                }
+                let clip = vp * Vec4::from((q, 1.0));
+                if clip.w <= 0.0 {
+                    return None;
+                }
+                let ndc = clip.truncate() / clip.w;
+                Some(Vec2::new((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y))
+            })
+            .collect()
     }
 }
 
@@ -580,6 +620,61 @@ mod tests {
         assert!(e2.sculptor.tri_count() > e.sculptor.tri_count());
     }
 
+    fn raised(e: &Editor, dir: Vec3) -> bool {
+        let (o, d) = (dir * 5.0, -dir);
+        e.sculptor.raycast(o, d).is_some_and(|h| h.point.length() > 1.01)
+    }
+
+    fn dab_front(e: &mut Editor) {
+        e.brush.intensity = [1.0; Tool::ALL.len()];
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        for i in 0..6 {
+            e.pointer_move(SIZE * 0.5 + Vec2::new(0.0, if i % 2 == 0 { 12.0 } else { 0.0 }), SIZE);
+        }
+        e.pointer_up();
+        e.sculptor.refresh_bvh();
+    }
+
+    #[test]
+    fn radial_symmetry_makes_copies_around_the_axis() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.brush.symmetry = Symmetry { mirror: [false; 3], radial: 4, radial_axis: 1, local: false };
+        dab_front(&mut e);
+        for dir in [Vec3::Z, Vec3::X, Vec3::NEG_Z, Vec3::NEG_X] {
+            assert!(raised(&e, dir), "no copy facing {dir:?}");
+        }
+        assert!(!raised(&e, Vec3::Y));
+    }
+
+    #[test]
+    fn mirror_y_and_local_centre() {
+        let mut e = Editor::new();
+        let mut m = Mesh::icosphere(4);
+        for p in &mut m.positions {
+            p.y += 0.5; // model centre is (0, 0.5, 0)
+        }
+        m.compute_all_normals();
+        e.set_mesh(m);
+        e.view_from(ViewDir::Front);
+        e.brush.symmetry = Symmetry { mirror: [false, true, false], radial: 1, radial_axis: 1, local: true };
+        // stroke on the upper front; the copy should land on the lower front
+        e.brush.intensity = [1.0; Tool::ALL.len()];
+        let d = Vec3::NEG_Z;
+        let before_low = e.sculptor.raycast(Vec3::new(0.0, 0.0, 5.0), d).unwrap().point.z;
+        let target = Vec3::new(0.0, 1.0, 0.87);
+        let clip = e.camera.proj(SIZE.x / SIZE.y) * e.camera.view() * Vec4::from((target, 1.0));
+        let ndc = clip.truncate() / clip.w;
+        let sp = Vec2::new((ndc.x * 0.5 + 0.5) * SIZE.x, (0.5 - ndc.y * 0.5) * SIZE.y);
+        e.pointer_down(Button::Left, sp, SIZE, Mods::default());
+        e.pointer_move(sp + Vec2::new(10.0, 0.0), SIZE);
+        e.pointer_up();
+        e.sculptor.refresh_bvh();
+        let after_low = e.sculptor.raycast(Vec3::new(0.0, 0.0, 5.0), d).unwrap().point.z;
+        assert!(after_low > before_low + 0.01, "{before_low} -> {after_low}");
+    }
+
     #[test]
     fn press_off_mesh_orbits() {
         let mut e = Editor::new();
@@ -603,7 +698,7 @@ mod tests {
         let mut e = Editor::new();
         e.view_from(ViewDir::Front);
         let p = Vec2::new(SIZE.x * 0.5 + 100.0, SIZE.y * 0.5);
-        let m = e.mirror_screen_point(p, SIZE).unwrap();
+        let m = e.mirror_screen_points(p, SIZE)[0];
         assert!((m.x - (SIZE.x * 0.5 - 100.0)).abs() < 3.0, "{m:?}");
     }
 }

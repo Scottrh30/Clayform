@@ -7,8 +7,10 @@ pub mod dyntopo;
 pub mod editor;
 pub mod io;
 pub mod mesh;
+pub mod project;
 pub mod remesh;
 pub mod sculpt;
+pub mod symmetry;
 pub mod wire;
 
 pub use glam;
