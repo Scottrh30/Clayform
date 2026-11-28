@@ -49,6 +49,7 @@ pub enum Tool {
     Chisel,
     CurveTube,
     CurveStrap,
+    Morph,
 }
 
 /// What the Anchors brush does while dragging.
@@ -81,7 +82,7 @@ impl AnchorMode {
 pub const TOOL_CATEGORIES: [&str; 7] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves", "Stamps"];
 
 impl Tool {
-    pub const ALL: [Tool; 41] = [
+    pub const ALL: [Tool; 42] = [
         Tool::Draw,
         Tool::Clay,
         Tool::ClayBuildup,
@@ -123,6 +124,7 @@ impl Tool {
         Tool::Chisel,
         Tool::CurveTube,
         Tool::CurveStrap,
+        Tool::Morph,
     ];
 
     /// Index into `TOOL_CATEGORIES`.
@@ -194,6 +196,7 @@ impl Tool {
             Tool::Chisel => "Chisel",
             Tool::CurveTube => "Curve Tube",
             Tool::CurveStrap => "Curve Strap",
+            Tool::Morph => "Morph",
         }
     }
 
@@ -272,6 +275,7 @@ impl Tool {
             Tool::Chisel => "Drag out a 3D shape (rivet, button, star…) pressed onto the surface; Ctrl presses it in",
             Tool::CurveTube => "Draw a curve over the model, release to add a round tube along it",
             Tool::CurveStrap => "Draw a curve over the model, release to add a flat strap lying on the surface",
+            Tool::Morph => "Brushes the surface back towards the stored morph target",
         }
     }
 
@@ -301,7 +305,7 @@ impl Tool {
             && !matches!(
                 self,
                 Smooth | Flatten | Snakehook | Nudge | TrimDynamic | Planar | TrimFront | Polish | HPolish | MPolish
-                    | SmoothValleys | SmoothPeaks | SmoothStronger | CurveSnakehook | GroupPaint | CurveTube | CurveStrap
+                    | SmoothValleys | SmoothPeaks | SmoothStronger | CurveSnakehook | GroupPaint | CurveTube | CurveStrap | Morph
             )
     }
 
@@ -408,18 +412,19 @@ pub struct DragInput {
 /// from level k-1, and its detail: per-vertex offsets from that smooth
 /// subdivision, in each vertex's local frame so they follow the surface.
 #[derive(Clone)]
-struct Level {
-    mesh: Option<Mesh>,
-    odd: Vec<[u32; 4]>,
-    details: Vec<Vec3>,
+pub(crate) struct Level {
+    pub(crate) mesh: Option<Mesh>,
+    pub(crate) odd: Vec<[u32; 4]>,
+    pub(crate) details: Vec<Vec3>,
 }
 
 /// Everything about the sculpt that a topology change can affect.
 #[derive(Clone)]
-struct State {
-    mesh: Mesh,
-    levels: Vec<Level>,
-    level: usize,
+pub(crate) struct State {
+    pub(crate) mesh: Mesh,
+    pub(crate) levels: Vec<Level>,
+    pub(crate) level: usize,
+    pub(crate) extra: crate::detail::Extra,
 }
 
 fn mesh_bytes(m: &Mesh) -> usize {
@@ -427,8 +432,10 @@ fn mesh_bytes(m: &Mesh) -> usize {
 }
 
 /// A state to restore; applying one returns its inverse.
-enum Undo {
+pub(crate) enum Undo {
     Verts { idx: Vec<u32>, pos: Vec<Vec3>, mask: Vec<f32> },
+    /// Sculpt layers / morph target and the active level's positions.
+    Extra(Box<(crate::detail::Extra, Vec<Vec3>)>),
     State(Box<State>),
     /// Go back to this multiresolution level (level changes are exactly
     /// reversible, so nothing needs copying).
@@ -450,6 +457,7 @@ impl Undo {
             Undo::AddTop { level, .. } => {
                 level.mesh.as_ref().map_or(0, mesh_bytes) + level.odd.len() * 16 + level.details.len() * 12
             }
+            Undo::Extra(b) => b.0.bytes() + b.1.len() * 12,
             Undo::State(s) => {
                 mesh_bytes(&s.mesh)
                     + s.levels
@@ -545,10 +553,10 @@ struct GrabSet {
     bounds: (Vec3, Vec3),
 }
 
-struct Stroke {
+pub(crate) struct Stroke {
     mark: Marker,
-    touched: Vec<u32>,
-    old_pos: Vec<Vec3>,
+    pub(crate) touched: Vec<u32>,
+    pub(crate) old_pos: Vec<Vec3>,
     old_mask: Vec<f32>,
     grab: Vec<GrabSet>,
     /// Dynamic-topology strokes undo by restoring this whole snapshot.
@@ -567,7 +575,7 @@ struct Stroke {
 
 impl Stroke {
     #[inline]
-    fn touch(&mut self, v: u32, mesh: &Mesh) {
+    pub(crate) fn touch(&mut self, v: u32, mesh: &Mesh) {
         self.modified = true;
         if self.snapshot.is_some() {
             return;
@@ -631,26 +639,31 @@ pub struct Sculptor {
     pub mesh: Mesh,
     /// Brush tip shaping (set by the editor before each stroke / dab).
     pub tip: Tip,
-    bvh: Bvh,
+    pub(crate) bvh: Bvh,
     bvh_dirty: bool,
     /// Faces moved since the last refit (empty with `bvh_dirty` = refit all).
     bvh_faces: Vec<u32>,
-    undo: Vec<Undo>,
+    pub(crate) undo: Vec<Undo>,
     redo: Vec<Undo>,
     /// What each undo / redo step did, for the history list.
-    undo_labels: Vec<String>,
+    pub(crate) undo_labels: Vec<String>,
     redo_labels: Vec<String>,
     /// Label for the next undo step (set just before the change).
     next_label: Option<String>,
     vmark: Marker,
     vmark2: Marker,
     fmark: Marker,
-    stroke: Option<Stroke>,
-    region: Vec<(u32, f32)>,
+    pub(crate) stroke: Option<Stroke>,
+    pub(crate) region: Vec<(u32, f32)>,
     stack: Vec<u32>,
     scratch: Vec<Vec3>,
-    levels: Vec<Level>,
-    level: usize,
+    pub(crate) levels: Vec<Level>,
+    pub(crate) level: usize,
+    /// Sculpt layers and the morph target.
+    pub(crate) extra: crate::detail::Extra,
+    /// The highest level as it was before the last topology change, for
+    /// "Reproject higher levels" (mesh, how many levels it had above the base).
+    pub(crate) lost_top: Option<(std::sync::Arc<Mesh>, usize)>,
     /// Level to return to while a split subdivision is in progress.
     pending_level: Option<usize>,
     /// Counts changes, so the interface can tell when there's unsaved work.
@@ -695,6 +708,8 @@ impl Sculptor {
             scratch: Vec::new(),
             levels: vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
             level: 0,
+            extra: Default::default(),
+            lost_top: None,
             pending_level: None,
             revision: 0,
             dirty: GpuDirty { topology: true, ..Default::default() },
@@ -717,7 +732,7 @@ impl Sculptor {
 
     /// Dynamic topology needs a single level (like ZBrush's Sculptris Pro).
     pub fn dyntopo_allowed(&self) -> bool {
-        self.levels.len() == 1
+        self.levels.len() == 1 && self.extra.layers.is_empty()
     }
 
     /// Triangle count of the highest level.
@@ -730,8 +745,8 @@ impl Sculptor {
         }
     }
 
-    fn snapshot(&self) -> Box<State> {
-        Box::new(State { mesh: self.mesh.clone(), levels: self.levels.clone(), level: self.level })
+    pub(crate) fn snapshot(&self) -> Box<State> {
+        Box::new(State { mesh: self.mesh.clone(), levels: self.levels.clone(), level: self.level, extra: self.extra.clone() })
     }
 
     fn restore(&mut self, s: Box<State>) -> Box<State> {
@@ -740,6 +755,7 @@ impl Sculptor {
             mesh: std::mem::replace(&mut self.mesh, s.mesh),
             levels: std::mem::replace(&mut self.levels, s.levels),
             level: std::mem::replace(&mut self.level, s.level),
+            extra: std::mem::replace(&mut self.extra, s.extra),
         });
         self.topology_changed();
         cur
@@ -757,7 +773,7 @@ impl Sculptor {
         self.revision
     }
 
-    fn push_undo(&mut self, u: Undo) {
+    pub(crate) fn push_undo(&mut self, u: Undo) {
         self.revision += 1;
         let label = self.next_label.take().unwrap_or_else(|| {
             match &u {
@@ -767,6 +783,7 @@ impl Sculptor {
                 Undo::DropTop { .. } => "Subdivide",
                 Undo::AddTop { .. } => "Remove level",
                 Undo::Groups { .. } => "Polygroups",
+                Undo::Extra(_) => "Layers",
             }
             .to_string()
         });
@@ -815,6 +832,13 @@ impl Sculptor {
     /// the undo history instead of being copied.
     pub fn set_mesh_built(&mut self, mesh: Mesh, bvh: Option<Bvh>) {
         self.end_stroke();
+        self.stop_recording();
+        // keep the highest level's shape so its detail can be reprojected
+        if self.levels.len() > 1 {
+            let top = self.levels.len() - 1;
+            self.goto_level(top);
+            self.lost_top = Some((std::sync::Arc::new(self.mesh.clone()), top));
+        }
         let old = State {
             mesh: std::mem::replace(&mut self.mesh, mesh),
             levels: std::mem::replace(
@@ -822,6 +846,7 @@ impl Sculptor {
                 vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
             ),
             level: std::mem::replace(&mut self.level, 0),
+            extra: std::mem::take(&mut self.extra),
         };
         self.push_undo(Undo::State(Box::new(old)));
         self.install(bvh);
@@ -841,7 +866,7 @@ impl Sculptor {
         }
     }
 
-    fn topology_changed(&mut self) {
+    pub(crate) fn topology_changed(&mut self) {
         self.bvh = Bvh::build(&self.mesh);
         self.bvh_dirty = false;
         self.bvh_faces.clear();
@@ -862,6 +887,7 @@ impl Sculptor {
     /// `finish_subdivide` or roll back with `abort_subdivide`.
     pub fn begin_subdivide(&mut self) -> Result<(), String> {
         self.end_stroke();
+        self.stop_recording();
         if self.top_tri_count() * 4 > MAX_TRIANGLES {
             return Err(format!("Subdividing would exceed {} M triangles", MAX_TRIANGLES / 1_000_000));
         }
@@ -902,7 +928,7 @@ impl Sculptor {
     }
 
     /// Changes level without recording undo.
-    fn goto_level(&mut self, target: usize) {
+    pub(crate) fn goto_level(&mut self, target: usize) {
         let target = target.min(self.levels.len() - 1);
         if target == self.level {
             return;
@@ -975,6 +1001,7 @@ impl Sculptor {
             mesh: std::mem::replace(&mut self.mesh, mesh),
             levels: std::mem::replace(&mut self.levels, new_levels),
             level: std::mem::replace(&mut self.level, active),
+            extra: std::mem::take(&mut self.extra),
         };
         self.push_undo(Undo::State(Box::new(old)));
         self.install(bvh);
@@ -983,6 +1010,7 @@ impl Sculptor {
     /// Moves to another multiresolution level (undoable).
     pub fn set_level(&mut self, target: usize) {
         self.end_stroke();
+        self.stop_recording();
         let target = target.min(self.levels.len() - 1);
         if target == self.level {
             return;
@@ -1067,6 +1095,9 @@ impl Sculptor {
         let snap = self.snapshot();
         self.set_label("Delete lower levels");
         self.push_undo(Undo::State(snap));
+        self.stop_recording();
+        let cut = self.level;
+        self.extra.shift_levels(cut);
         self.levels.drain(0..self.level);
         self.levels[0].odd = Vec::new();
         self.levels[0].details = Vec::new();
@@ -1084,6 +1115,8 @@ impl Sculptor {
         self.set_label("Delete higher levels");
         self.push_undo(Undo::State(snap));
         self.levels.truncate(self.level + 1);
+        let keep = self.level;
+        self.extra.drop_above(keep);
         self.topology_changed();
     }
 
@@ -1146,6 +1179,26 @@ impl Sculptor {
             group_seen: std::collections::HashSet::new(),
         });
     }
+
+    /// Name of the running stroke's undo step.
+    pub(crate) fn stroke_label(&self) -> Option<&str> {
+        self.stroke.as_ref().and_then(|s| s.label.as_deref())
+    }
+
+    pub(crate) fn add_revision(&mut self) {
+        self.revision += 1;
+    }
+
+    /// Every vertex may have moved: refit picking, redraw everything.
+    pub(crate) fn mark_all_moved(&mut self) {
+        self.bvh_dirty = true;
+        self.bvh_faces.clear();
+        self.dirty.all(self.mesh.positions.len());
+    }
+
+    /// Per-sculpt data added by later features (see `export_extras`).
+    pub(crate) fn export_more_extras(&self, _out: &mut Vec<u8>) {}
+    pub(crate) fn import_more_extras(&mut self, _tag: &[u8; 4], _body: &[u8]) {}
 
     /// Puts every point the current stroke has moved back where it was
     /// (Drag Rect redraws its stamp this way while you drag).
@@ -1308,7 +1361,7 @@ impl Sculptor {
         }
     }
 
-    fn after_deform(&mut self, verts_from_region: bool, extra: Option<&[u32]>) {
+    pub(crate) fn after_deform(&mut self, verts_from_region: bool, extra: Option<&[u32]>) {
         let mut list: Vec<u32> = Vec::new();
         let verts: &[u32] = if verts_from_region {
             list.extend(self.region.iter().map(|r| r.0));
@@ -1676,6 +1729,14 @@ impl Sculptor {
                     mesh.positions[v as usize] = x[k];
                 }
             }
+            Tool::Morph => {
+                if let Some(target) = self.extra.morph_at(self.level, mesh.positions.len()) {
+                    for &(v, w) in region {
+                        let pv = mesh.positions[v as usize];
+                        mesh.positions[v as usize] = pv.lerp(target[v as usize], (w * i).min(1.0));
+                    }
+                }
+            }
             Tool::Chisel => {
                 // raise (or press in) the shape's height field over the disc
                 let shape = self.tip.chisel.unwrap_or(ChiselShape::Rivet);
@@ -1964,6 +2025,21 @@ impl Sculptor {
                 Undo::Verts { idx, pos: cur_pos, mask: cur_mask }
             }
             Undo::State(s) => Undo::State(self.restore(s)),
+            Undo::Extra(b) => {
+                let (extra, pos) = *b;
+                let cur_extra = std::mem::replace(&mut self.extra, extra);
+                let cur_pos = if pos.len() == self.mesh.positions.len() {
+                    let c = std::mem::replace(&mut self.mesh.positions, pos);
+                    self.mesh.compute_all_normals();
+                    self.dirty.all(self.mesh.positions.len());
+                    self.bvh_dirty = true;
+                    self.bvh_faces.clear();
+                    c
+                } else {
+                    Vec::new()
+                };
+                Undo::Extra(Box::new((cur_extra, cur_pos)))
+            }
             Undo::Groups { faces, groups } => {
                 let mut cur = Vec::with_capacity(faces.len());
                 for (k, &f) in faces.iter().enumerate() {

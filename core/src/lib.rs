@@ -6,6 +6,7 @@ pub mod bvh;
 pub mod camera;
 pub mod dyntopo;
 pub mod deform;
+pub mod detail;
 pub mod editor;
 pub mod export;
 pub mod io;

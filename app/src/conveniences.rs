@@ -97,7 +97,9 @@ pub async fn open_project_bytes(ui: Ui, name: String, path: Option<String>, byte
         }
         let fallback = if k == 0 { base.clone() } else { format!("{base} {}", k + 1) };
         let info = scene_ui::parse_info(&st.info_json, &fallback);
-        scene.push((info, clayform_core::sculpt::Sculptor::from_levels(levels, active, active_bvh)));
+        let mut sc = clayform_core::sculpt::Sculptor::from_levels(levels, active, active_bvh);
+        sc.import_extras(&st.extras);
+        scene.push((info, sc));
     }
     with_ed(|e| {
         e.load_scene(scene, parts.active_subtool);

@@ -325,11 +325,12 @@ impl Editor {
     }
 
     /// Every SubTool's levels (for saving), with its info and active level.
-    pub fn scene_levels(&self) -> Vec<(SubToolInfo, Vec<crate::project::LevelData<&Mesh>>, usize)> {
+    pub fn scene_levels(&self) -> Vec<(SubToolInfo, Vec<crate::project::LevelData<&Mesh>>, usize, Vec<u8>)> {
         (0..self.subtools.len())
             .map(|i| {
-                let (levels, active) = self.sculptor_at(i).project_levels();
-                (self.subtools[i].info.clone(), levels, active)
+                let s = self.sculptor_at(i);
+                let (levels, active) = s.project_levels();
+                (self.subtools[i].info.clone(), levels, active, s.export_extras())
             })
             .collect()
     }
@@ -339,5 +340,28 @@ impl Editor {
         (0..self.subtools.len()).map(|i| self.sculptor_at(i).revision()).sum::<u64>()
             + self.subtools.len() as u64 * 1_000_003
             + self.subtools.iter().map(|s| s.info.id).sum::<u64>()
+    }
+}
+
+impl Editor {
+    /// Project All: pulls the active SubTool onto the other visible SubTools'
+    /// surfaces along its normals (within `reach`, a fraction of its size).
+    pub fn project_all(&mut self, reach: f32, strength: f32) -> Result<usize, String> {
+        let others: Vec<usize> = self.visible_indices().into_iter().filter(|&i| i != self.active).collect();
+        if others.is_empty() {
+            return Err("Show another SubTool to project its detail from".into());
+        }
+        let meshes: Vec<Mesh> = others.iter().map(|&i| self.baked_mesh(i)).collect();
+        let refs: Vec<&Mesh> = meshes.iter().collect();
+        let (src, _) = crate::scene::concat(&refs);
+        let bvh = crate::bvh::Bvh::build(&src);
+        let (mn, mx) = self.sculptor.mesh.bounds();
+        let size = (mx - mn).max_element().max(1e-6);
+        let n = self.sculptor.project_from(&src, &bvh, reach * size, strength);
+        self.redraw = true;
+        if n == 0 {
+            return Err("Nothing was close enough: raise the distance".into());
+        }
+        Ok(n)
     }
 }

@@ -264,3 +264,20 @@ button.mini.on { color: #fff; border-color: var(--accent-2); }
   width: 100%; padding: 4px 7px; background: #17181c; border: 1px solid var(--line); border-radius: 4px;
 }
 .ov-lazy { stroke: #fff; }
+
+/* ---------------------------------------------------------------- layers */
+.layer-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
+.layer { background: var(--panel-2); border: 1px solid transparent; border-radius: 4px; padding: 3px 5px 1px; }
+.layer.rec { border-color: #b8432f; }
+.layer.off { opacity: 0.55; }
+.layer-head { display: flex; align-items: center; gap: 4px; }
+.layer-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.layer-note { color: var(--dim); font-size: 11px; }
+.layer button.rec {
+  font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: none;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.layer button.rec.on { background: #b8432f; border-color: #b8432f; color: #fff; }
+.layer button.icon { width: 22px; height: 22px; padding: 0; background: none; border: 1px solid transparent; border-radius: 4px; color: var(--dim); }
+.layer button.icon:hover { border-color: var(--line); color: #fff; }
+.layer-slider { margin: 0; }

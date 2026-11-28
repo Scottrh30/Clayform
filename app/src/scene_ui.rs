@@ -90,7 +90,7 @@ pub fn encode_project(settings: &str) -> Vec<u8> {
         let data: Vec<project::SubToolData<&Mesh>> = e
             .scene_levels()
             .into_iter()
-            .map(|(info, levels, active)| project::SubToolData { info_json: info_json(&info), levels, active })
+            .map(|(info, levels, active, extras)| project::SubToolData { info_json: info_json(&info), levels, active, extras })
             .collect();
         project::encode_scene(&data, e.active_subtool(), settings)
     })

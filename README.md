@@ -94,6 +94,19 @@ Like SculptGL, the functions are grouped into dropdown areas:
   - **Alphas:** ten built-in grayscale stamps (pores, scales, weave, rings, square, noise, cracks, bumps, stitches,
     hexagons) or **Load image…** for your own PNG/JPEG. White raises (or carves, with Negative), black leaves the
     surface alone. **Turn** rotates the alpha; **Turn with the stroke** makes it follow the stroke direction.
+- **Layers** (Layers folder): **New layer** starts recording (REC): strokes go into the layer. Hide it with the
+  dot, fade it with its slider (negative inverts, above 100% exaggerates), rename it (double-click), bake it into
+  the sculpt (⤵) or delete it. Each layer belongs to one level; layers turn dynamic topology off. Saved in projects.
+- **Surface detail folder:**
+  - **Morph target:** **Store** the shape, keep sculpting, and paint parts back with the **Morph** brush;
+    **Switch** swaps the sculpt with the stored shape.
+  - **Surface Noise:** Smooth, Ridged, Cells or Crackle noise over the whole model, with size, height, detail and
+    seed. **Preview** shows it live while you move the sliders; **Apply** keeps it (one undo step). Masked areas
+    stay smooth.
+  - **Project All:** pulls the active SubTool onto the other visible SubTools' surfaces along its normals, within
+    a distance, e.g. to move an old sculpt's detail onto a new, cleaner mesh.
+  - **Reproject higher levels:** when a remesh, ZModeler edit or other topology change removes a sculpt's levels,
+    **Rebuild N levels** subdivides the new base again and projects the old highest level's detail onto it.
 - **Brush presets:** save the current brush (tool, size, strength, stroke, falloff and alpha) under a name, load it
   with a click, and **export** it as a `.claybrush` file to share or **import** one. Six starter presets show the
   features (skin pores, reptile scales, fabric weave, clean lines, rivets, a stitched seam).
@@ -222,7 +235,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -236,7 +249,7 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Multithreaded brushes (needs WebAssembly threads in the window), automatic (ZRemesher-style) retopology, layers, vertex painting, and a lasso mask.
+Multithreaded brushes (needs WebAssembly threads in the window), automatic (ZRemesher-style) retopology, vertex painting, and a lasso mask.
 
 ## Automated testing hook
 

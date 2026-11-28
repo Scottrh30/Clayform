@@ -8,14 +8,18 @@
 //! level (u32), then per level: mesh length (u64) + mesh in the `wire` format
 //! (stencils = the Loop stencils that build it from the level below), detail
 //! count (u32) + details (3 × f32 each). Version 1 files have no SubTool
-//! count, active SubTool or info: one object.
+//! count, active SubTool or info: one object. Version 3 adds, after each
+//! SubTool's levels, an extras blob (u64 length + bytes) that the sculptor
+//! writes and reads itself (sculpt layers, morph target, creases, colours,
+//! UVs), made of tagged chunks so later additions stay readable.
 
 use crate::wire;
 use glam::Vec3;
 
 const MAGIC: &[u8; 8] = b"CLAYFORM";
 /// 1: one object. 2: several SubTools, each with an info JSON blob.
-const VERSION: u32 = 2;
+/// 3: an extras blob per SubTool.
+const VERSION: u32 = 3;
 pub const EXTENSION: &str = "clayform";
 
 /// One level as stored in a project.
@@ -30,6 +34,8 @@ pub struct SubToolData<M> {
     pub info_json: String,
     pub levels: Vec<LevelData<M>>,
     pub active: usize,
+    /// Sculptor extras (see `Sculptor::export_extras`).
+    pub extras: Vec<u8>,
 }
 
 /// What a project file holds once read (meshes still to be built).
@@ -45,6 +51,7 @@ pub fn encode(levels: &[LevelData<&crate::mesh::Mesh>], active: usize, settings_
         info_json: String::new(),
         levels: levels.iter().map(|l| LevelData { mesh: l.mesh, stencils: l.stencils.clone(), details: l.details.clone() }).collect(),
         active,
+        extras: Vec::new(),
     };
     encode_scene(&[st], 0, settings_json)
 }
@@ -77,6 +84,8 @@ pub fn encode_scene(subtools: &[SubToolData<&crate::mesh::Mesh>], active_subtool
         out.extend_from_slice(&(st.info_json.len() as u32).to_le_bytes());
         out.extend_from_slice(st.info_json.as_bytes());
         put_levels(&mut out, &st.levels, st.active);
+        out.extend_from_slice(&(st.extras.len() as u64).to_le_bytes());
+        out.extend_from_slice(&st.extras);
     }
     out
 }
@@ -137,7 +146,14 @@ pub fn decode(bytes: &[u8]) -> Result<ProjectParts, String> {
             let stencils = mesh.stencils.clone();
             levels.push(LevelData { mesh, stencils, details });
         }
-        subtools.push(SubToolData { info_json, levels, active });
+        let extras = if version >= 3 {
+            let l = take(8)?;
+            let l = u64::from_le_bytes(l.try_into().unwrap()) as usize;
+            take(l)?.to_vec()
+        } else {
+            Vec::new()
+        };
+        subtools.push(SubToolData { info_json, levels, active, extras });
     }
     Ok(ProjectParts { settings_json, subtools, active_subtool })
 }
@@ -152,14 +168,15 @@ mod tests {
         let a = Mesh::icosphere(2);
         let b = crate::poly::Polys::qcube(1).to_mesh();
         let sts = vec![
-            SubToolData { info_json: "{\"name\":\"A\"}".into(), levels: vec![LevelData { mesh: &a, stencils: vec![], details: vec![] }], active: 0 },
-            SubToolData { info_json: "{\"name\":\"B\"}".into(), levels: vec![LevelData { mesh: &b, stencils: vec![], details: vec![] }], active: 0 },
+            SubToolData { info_json: "{\"name\":\"A\"}".into(), levels: vec![LevelData { mesh: &a, stencils: vec![], details: vec![] }], active: 0, extras: vec![] },
+            SubToolData { info_json: "{\"name\":\"B\"}".into(), levels: vec![LevelData { mesh: &b, stencils: vec![], details: vec![] }], active: 0, extras: vec![1, 2, 3] },
         ];
         let bytes = encode_scene(&sts, 1, "{}");
         let p = decode(&bytes).unwrap();
         assert_eq!(p.subtools.len(), 2);
         assert_eq!(p.active_subtool, 1);
         assert_eq!(p.subtools[1].info_json, "{\"name\":\"B\"}");
+        assert_eq!(p.subtools[1].extras, vec![1, 2, 3]);
         assert_eq!(p.subtools[0].levels[0].mesh.tris.len(), a.tris.len());
         assert_eq!(p.subtools[1].levels[0].mesh.tris.len(), b.tris.len());
         // a single-object project still opens

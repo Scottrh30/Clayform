@@ -3,6 +3,7 @@
 //! the Tauri shell only provides native file dialogs.
 
 mod brush_ui;
+mod detail_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -127,6 +128,8 @@ struct Ui {
     user_alphas: RwSignal<Vec<std::sync::Arc<clayform_core::brush::Alpha>>>,
     /// (a pen was seen, its latest pressure)
     pressure: RwSignal<(bool, f32)>,
+    sdetail: RwSignal<detail_ui::DetailState>,
+    noise: RwSignal<clayform_core::detail::NoiseSettings>,
 }
 
 impl Ui {
@@ -187,6 +190,8 @@ impl Ui {
             alpha: RwSignal::new(None),
             user_alphas: RwSignal::new(Vec::new()),
             pressure: RwSignal::new((false, 1.0)),
+            sdetail: RwSignal::new(Default::default()),
+            noise: RwSignal::new(detail_ui::default_noise()),
             zm: RwSignal::new(ZmSettings::default()),
             overlay: RwSignal::new(Overlay::default()),
             vp_size: RwSignal::new((800.0, 600.0)),
@@ -256,6 +261,7 @@ impl Ui {
         self.level.set(lv);
         self.level_count.set(lc);
         self.top_tris.set(top);
+        detail_ui::refresh(self);
     }
 
     /// Recomputes what's drawn over the viewport (hover targets, retopology, joints).
@@ -1545,6 +1551,8 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             </Folder>
             <brush_ui::BrushTipFolder ui />
             <brush_ui::PresetsFolder ui />
+            <detail_ui::LayersFolder ui />
+            <detail_ui::SurfaceFolder ui />
             <Folder title="Masking">
                 <div class="row buttons">
                     <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>
