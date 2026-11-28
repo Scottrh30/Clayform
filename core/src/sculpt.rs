@@ -1197,8 +1197,14 @@ impl Sculptor {
     }
 
     /// Per-sculpt data added by later features (see `export_extras`).
-    pub(crate) fn export_more_extras(&self, _out: &mut Vec<u8>) {}
-    pub(crate) fn import_more_extras(&mut self, _tag: &[u8; 4], _body: &[u8]) {}
+    pub(crate) fn export_more_extras(&self, out: &mut Vec<u8>) {
+        self.export_creases(out);
+    }
+    pub(crate) fn import_more_extras(&mut self, tag: &[u8; 4], body: &[u8]) {
+        if tag == b"CRSE" {
+            self.import_creases(body);
+        }
+    }
 
     /// Puts every point the current stroke has moved back where it was
     /// (Drag Rect redraws its stamp this way while you drag).

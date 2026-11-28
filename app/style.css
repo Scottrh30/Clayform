@@ -156,6 +156,7 @@ button, select, input { font: inherit; color: inherit; }
 .mode-overlay .ov-building { stroke: #ffe07a; fill: #ffe07a; stroke-dasharray: 4 3; }
 .mode-overlay .ov-joint { stroke: #8fc3ff; fill: #2b6fd6; stroke-width: 1.5; }
 .mode-overlay .ov-curve { stroke: #ff965a; stroke-width: 2; }
+.mode-overlay .ov-crease { stroke: #4fc3f7; stroke-width: 1.5; }
 .mode-overlay .ov-face { fill: rgba(111, 227, 154, 0.16); stroke: none; }
 .snap-thumb img { max-width: 100%; max-height: 120px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
 .ref-item { border-top: 1px solid var(--line); padding: 4px 0; }

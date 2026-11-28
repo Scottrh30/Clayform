@@ -125,6 +125,7 @@ fn style_class(s: OverlayStyle) -> &'static str {
         OverlayStyle::Joint => "ov-joint",
         OverlayStyle::Active => "ov-active",
         OverlayStyle::Curve => "ov-curve",
+        OverlayStyle::Crease => "ov-crease",
         OverlayStyle::Axis(0) => "ov-x",
         OverlayStyle::Axis(1) => "ov-y",
         OverlayStyle::Axis(_) => "ov-z",
@@ -354,6 +355,7 @@ pub fn RetopoFolder(ui: Ui) -> impl IntoView {
                     ui.refresh();
                 }>"Clear"</button>
             </div>
+            <crate::topo_ui::RetopoStrokes ui />
             <Slider
                 label="Levels"
                 min=0.0 max=5.0 step=1.0

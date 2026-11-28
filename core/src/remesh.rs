@@ -368,7 +368,9 @@ pub fn voxel_csg_with(
     }
 
     report(0.85)?;
-    let mut mesh = Mesh::new(positions, out_tris);
+    // every surface-nets quad is a pair of triangles: keep them as quads
+    let partner: Vec<u32> = (0..out_tris.len() as u32).map(|t| t ^ 1).collect();
+    let mut mesh = crate::mesh::MeshBuilder::new(positions, out_tris).with_faces(None, Some(partner)).finish();
     report(0.9)?;
 
     // ---- 4. relax, then project onto the original surface

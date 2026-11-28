@@ -4,6 +4,7 @@
 
 mod brush_ui;
 mod detail_ui;
+mod topo_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -1553,6 +1554,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             <brush_ui::PresetsFolder ui />
             <detail_ui::LayersFolder ui />
             <detail_ui::SurfaceFolder ui />
+            <topo_ui::TopologyToolsFolder ui />
             <Folder title="Masking">
                 <div class="row buttons">
                     <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>

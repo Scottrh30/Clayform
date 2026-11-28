@@ -30,6 +30,8 @@ pub struct Mesh {
     /// Exported positions are `p / export_scale + export_center`.
     pub export_center: Vec3,
     pub export_scale: f32,
+    /// Creased edges (smaller vertex index first): subdivision keeps them sharp.
+    pub creases: Vec<[u32; 2]>,
 }
 
 /// Generation-stamp marker: O(1) "visited" tests without clearing arrays.
@@ -107,6 +109,7 @@ impl MeshBuilder {
                 boundary: vec![false; n],
                 export_center: Vec3::ZERO,
                 export_scale: 1.0,
+                creases: Vec::new(),
             },
             phase: 0,
             i: 0,
@@ -425,7 +428,16 @@ impl Mesh {
             })
             .collect();
         let (c, s) = (self.export_center, self.export_scale);
+        let creases: Vec<[u32; 2]> = self
+            .creases
+            .iter()
+            .filter_map(|&[a, b]| {
+                let (x, y) = (remap[a as usize], remap[b as usize]);
+                (x != NONE && y != NONE).then(|| [x.min(y), x.max(y)])
+            })
+            .collect();
         *self = MeshBuilder::new(positions, tris).with_faces(Some(groups), Some(partner)).finish();
+        self.creases = creases;
         self.mask = mask;
         self.export_center = c;
         self.export_scale = s;
@@ -543,8 +555,25 @@ impl Mesh {
     pub fn loop_positions(&self, odd: &[[u32; 4]]) -> Vec<Vec3> {
         let n = self.positions.len();
         let mut out = Vec::with_capacity(n + odd.len());
+        // creased edges at each vertex (sharp vertices: 2 = crease rule, 3+ = corner)
+        let mut crease_nbr: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &[a, b] in &self.creases {
+            crease_nbr.entry(a).or_default().push(b);
+            crease_nbr.entry(b).or_default().push(a);
+        }
+        let creased: std::collections::HashSet<(u32, u32)> = self.creases.iter().map(|e| (e[0], e[1])).collect();
         for v in 0..n as u32 {
             let p = self.positions[v as usize];
+            if let Some(cn) = crease_nbr.get(&v) {
+                if cn.len() >= 3 {
+                    out.push(p);
+                    continue;
+                }
+                if cn.len() == 2 && !self.boundary[v as usize] {
+                    out.push(p * 0.75 + (self.positions[cn[0] as usize] + self.positions[cn[1] as usize]) * 0.125);
+                    continue;
+                }
+            }
             let np = if self.boundary[v as usize] {
                 let mut bsum = Vec3::ZERO;
                 let mut bc = 0;
@@ -571,7 +600,8 @@ impl Mesh {
         for &[a, b, c, d] in odd {
             let pa = self.positions[a as usize];
             let pb = self.positions[b as usize];
-            out.push(if d != NONE {
+            let sharp = !creased.is_empty() && creased.contains(&(a.min(b), a.max(b)));
+            out.push(if d != NONE && !sharp {
                 (pa + pb) * 0.375 + (self.positions[c as usize] + self.positions[d as usize]) * 0.125
             } else {
                 (pa + pb) * 0.5
@@ -647,6 +677,13 @@ impl Mesh {
             return Err(());
         }
         let mut out = MeshBuilder::new(positions, new_tris).with_faces(Some(new_groups), None).finish();
+        // each creased edge becomes two creased halves
+        for &[a, b] in &self.creases {
+            if let Some(&m) = edges.get(&(a, b)) {
+                out.creases.push([a.min(m), a.max(m)]);
+                out.creases.push([b.min(m), b.max(m)]);
+            }
+        }
         out.mask = mask;
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;

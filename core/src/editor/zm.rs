@@ -24,6 +24,8 @@ pub(super) struct ZmState {
     cache: Option<(u64, usize, Polys, Vec<u32>)>,
     pub(super) drag: Option<ZmDrag>,
     pub(super) bridge: Option<BridgePick>,
+    /// Weld points: the first point picked (vertex, revision).
+    pub(super) weld: Option<(u32, u64, Vec3)>,
 }
 
 pub(super) struct ZmDrag {
@@ -35,6 +37,8 @@ pub(super) struct ZmDrag {
     extent: f32,
     applied: bool,
     action: Action,
+    face: usize,
+    edge: (u32, u32),
 }
 
 pub(super) struct BridgePick {
@@ -144,7 +148,17 @@ impl Editor {
             let c = verts.iter().copied().sum::<Vec3>() / verts.len().max(1) as f32;
             let extent = verts.iter().map(|q| q.distance(c)).sum::<f32>() / verts.len().max(1) as f32;
             let wpp = self.camera.world_per_point(pick.point, size.y);
-            self.zms.drag = Some(ZmDrag { base, regions, start: p, wpp, extent: extent.max(1e-4), applied: false, action });
+            self.zms.drag = Some(ZmDrag {
+                base,
+                regions,
+                start: p,
+                wpp,
+                extent: extent.max(1e-4),
+                applied: false,
+                action,
+                face: pick.face,
+                edge: pick.edge,
+            });
             return Some(Drag::Sculpt);
         }
         let mut polys = self.zm_polys().0.clone();
@@ -187,7 +201,48 @@ impl Editor {
                 self.zm_set_groups(&polys);
             }
             Action::Bridge => self.zm_bridge(pick, polys),
-            Action::Extrude | Action::Inset | Action::Bevel => unreachable!(),
+            Action::Spin | Action::Collapse | Action::Split | Action::InsertPolygon => {
+                let r = match action {
+                    Action::Spin => polys.spin_edge(pick.edge),
+                    Action::Collapse => polys.collapse_edge(pick.edge),
+                    Action::Split => polys.split_face(pick.face, pick.edge),
+                    _ => polys.fill_hole(pick.edge),
+                };
+                match r {
+                    Ok(()) => self.zm_commit(polys),
+                    Err(e) => self.message = Some(e),
+                }
+            }
+            Action::WeldPoints => {
+                let v = *polys.faces[pick.face]
+                    .iter()
+                    .min_by(|a, b| polys.pos[**a as usize].distance(pick.point).total_cmp(&polys.pos[**b as usize].distance(pick.point)))
+                    .unwrap();
+                let rev = self.sculptor.revision();
+                match self.zms.weld.take().filter(|w| w.1 == rev) {
+                    Some((first, _, _)) if first != v => {
+                        polys.weld_points(first, v);
+                        self.zm_commit(polys);
+                    }
+                    _ => {
+                        self.zms.weld = Some((v, rev, polys.pos[v as usize]));
+                        self.message = Some("Weld: now click near the point to merge it with".into());
+                    }
+                }
+            }
+            Action::Crease => {
+                let edges: Vec<(u32, u32)> = match self.zm.target {
+                    Target::Polygon => vec![pick.edge],
+                    _ => {
+                        let region = polys.target_faces(self.zm.target, pick.face, pick.edge);
+                        polys.boundary_edges(&region)
+                    }
+                };
+                let on = self.sculptor.toggle_creases(&edges);
+                self.message = Some(format!("{} {} edge{}", if on { "Creased" } else { "Uncreased" }, edges.len(), if edges.len() == 1 { "" } else { "s" }));
+                self.redraw = true;
+            }
+            Action::Extrude | Action::Inset | Action::Bevel | Action::QMesh | Action::SlideEdge => unreachable!(),
         }
         Some(Drag::None)
     }
@@ -240,6 +295,12 @@ impl Editor {
         for region in &dr.regions {
             match dr.action {
                 Action::Extrude => polys.extrude(region, -d.y * dr.wpp),
+                Action::QMesh => polys.qmesh(region, -d.y * dr.wpp),
+                Action::SlideEdge => {
+                    let base = dr.base.pos.clone();
+                    polys.slide_edge(dr.face, dr.edge, (d.x / 200.0).clamp(-0.95, 0.95), &base);
+                    break;
+                }
                 Action::Inset => polys.inset(region, inset),
                 _ => polys.bevel(region, inset, -d.y.signum() * inset * dr.extent * 0.6),
             }
@@ -278,7 +339,18 @@ impl Editor {
         let Some(p) = p else { return o };
         let Some(pick) = self.zm_pick(p, size) else { return o };
         let action = self.zm.action;
-        let regions = if matches!(action, Action::InsertEdgeLoop | Action::Bridge | Action::GroupIt) {
+        let edge_action = matches!(
+            action,
+            Action::InsertEdgeLoop | Action::Bridge | Action::SlideEdge | Action::Spin | Action::Collapse | Action::Split | Action::InsertPolygon
+        ) || (action == Action::Crease && self.zm.target == Target::Polygon);
+        if let Some((_, rev, q)) = self.zms.weld {
+            if rev == self.sculptor.revision() {
+                if let Some(s) = self.to_screen(q, size) {
+                    o.points.push((s, OverlayStyle::Pending));
+                }
+            }
+        }
+        let regions = if edge_action || matches!(action, Action::GroupIt | Action::WeldPoints) {
             vec![vec![pick.face]]
         } else {
             self.zm_regions(&pick)
@@ -291,17 +363,29 @@ impl Editor {
             }
         }
         let edge = (polys.pos[pick.edge.0 as usize], polys.pos[pick.edge.1 as usize]);
+        let near = (action == Action::WeldPoints)
+            .then(|| {
+                polys.faces[pick.face]
+                    .iter()
+                    .map(|&v| polys.pos[v as usize])
+                    .min_by(|a, b| a.distance(pick.point).total_cmp(&b.distance(pick.point)))
+            })
+            .flatten();
         segs.truncate(6000);
         for (a, b) in segs {
             if let (Some(a), Some(b)) = (self.to_screen(a, size), self.to_screen(b, size)) {
                 o.lines.push((a, b, OverlayStyle::Target));
             }
         }
-        if matches!(action, Action::InsertEdgeLoop | Action::Bridge) {
+        if edge_action {
             if let (Some(a), Some(b)) = (self.to_screen(edge.0, size), self.to_screen(edge.1, size)) {
                 o.lines.push((a, b, OverlayStyle::Active));
             }
         }
+        if let Some(s) = near.and_then(|q| self.to_screen(q, size)) {
+            o.points.push((s, OverlayStyle::Active));
+        }
+
         o
     }
 

@@ -93,6 +93,7 @@ pub fn parse_obj(src: &str) -> Result<Mesh, String> {
         groups: Vec::new(),
         export_center: Vec3::ZERO,
         export_scale: 1.0,
+        creases: Default::default(),
     };
     let mut group_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut group = 0u32;

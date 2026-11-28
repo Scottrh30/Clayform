@@ -13,6 +13,7 @@ pub mod io;
 pub mod mannequin;
 pub mod mesh;
 pub mod poly;
+pub mod poly_ops;
 pub mod print;
 pub mod project;
 pub mod remesh;
@@ -21,6 +22,7 @@ pub mod scene;
 pub mod sculpt;
 pub mod snapshot;
 pub mod symmetry;
+pub mod topo;
 pub mod tube;
 pub mod wire;
 

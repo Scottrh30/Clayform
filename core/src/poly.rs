@@ -15,6 +15,8 @@ pub struct Polys {
     pub groups: Vec<u32>,
     pub export_center: Vec3,
     pub export_scale: f32,
+    /// Creased edges (smaller vertex first).
+    pub creases: std::collections::HashSet<(u32, u32)>,
 }
 
 /// Which polygons an action applies to.
@@ -50,16 +52,34 @@ pub enum Action {
     Polygroup,
     /// Flood a new polygroup over faces facing roughly the same way (PolyGroupIt).
     GroupIt,
+    /// Extrude that merges into geometry it meets.
+    QMesh,
+    SlideEdge,
+    Spin,
+    Collapse,
+    Split,
+    WeldPoints,
+    Crease,
+    /// Fill a hole with a polygon.
+    InsertPolygon,
 }
 
 impl Action {
-    pub const ALL: [Action; 8] = [
+    pub const ALL: [Action; 16] = [
         Action::Extrude,
+        Action::QMesh,
         Action::Inset,
         Action::Bevel,
         Action::InsertEdgeLoop,
+        Action::SlideEdge,
+        Action::Split,
+        Action::Spin,
+        Action::Collapse,
+        Action::WeldPoints,
         Action::Delete,
         Action::Bridge,
+        Action::InsertPolygon,
+        Action::Crease,
         Action::Polygroup,
         Action::GroupIt,
     ];
@@ -73,6 +93,14 @@ impl Action {
             Action::Bridge => "Bridge",
             Action::Polygroup => "Polygroup",
             Action::GroupIt => "PolyGroupIt",
+            Action::QMesh => "QMesh",
+            Action::SlideEdge => "Slide edge",
+            Action::Spin => "Spin edge",
+            Action::Collapse => "Collapse edge",
+            Action::Split => "Split polygon",
+            Action::WeldPoints => "Weld points",
+            Action::Crease => "Crease",
+            Action::InsertPolygon => "Insert polygon",
         }
     }
     pub fn description(self) -> &'static str {
@@ -85,11 +113,19 @@ impl Action {
             Action::Bridge => "Click one polygon (or hole edge), then another, to connect them",
             Action::Polygroup => "Click to put the target in a new polygroup",
             Action::GroupIt => "Click to group the faces that face roughly the same way as the one clicked",
+            Action::QMesh => "Drag to extrude; where it meets other polygons they merge (no faces left inside)",
+            Action::SlideEdge => "Drag sideways to slide the edge along its neighbouring edges",
+            Action::Spin => "Click an edge between two polygons to turn it one step around them",
+            Action::Collapse => "Click an edge to merge its two points into one",
+            Action::Split => "Click an edge to cut its polygon in two, across to the opposite side",
+            Action::WeldPoints => "Click near a point, then near another: they merge into one",
+            Action::Crease => "Click to crease (or uncrease) the edge, or the target's border, for subdivision",
+            Action::InsertPolygon => "Click an open edge to fill its hole with a polygon",
         }
     }
     /// Whether dragging sets an amount.
     pub fn drags(self) -> bool {
-        matches!(self, Action::Extrude | Action::Inset | Action::Bevel)
+        matches!(self, Action::Extrude | Action::Inset | Action::Bevel | Action::QMesh | Action::SlideEdge)
     }
 }
 
@@ -148,6 +184,7 @@ impl Polys {
                 groups,
                 export_center: m.export_center,
                 export_scale: m.export_scale,
+                creases: m.creases.iter().map(|e| (e[0], e[1])).collect(),
             },
             tri_face,
         )
@@ -212,6 +249,21 @@ impl Polys {
             }
         }
         let mut m = MeshBuilder::new(pos, tris).with_faces(Some(groups), Some(partner)).finish();
+        // creases on edges that still exist
+        let live: std::collections::HashSet<(u32, u32)> = self
+            .faces
+            .iter()
+            .flat_map(|f| (0..f.len()).map(move |i| (f[i].min(f[(i + 1) % f.len()]), f[i].max(f[(i + 1) % f.len()]))))
+            .collect();
+        m.creases = self
+            .creases
+            .iter()
+            .filter(|e| live.contains(e))
+            .filter_map(|&(a, b)| {
+                let (x, y) = (used[a as usize], used[b as usize]);
+                (x != NONE && y != NONE).then(|| [x.min(y), x.max(y)])
+            })
+            .collect();
         m.mask = mask;
         m.export_center = self.export_center;
         m.export_scale = self.export_scale;
@@ -586,7 +638,15 @@ impl Polys {
     }
 
     fn empty() -> Polys {
-        Polys { pos: Vec::new(), mask: Vec::new(), faces: Vec::new(), groups: Vec::new(), export_center: Vec3::ZERO, export_scale: 1.0 }
+        Polys {
+            pos: Vec::new(),
+            mask: Vec::new(),
+            faces: Vec::new(),
+            groups: Vec::new(),
+            export_center: Vec3::ZERO,
+            export_scale: 1.0,
+            creases: Default::default(),
+        }
     }
 
     fn grid(&mut self, origin: Vec3, u: Vec3, v: Vec3, div: u32, group: u32) {

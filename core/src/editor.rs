@@ -79,6 +79,8 @@ pub enum OverlayStyle {
     Curve,
     /// Gizmo handles for the X, Y and Z axes.
     Axis(u8),
+    /// Creased edges.
+    Crease,
 }
 
 /// How dynamic topology picks its triangle size.
@@ -213,6 +215,10 @@ pub struct Editor {
     /// Drag Rect: where the stamp was placed and the scale there.
     rect: Option<(Vec2, f32)>,
     rng: Rng,
+    /// Retopology: dragging draws topology strokes instead of placing points.
+    pub retopo_draw: bool,
+    /// Draw creased edges over the model.
+    pub show_creases: bool,
     /// Direction of the last dabs on screen (alpha "follow stroke").
     stroke_dir: Vec2,
 }
@@ -289,6 +295,8 @@ impl Editor {
             stroke_kind: StrokeKind::Freehand,
             rect: None,
             rng: Rng::new(7),
+            retopo_draw: false,
+            show_creases: true,
             stroke_dir: Vec2::X,
         };
         e.frame_mesh();
@@ -554,6 +562,21 @@ impl Editor {
                 let mut o = Overlay { brush: true, ..Default::default() };
                 for w in self.curve.windows(2) {
                     o.lines.push((w[0], w[1], OverlayStyle::Curve));
+                }
+                if self.show_creases && !self.sculptor.mesh.creases.is_empty() && self.sculptor.mesh.creases.len() <= 30_000 {
+                    let eye = self.camera.eye();
+                    let m = &self.sculptor.mesh;
+                    for &[a, b] in &m.creases {
+                        let (qa, qb) = (m.positions[a as usize], m.positions[b as usize]);
+                        // cheap facing test instead of a ray per edge
+                        let n = m.normals[a as usize] + m.normals[b as usize];
+                        if n.dot(eye - (qa + qb) * 0.5) < 0.0 {
+                            continue;
+                        }
+                        if let (Some(sa), Some(sb)) = (self.to_screen(qa, size), self.to_screen(qb, size)) {
+                            o.lines.push((sa, sb, OverlayStyle::Crease));
+                        }
+                    }
                 }
                 if let (Some(l), Some(p)) = (self.lazy, p) {
                     if self.drag == Drag::Sculpt && l.pos.distance(p) > 1.0 {

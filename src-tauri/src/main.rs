@@ -91,6 +91,25 @@ async fn remesh(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'
     .await
 }
 
+/// Quad remesh or decimation. Body: mesh. Headers: `op` (quad | decimate),
+/// `target` (polygon / triangle count), `groups` (1 = keep polygroups).
+#[tauri::command]
+async fn topology(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'_>) -> Result<Response, String> {
+    let bytes = raw_body(&request)?;
+    let op = header(&request, "op").unwrap_or_default().to_string();
+    let target: usize = header(&request, "target").and_then(|v| v.parse().ok()).unwrap_or(5000);
+    let groups = header(&request, "groups").is_some_and(|v| v == "1");
+    run_job(app, &jobs, move |progress| {
+        let (mesh, _) = wire::decode(&bytes)?;
+        let out = match op.as_str() {
+            "quad" => clayform_core::topo::quad_remesh(&mesh, target, groups, progress)?,
+            _ => clayform_core::topo::decimate(&mesh, target, groups, progress)?,
+        };
+        Ok(wire::encode(&out, &[]))
+    })
+    .await
+}
+
 /// One level of Loop subdivision. Body: mesh; returns mesh + stencils.
 #[tauri::command]
 async fn subdivide(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'_>) -> Result<Response, String> {
@@ -324,7 +343,7 @@ fn main() {
         .manage(Jobs::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, subdivide, cancel_job, open_project, save_project, open_image, open_brush])
+        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, topology, subdivide, cancel_job, open_project, save_project, open_image, open_brush])
         .run(tauri::generate_context!())
         .expect("error while running Clayform");
 }
