@@ -112,10 +112,23 @@ Like SculptGL, the functions are grouped into dropdown areas:
   video editors.
 - **Projects (.clayform):** save and open your work with every level, the mask, the camera and all brush and view
   settings. The title bar shows ` •` when there are unsaved changes, and opening a project can be undone.
+  **File › Open recent** lists the last ten projects.
+- **Autosave and crash recovery** (desktop app): every few minutes (Interface › Autosave, 1–30 minutes or off),
+  once you pause, unsaved work is copied to a recovery file. If Clayform closes without saving, the next start
+  offers **Recover** or **Discard**. Saving the project removes the copy.
+- **History:** the History folder lists every undoable step by name (Draw, Clay, Voxel remesh, Extrude…); click
+  one to jump back or forward to it.
+- **Keyboard shortcuts** are all rebindable (Help › All keyboard shortcuts…, or Interface): click a command, press
+  the new keys; a key already in use moves over. Changes are remembered.
+- **Speed on dense meshes:** brushes refit only the part of the picking hierarchy they touched and re-upload only
+  the blocks of vertices that changed. On a 1.3M-triangle sculpt a brush movement went from about 28 ms to 2.5 ms,
+  and the data sent to the GPU per movement shrank about 23×.
 - **Viewport:** ambient occlusion and cavity shading (each with a strength slider), custom matcaps loaded from
   PNG or JPEG images (remembered between sessions), and WebGL 2 through wgpu, 4× MSAA, six procedural matcaps, wireframe and flat shading.
 
 ## Controls
+
+These are the defaults; every key can be changed in **Help › All keyboard shortcuts…**.
 
 | Input | Action |
 |---|---|
@@ -162,7 +175,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -176,7 +189,7 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Automatic (ZRemesher-style) retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
+Multithreaded brushes (needs WebAssembly threads in the window), automatic (ZRemesher-style) retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
 
 ## Automated testing hook
 

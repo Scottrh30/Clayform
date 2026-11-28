@@ -27,6 +27,7 @@ impl Editor {
 
     pub(super) fn enter_mannequin(&mut self) {
         if !self.mannequin_shown() {
+            self.sculptor.set_label("New mannequin");
             self.sculptor.set_mesh(self.mannequin.mesh());
             self.frame_mesh();
             self.mqs.shown = Some(self.sculptor.revision());
@@ -38,6 +39,7 @@ impl Editor {
         if self.mannequin_shown() {
             self.sculptor.replace_mesh_preview(self.mannequin.mesh());
         } else {
+            self.sculptor.set_label("New mannequin");
             self.sculptor.set_mesh(self.mannequin.mesh());
             self.frame_mesh();
         }

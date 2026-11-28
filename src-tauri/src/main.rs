@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::ipc::{InvokeBody, Request, Response};
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Lets the interface cancel the running job.
@@ -208,6 +208,64 @@ async fn save_file(app: tauri::AppHandle, request: Request<'_>) -> Result<Option
     Ok(Some(path.display().to_string()))
 }
 
+fn autosave_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("autosave.clayform"))
+}
+
+/// Writes the crash-recovery copy of the open sculpt. Body: project bytes.
+#[tauri::command]
+async fn autosave_write(app: tauri::AppHandle, request: Request<'_>) -> Result<(), String> {
+    let bytes = raw_body(&request)?;
+    let path = autosave_file(&app)?;
+    let tmp = path.with_extension("saving");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct AutosaveInfo {
+    size: u64,
+    /// Milliseconds since 1970.
+    modified: f64,
+}
+
+/// The recovery copy's size and age, or null if there's none.
+#[tauri::command]
+fn autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, String> {
+    let path = autosave_file(&app)?;
+    let Ok(meta) = std::fs::metadata(&path) else { return Ok(None) };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0, |d| d.as_millis() as f64);
+    Ok(Some(AutosaveInfo { size: meta.len(), modified }))
+}
+
+#[tauri::command]
+async fn autosave_read(app: tauri::AppHandle) -> Result<Response, String> {
+    let path = autosave_file(&app)?;
+    std::fs::read(&path).map(Response::new).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn autosave_clear(app: tauri::AppHandle) -> Result<(), String> {
+    let path = autosave_file(&app)?;
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Reads a project by path (Open recent). Header: `path` (URL-encoded).
+#[tauri::command]
+async fn open_project_path(request: Request<'_>) -> Result<Response, String> {
+    let path = header(&request, "path").map(percent_decode).ok_or("no path")?;
+    std::fs::read(&path).map(Response::new).map_err(|e| format!("Could not open {path}: {e}"))
+}
+
 #[tauri::command]
 fn cancel_job(jobs: State<'_, Jobs>) {
     jobs.cancel.store(true, Ordering::SeqCst);
@@ -247,7 +305,7 @@ fn main() {
         .manage(Jobs::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![open_mesh, save_file, remesh, subdivide, cancel_job, open_project, save_project, open_image])
+        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, subdivide, cancel_job, open_project, save_project, open_image])
         .run(tauri::generate_context!())
         .expect("error while running Clayform");
 }

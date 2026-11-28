@@ -804,6 +804,8 @@ impl Renderer {
     pub fn sync_mesh(&mut self, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool, need_groups: bool) {
         if dirty.topology || dirty.range.is_some() {
             self.groups_stale = true;
+        }
+        if dirty.topology || self.vbuf.is_none() {
             self.bounds = mesh.bounds();
         }
         let n = mesh.positions.len();
@@ -852,13 +854,20 @@ impl Renderer {
             self.edges_stale = true;
             dirty.topology = false;
             dirty.range = None;
-        } else if let Some((a, b)) = dirty.range.take().filter(|_| n > 0) {
-            let (a, b) = (a as usize, (b as usize).min(n - 1));
-            for i in a..=b {
-                self.staging[i] = to_gpu(i);
+            dirty.blocks.clear();
+        } else if dirty.range.is_some() && n > 0 {
+            // only the blocks of vertices that changed
+            for (a, b) in dirty.take_runs(n) {
+                let (a, b) = (a as usize, b as usize);
+                for i in a..=b {
+                    self.staging[i] = to_gpu(i);
+                    // grow the shadow bounds with moved vertices (cheaper than a full pass)
+                    let p = mesh.positions[i];
+                    self.bounds = (self.bounds.0.min(p), self.bounds.1.max(p));
+                }
+                let off = (a * std::mem::size_of::<GpuVertex>()) as u64;
+                self.queue.write_buffer(self.vbuf.as_ref().unwrap(), off, bytemuck::cast_slice(&self.staging[a..=b]));
             }
-            let off = (a * std::mem::size_of::<GpuVertex>()) as u64;
-            self.queue.write_buffer(self.vbuf.as_ref().unwrap(), off, bytemuck::cast_slice(&self.staging[a..=b]));
         }
         if need_edges && self.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);

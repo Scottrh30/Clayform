@@ -431,23 +431,69 @@ impl Undo {
     }
 }
 
+/// What the renderer must re-upload: everything (`topology`), or the
+/// vertices in dirty blocks of `BLOCK` vertices (`range` is their span).
 #[derive(Default)]
 pub struct GpuDirty {
     pub topology: bool,
     pub range: Option<(u32, u32)>,
+    /// One bit per block of `GpuDirty::BLOCK` vertices.
+    pub blocks: Vec<u64>,
 }
 
 impl GpuDirty {
-    fn add(&mut self, v: u32) {
+    pub const BLOCK: u32 = 256;
+
+    #[inline]
+    pub fn add(&mut self, v: u32) {
         self.range = Some(match self.range {
             None => (v, v),
             Some((a, b)) => (a.min(v), b.max(v)),
         });
+        let blk = (v / Self::BLOCK) as usize;
+        let (w, bit) = (blk / 64, blk % 64);
+        if w >= self.blocks.len() {
+            self.blocks.resize(w + 1, 0);
+        }
+        self.blocks[w] |= 1 << bit;
     }
-    fn all(&mut self, n: usize) {
+
+    pub fn all(&mut self, n: usize) {
         if n > 0 {
             self.range = Some((0, n as u32 - 1));
+            let nb = (n as u32).div_ceil(Self::BLOCK) as usize;
+            self.blocks = vec![u64::MAX; nb.div_ceil(64)];
         }
+    }
+
+    /// Runs of dirty vertices `(first, last)` clipped to `n`, clearing them.
+    pub fn take_runs(&mut self, n: usize) -> Vec<(u32, u32)> {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for (w, word) in self.blocks.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let blk = (w * 64 + b) as u32;
+                let first = blk * Self::BLOCK;
+                if first as usize >= n {
+                    continue;
+                }
+                let last = ((blk + 1) * Self::BLOCK - 1).min(n as u32 - 1);
+                match runs.last_mut() {
+                    Some(r) if r.1 + 1 == first => r.1 = last,
+                    _ => runs.push((first, last)),
+                }
+            }
+        }
+        self.blocks.iter_mut().for_each(|w| *w = 0);
+        self.range = None;
+        runs
+    }
+
+    /// Vertices covered by dirty blocks (and clears them); for measurements.
+    pub fn take_blocks_vertices(&mut self) -> usize {
+        self.take_runs(usize::MAX).iter().map(|r| (r.1 - r.0 + 1) as usize).sum()
     }
 }
 
@@ -480,6 +526,8 @@ struct Stroke {
     layer_base: std::collections::HashMap<u32, Vec3>,
     /// Planar brush: the plane found by the first dab.
     plane: Option<(Vec3, Vec3)>,
+    /// Name of the stroke's undo step.
+    label: Option<String>,
     /// Polygroup paint: faces' groups before the stroke.
     group_old: Vec<(u32, u32)>,
     group_seen: std::collections::HashSet<u32>,
@@ -507,8 +555,15 @@ pub struct Sculptor {
     pub mesh: Mesh,
     bvh: Bvh,
     bvh_dirty: bool,
+    /// Faces moved since the last refit (empty with `bvh_dirty` = refit all).
+    bvh_faces: Vec<u32>,
     undo: Vec<Undo>,
     redo: Vec<Undo>,
+    /// What each undo / redo step did, for the history list.
+    undo_labels: Vec<String>,
+    redo_labels: Vec<String>,
+    /// Label for the next undo step (set just before the change).
+    next_label: Option<String>,
     vmark: Marker,
     vmark2: Marker,
     fmark: Marker,
@@ -546,8 +601,12 @@ impl Sculptor {
             mesh,
             bvh,
             bvh_dirty: false,
+            bvh_faces: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_labels: Vec::new(),
+            redo_labels: Vec::new(),
+            next_label: None,
             vmark: Marker::new(),
             vmark2: Marker::new(),
             fmark: Marker::new(),
@@ -559,7 +618,7 @@ impl Sculptor {
             level: 0,
             pending_level: None,
             revision: 0,
-            dirty: GpuDirty { topology: true, range: None },
+            dirty: GpuDirty { topology: true, ..Default::default() },
         }
     }
 
@@ -621,12 +680,50 @@ impl Sculptor {
 
     fn push_undo(&mut self, u: Undo) {
         self.revision += 1;
+        let label = self.next_label.take().unwrap_or_else(|| {
+            match &u {
+                Undo::Verts { .. } => "Edit",
+                Undo::State(_) => "Change mesh",
+                Undo::Level(_) => "Change level",
+                Undo::DropTop { .. } => "Subdivide",
+                Undo::AddTop { .. } => "Remove level",
+                Undo::Groups { .. } => "Polygroups",
+            }
+            .to_string()
+        });
         self.undo.push(u);
+        self.undo_labels.push(label);
         self.redo.clear();
+        self.redo_labels.clear();
         let mut total: usize = self.undo.iter().map(|u| u.bytes()).sum();
         while self.undo.len() > 1 && (total > UNDO_BUDGET_BYTES || self.undo.len() > 100) {
             total -= self.undo.remove(0).bytes();
+            self.undo_labels.remove(0);
         }
+    }
+
+    /// Names the next undo step (e.g. "Voxel remesh").
+    pub fn set_label(&mut self, label: impl Into<String>) {
+        self.next_label = Some(label.into());
+    }
+
+    /// Names the next undo step unless something already did.
+    pub fn set_label_if_none(&mut self, label: impl Into<String>) {
+        if self.next_label.is_none() {
+            self.next_label = Some(label.into());
+        }
+    }
+
+    /// Names the stroke in progress (its undo step is made when it ends).
+    pub fn label_stroke(&mut self, label: impl Into<String>) {
+        if let Some(st) = self.stroke.as_mut() {
+            st.label = Some(label.into());
+        }
+    }
+
+    /// Steps that can be undone (oldest first) and redone (next first).
+    pub fn history(&self) -> (Vec<String>, Vec<String>) {
+        (self.undo_labels.clone(), self.redo_labels.iter().rev().cloned().collect())
     }
 
     /// Replaces the mesh (new primitive, import, subdivision), undoable.
@@ -656,6 +753,8 @@ impl Sculptor {
             Some(b) => {
                 self.bvh = b;
                 self.bvh_dirty = false;
+            self.bvh_faces.clear();
+        self.bvh_faces.clear();
                 self.dirty.topology = true;
                 self.dirty.range = None;
             }
@@ -666,6 +765,7 @@ impl Sculptor {
     fn topology_changed(&mut self) {
         self.bvh = Bvh::build(&self.mesh);
         self.bvh_dirty = false;
+        self.bvh_faces.clear();
         self.dirty.topology = true;
         self.dirty.range = None;
     }
@@ -781,6 +881,9 @@ impl Sculptor {
         }
         let from = self.level;
         self.goto_level(target);
+        if self.next_label.is_none() {
+            self.set_label(format!("Level {}", target.min(self.levels.len().saturating_sub(1)) + 1));
+        }
         self.push_undo(Undo::Level(from));
     }
 
@@ -854,6 +957,7 @@ impl Sculptor {
             return;
         }
         let snap = self.snapshot();
+        self.set_label("Delete lower levels");
         self.push_undo(Undo::State(snap));
         self.levels.drain(0..self.level);
         self.levels[0].odd = Vec::new();
@@ -869,6 +973,7 @@ impl Sculptor {
             return;
         }
         let snap = self.snapshot();
+        self.set_label("Delete higher levels");
         self.push_undo(Undo::State(snap));
         self.levels.truncate(self.level + 1);
         self.topology_changed();
@@ -881,9 +986,15 @@ impl Sculptor {
         if extra > 20_000.max(self.bvh.indexed() / 3) {
             self.bvh = Bvh::build(&self.mesh);
             self.bvh_dirty = false;
+            self.bvh_faces.clear();
         } else if self.bvh_dirty {
-            self.bvh.refit(&self.mesh);
+            if self.bvh_faces.is_empty() {
+                self.bvh.refit(&self.mesh);
+            } else {
+                self.bvh.refit_faces(&self.mesh, &self.bvh_faces);
+            }
             self.bvh_dirty = false;
+            self.bvh_faces.clear();
         }
     }
 
@@ -922,6 +1033,7 @@ impl Sculptor {
             modified: false,
             layer_base: std::collections::HashMap::new(),
             plane: None,
+            label: None,
             group_old: Vec::new(),
             group_seen: std::collections::HashSet::new(),
         });
@@ -929,6 +1041,9 @@ impl Sculptor {
 
     pub fn end_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
+            // the stroke's own name, keeping any label meant for the next change
+            let outer = self.next_label.take();
+            self.next_label = st.label.clone();
             if let Some(snap) = st.snapshot {
                 if st.modified {
                     if self.mesh.compact() {
@@ -942,6 +1057,7 @@ impl Sculptor {
                 let (faces, groups) = st.group_old.into_iter().unzip();
                 self.push_undo(Undo::Groups { faces, groups });
             }
+            self.next_label = outer;
         }
     }
 
@@ -1084,6 +1200,7 @@ impl Sculptor {
             for &u in &mesh.tris[f as usize] {
                 self.dirty.add(u);
             }
+            self.bvh_faces.push(f);
         }
         self.bvh_dirty = true;
     }
@@ -1646,6 +1763,10 @@ impl Sculptor {
             let Sculptor { mesh, fmark, vmark2, .. } = self;
             mesh.update_normals(&changed, fmark, vmark2);
         }
+        for &v in &changed {
+            let faces = self.mesh.vert_faces(v);
+            self.bvh_faces.extend_from_slice(faces);
+        }
         self.dirty.topology = true;
         self.bvh_dirty = true;
         if self.mesh.is_alive(seed) {
@@ -1739,6 +1860,9 @@ impl Sculptor {
         let e = self.undo.pop().unwrap();
         let inv = self.apply(e);
         self.redo.push(inv);
+        if let Some(l) = self.undo_labels.pop() {
+            self.redo_labels.push(l);
+        }
     }
 
     pub fn redo(&mut self) {
@@ -1748,6 +1872,9 @@ impl Sculptor {
         let e = self.redo.pop().unwrap();
         let inv = self.apply(e);
         self.undo.push(inv);
+        if let Some(l) = self.redo_labels.pop() {
+            self.undo_labels.push(l);
+        }
     }
 
     fn mask_op(&mut self, f: impl Fn(f32) -> f32) {
@@ -1797,9 +1924,11 @@ impl Sculptor {
     }
 
     pub fn clear_mask(&mut self) {
+        self.set_label("Clear mask");
         self.mask_op(|_| 0.0);
     }
     pub fn invert_mask(&mut self) {
+        self.set_label("Invert mask");
         self.mask_op(|m| 1.0 - m);
     }
 }

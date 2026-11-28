@@ -4,6 +4,8 @@
 
 mod host;
 mod render;
+mod conveniences;
+mod keys;
 mod output_ui;
 mod tools_ui;
 
@@ -101,6 +103,16 @@ struct Ui {
     group_angle: RwSignal<f32>,
     bulk: RwSignal<f32>,
     render: RwSignal<output_ui::RenderSettings>,
+    keymap: RwSignal<keys::KeyMap>,
+    /// The shortcut editor is waiting for a key for this command.
+    key_capture: RwSignal<Option<String>>,
+    show_keys: RwSignal<bool>,
+    recent: RwSignal<Vec<String>>,
+    /// Minutes between autosaves (0 = off).
+    autosave_minutes: RwSignal<u32>,
+    /// A recovery copy from an earlier session (when it was written, ms).
+    recovery: RwSignal<Option<f64>>,
+    autosaved_at: RwSignal<Option<f64>>,
 }
 
 impl Ui {
@@ -168,6 +180,13 @@ impl Ui {
             group_angle: RwSignal::new(30.0),
             bulk: RwSignal::new(1.0),
             render: RwSignal::new(Default::default()),
+            keymap: RwSignal::new(keys::load()),
+            key_capture: RwSignal::new(None),
+            show_keys: RwSignal::new(false),
+            recent: RwSignal::new(conveniences::load_recent()),
+            autosave_minutes: RwSignal::new(conveniences::autosave_minutes()),
+            recovery: RwSignal::new(None),
+            autosaved_at: RwSignal::new(None),
         }
     }
 
@@ -710,6 +729,7 @@ async fn save_project(ui: Ui, ask: bool) {
             }
             ui.project_name.set(file.trim_end_matches(".clayform").to_string());
             ui.saved_rev.set(rev);
+            conveniences::saved(ui, host::in_desktop_app().then_some(p.as_str()));
             ui.status.set(format!("Saved {p} ({mb:.1} MB)"));
         }
         Ok(None) => {}
@@ -726,35 +746,7 @@ async fn open_project(ui: Ui) {
             return;
         }
     };
-    let parts = match project::decode(&opened.bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            ui.status.set(format!("Open failed: {e}"));
-            return;
-        }
-    };
-    start_job(ui, "Opening");
-    let active = parts.active;
-    let mut levels: Vec<LevelData<Mesh>> = Vec::with_capacity(parts.levels.len());
-    let mut active_bvh = None;
-    for (i, l) in parts.levels.into_iter().enumerate() {
-        let (mesh, stencils, bvh) = build_in_slices(ui, l.mesh).await;
-        if i == active {
-            active_bvh = Some(bvh);
-        }
-        levels.push(LevelData { mesh, stencils, details: l.details });
-    }
-    with_ed(|e| {
-        e.cancel_drag();
-        e.sculptor.load_levels(levels, active, active_bvh);
-        e.redraw = true;
-    });
-    apply_settings(ui, &parts.settings_json);
-    ui.project_path.set(opened.path);
-    ui.project_name.set(opened.name.trim_end_matches(".clayform").to_string());
-    end_job(ui);
-    ui.saved_rev.set(ui.rev.get_untracked());
-    ui.status.set(format!("Opened {}", opened.name));
+    conveniences::open_project_bytes(ui, opened.name, opened.path, opened.bytes).await;
 }
 
 const MATCAP_KEY: &str = "clayform.matcap";
@@ -829,7 +821,10 @@ fn now_ms() -> f64 {
 
 fn new_mesh(ui: Ui, m: Mesh, name: &str) {
     let tris = m.tris.len();
-    with_ed(|e| e.set_mesh(m));
+    with_ed(|e| {
+        e.sculptor.set_label(format!("New {name}"));
+        e.set_mesh(m)
+    });
     ui.status.set(format!("{name} — {} triangles", fmt_count(tris)));
     ui.refresh();
 }
@@ -932,6 +927,7 @@ fn Viewport(ui: Ui) -> impl IntoView {
 
     let on_down = move |ev: ev::PointerEvent| {
         ev.prevent_default();
+        conveniences::touch();
         ui.menu.set(None);
         if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
             let _ = el.set_pointer_capture(ev.pointer_id());
@@ -952,6 +948,7 @@ fn Viewport(ui: Ui) -> impl IntoView {
         }
     };
     let on_move = move |ev: ev::PointerEvent| {
+        conveniences::touch();
         let p = local_pos(&ev);
         let size = canvas_size(&ev);
         ui.mods.set((ev.shift_key(), ev.ctrl_key() || ev.meta_key()));
@@ -1030,6 +1027,7 @@ fn Viewport(ui: Ui) -> impl IntoView {
                 }}
             </svg>
             <tools_ui::ModeOverlay ui />
+            <conveniences::RecoveryBanner ui />
             <tools_ui::References ui />
             <Show when=move || ui.job.get().is_some()>
                 <div class="job-card">
@@ -1181,6 +1179,30 @@ fn MenuBar(ui: Ui) -> impl IntoView {
             </span>
             <Menu ui id="file" label="File">
                 <Item ui action=Action::OpenProject label="Open project…" key="Ctrl+O" />
+                <Show when=move || !ui.recent.get().is_empty()>
+                    <div class="menu-sub">"Open recent"</div>
+                    {move || ui
+                        .recent
+                        .get()
+                        .into_iter()
+                        .map(|p| {
+                            let name = conveniences::file_name(&p);
+                            let path = p.clone();
+                            view! {
+                                <button class="item recent" title=p.clone() on:click=move |_| {
+                                    ui.menu.set(None);
+                                    spawn_local(conveniences::open_recent(ui, path.clone()));
+                                }>
+                                    <span>{name}</span>
+                                </button>
+                            }
+                        })
+                        .collect_view()}
+                    <button class="item recent-clear" on:click=move |_| {
+                        conveniences::clear_recent(ui);
+                        ui.menu.set(None);
+                    }><span>"Clear recent"</span></button>
+                </Show>
                 <Item ui action=Action::SaveProject label="Save project" key="Ctrl+S" />
                 <Item ui action=Action::SaveProjectAs label="Save project as…" key="Ctrl+Shift+S" />
                 <div class="sep"></div>
@@ -1270,28 +1292,30 @@ fn MenuBar(ui: Ui) -> impl IntoView {
             <Menu ui id="help" label="Help">
                 <div class="help">
                     <table>
-                        <tr><td>"Left drag on mesh"</td><td>"Sculpt"</td></tr>
-                        <tr><td>"Shift + drag"</td><td>"Smooth"</td></tr>
-                        <tr><td>"Ctrl + drag"</td><td>"Invert brush"</td></tr>
+                        <tr><td>"Left drag on mesh"</td><td>"Sculpt (or the mode's action)"</td></tr>
+                        <tr><td>"Shift + drag / Ctrl + drag"</td><td>"Smooth / invert the brush"</td></tr>
                         <tr><td>"Left drag off mesh, Alt + left, right drag"</td><td>"Rotate"</td></tr>
                         <tr><td>"Middle drag, Shift + right drag"</td><td>"Pan"</td></tr>
                         <tr><td>"Wheel"</td><td>"Zoom"</td></tr>
-                        <tr><td>"D C B S F Y Q I"</td><td>"Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate"</td></tr>
-                        <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Move Topological, Snakehook, Nudge, Mask"</td></tr>
-                        <tr><td>"J H O"</td><td>"Move, Clay Tubes, Polish (more brushes in the Tool list)"</td></tr>
-                        <tr><td>"F12"</td><td>"Render image"</td></tr>
-                        <tr><td>"Tab / Shift+Tab"</td><td>"Next / previous mode: Sculpt, ZModeler, Retopology, Mannequin"</td></tr>
-                        <tr><td>"Shift+G"</td><td>"Polygroup colours"</td></tr>
-                        <tr><td>"Enter / Esc"</td><td>"Retopology: close the face / drop the picked points"</td></tr>
-                        <tr><td>"[  ]"</td><td>"Brush radius"</td></tr>
-                        <tr><td>"X / W / N"</td><td>"Mirror X / wireframe / negative"</td></tr>
-                        <tr><td>"Ctrl+O / Ctrl+S / Ctrl+Shift+S"</td><td>"Open / save / save project as"</td></tr>
-                        <tr><td>"Ctrl+I / Ctrl+E"</td><td>"Import / export mesh"</td></tr>
-                        <tr><td>"Ctrl+D"</td><td>"Subdivide (add a level)"</td></tr>
-                        <tr><td>"Page Up / Page Down"</td><td>"Higher / lower level"</td></tr>
-                        <tr><td>"T"</td><td>"Dynamic topology on/off"</td></tr>
-                        <tr><td>"R"</td><td>"Voxel remesh"</td></tr>
+                        {move || {
+                            let map = ui.keymap.get();
+                            [
+                                ("undo", "Undo"), ("redo", "Redo"), ("open", "Open project"), ("save", "Save project"),
+                                ("render", "Render image"), ("subdivide", "Subdivide"), ("remesh", "Voxel remesh"),
+                                ("dyntopo", "Dynamic topology"), ("radius_down", "Smaller brush"), ("radius_up", "Bigger brush"),
+                                ("next_mode", "Next mode"), ("front", "Front view"), ("frame", "Frame mesh"),
+                            ]
+                            .into_iter()
+                            .map(|(id, label)| view! { <tr><td>{keys::keys_label(&map, id)}</td><td>{label}</td></tr> })
+                            .collect_view()
+                        }}
                     </table>
+                    <div class="row buttons">
+                        <button on:click=move |_| {
+                            ui.menu.set(None);
+                            ui.show_keys.set(true);
+                        }>"All keyboard shortcuts…"</button>
+                    </div>
                     <p class="about">"Clayform — a SculptGL-style sculpting app (Tauri + Leptos)."</p>
                 </div>
             </Menu>
@@ -1320,6 +1344,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
     view! {
         <aside class="panel">
             <tools_ui::ModeBar ui />
+            <conveniences::HistoryFolder ui />
             <Folder title="Sculpting">
                 <label class="row">
                     <span class="label">"Tool"</span>
@@ -1340,9 +1365,12 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                                             .filter(|t| t.category() == c)
                                             .map(|t| {
                                                 let t = *t;
-                                                let label = match t.key() {
-                                                    Some(k) => format!("{}  ({k})", t.name()),
-                                                    None => t.name().to_string(),
+                                                let label = move || {
+                                                    let map = ui.keymap.get();
+                                                    match map.get(&format!("tool:{}", t.name())).and_then(|k| k.first()) {
+                                                        Some(k) => format!("{}  ({k})", t.name()),
+                                                        None => t.name().to_string(),
+                                                    }
                                                 };
                                                 view! {
                                                     <option value=t.index().to_string() title=t.description() selected=move || ui.tool.get() == t>
@@ -1637,89 +1665,19 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                         <button class:on=move || ui.panel_right.get() on:click=move |_| ui.panel_right.set(true)>"Right"</button>
                     </div>
                 </div>
+                <Slider
+                    label="Autosave"
+                    min=0.0 max=30.0 step=1.0
+                    value=Signal::derive(move || ui.autosave_minutes.get() as f32)
+                    on_change=move |v| conveniences::set_autosave_minutes(ui, v as u32)
+                    format=|v| if v < 0.5 { "Off".to_string() } else { format!("every {v:.0} min") }
+                />
+                <div class="hint">"Autosave keeps a recovery copy of unsaved work (desktop app). If Clayform closes unexpectedly, it offers to recover it next time. Saving the project removes the copy."</div>
+                <div class="row buttons">
+                    <button on:click=move |_| ui.show_keys.set(true)>"Keyboard shortcuts…"</button>
+                </div>
             </Folder>
         </aside>
-    }
-}
-
-fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
-    ui.mods.set((ev.shift_key(), ev.ctrl_key() || ev.meta_key()));
-    if let Some(el) = ev.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-        let tag = el.tag_name();
-        let text_input = tag == "TEXTAREA"
-            || tag == "SELECT"
-            || (tag == "INPUT" && matches!(el.get_attribute("type").as_deref(), Some("text") | Some("number") | None));
-        if text_input {
-            return;
-        }
-    }
-    let ctrl = ev.ctrl_key() || ev.meta_key();
-    let key = ev.key();
-    let k = key.to_ascii_lowercase();
-    let mut handled = true;
-    if ctrl {
-        match k.as_str() {
-            "z" if ev.shift_key() => act(ui, Action::Redo),
-            "z" => act(ui, Action::Undo),
-            "y" => act(ui, Action::Redo),
-            "o" => act(ui, Action::OpenProject),
-            "s" if ev.shift_key() => act(ui, Action::SaveProjectAs),
-            "s" => act(ui, Action::SaveProject),
-            "i" => act(ui, Action::Import),
-            "e" => act(ui, Action::ExportObj),
-            "d" => act(ui, Action::Subdivide),
-            "1" => act(ui, Action::View(ViewDir::Back)),
-            "3" => act(ui, Action::View(ViewDir::Left)),
-            "7" => act(ui, Action::View(ViewDir::Bottom)),
-            _ => handled = false,
-        }
-    } else if ev.alt_key() {
-        handled = false;
-    } else {
-        match k.as_str() {
-            "[" => ui.radius.update(|r| *r = (*r / 1.15).max(4.0)),
-            "]" => ui.radius.update(|r| *r = (*r * 1.15).min(400.0)),
-            "w" => ui.view.update(|s| s.wireframe = !s.wireframe),
-            "x" => ui.symmetry.update(|s| s.mirror[0] = !s.mirror[0]),
-            "n" => ui.negative.update(|s| *s = !*s),
-            "home" | "." => act(ui, Action::FrameMesh),
-            "1" => act(ui, Action::View(ViewDir::Front)),
-            "3" => act(ui, Action::View(ViewDir::Right)),
-            "7" => act(ui, Action::View(ViewDir::Top)),
-            "f12" => act(ui, Action::RenderImage),
-            "escape" => {
-                ui.menu.set(None);
-                with_ed(|e| e.retopo.pending.clear());
-                ui.refresh();
-            }
-            "enter" if ui.mode.get_untracked() == Mode::Retopo => {
-                with_ed(|e| e.retopo_close_face());
-                ui.refresh();
-            }
-            "g" if ev.shift_key() => ui.view.update(|s| s.polygroups = !s.polygroups),
-            "tab" => {
-                let m = ui.mode.get_untracked();
-                let i = Mode::ALL.iter().position(|x| *x == m).unwrap_or(0);
-                let n = Mode::ALL.len();
-                let next = if ev.shift_key() { (i + n - 1) % n } else { (i + 1) % n };
-                ui.mode.set(Mode::ALL[next]);
-            }
-            "pageup" => act(ui, Action::LevelUp),
-            "pagedown" => act(ui, Action::LevelDown),
-            "t" => act(ui, Action::ToggleDyntopo),
-            "r" => act(ui, Action::VoxelRemesh),
-            _ => {
-                if let Some(t) = Tool::ALL.iter().find(|t| t.key().is_some_and(|c| c.to_ascii_lowercase().to_string() == k)) {
-                    ui.tool.set(*t);
-                    ui.mode.set(Mode::Sculpt);
-                } else {
-                    handled = false;
-                }
-            }
-        }
-    }
-    if handled {
-        ev.prevent_default();
     }
 }
 
@@ -1779,6 +1737,7 @@ fn App() -> impl IntoView {
         with_ed(|e| e.redraw = true);
     });
 
+    conveniences::start_autosave(ui);
     host::listen_progress(move |p| {
         ui.job.update(|j| {
             if let Some(j) = j {
@@ -1787,7 +1746,7 @@ fn App() -> impl IntoView {
         })
     });
 
-    let keydown = window_event_listener(ev::keydown, move |ev| handle_key(ui, &ev));
+    let keydown = window_event_listener(ev::keydown, move |ev| keys::handle_key(ui, &ev));
     let keyup = window_event_listener(ev::keyup, move |ev| ui.mods.set((ev.shift_key(), ev.ctrl_key() || ev.meta_key())));
     on_cleanup(move || {
         keydown.remove();
@@ -1831,9 +1790,16 @@ fn App() -> impl IntoView {
                 }}</span>
                 <span class="sep">"|"</span>
                 <span class="msg">{move || ui.status.get()}</span>
+                <span class="autosaved">{move || ui.autosaved_at.get().map(|ms| {
+                    let d = js_sys::Date::new(&JsValue::from_f64(ms));
+                    format!("autosaved {:02}:{:02}", d.get_hours(), d.get_minutes())
+                })}</span>
             </footer>
             <Show when=move || ui.menu.get().is_some()>
                 <div class="menu-backdrop" on:pointerdown=move |_| ui.menu.set(None)></div>
+            </Show>
+            <Show when=move || ui.show_keys.get()>
+                <keys::ShortcutEditor ui />
             </Show>
         </div>
     }

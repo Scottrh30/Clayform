@@ -17,6 +17,13 @@ struct Node {
 pub struct Bvh {
     nodes: Vec<Node>,
     order: Vec<u32>,
+    /// Parent of each node (NONE for the root), and the leaf holding each
+    /// indexed face, for refitting only what moved.
+    parent: Vec<u32>,
+    leaf_of: Vec<u32>,
+    /// Scratch marks for partial refits.
+    mark: Vec<u32>,
+    stamp: u32,
     /// Faces with index >= `indexed` were added after the build (dynamic
     /// topology) and are tested by brute force until the next rebuild.
     indexed: usize,
@@ -148,7 +155,22 @@ impl BvhBuilder {
 
     pub fn finish(mut self, mesh: &Mesh) -> Bvh {
         self.step(mesh, &mut || true);
-        Bvh { nodes: self.nodes, order: self.order, indexed: self.indexed }
+        let mut parent = vec![NONE; self.nodes.len()];
+        let mut leaf_of = vec![NONE; self.indexed];
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.count > 0 {
+                for &f in &self.order[n.first as usize..(n.first + n.count) as usize] {
+                    if (f as usize) < leaf_of.len() {
+                        leaf_of[f as usize] = i as u32;
+                    }
+                }
+            } else if (n.first as usize) + 1 < self.nodes.len() && i < n.first as usize {
+                parent[n.first as usize] = i as u32;
+                parent[n.first as usize + 1] = i as u32;
+            }
+        }
+        let mark = vec![0; self.nodes.len()];
+        Bvh { nodes: self.nodes, order: self.order, parent, leaf_of, mark, stamp: 0, indexed: self.indexed }
     }
 }
 
@@ -187,6 +209,37 @@ impl Bvh {
     pub fn refit(&mut self, mesh: &Mesh) {
         for i in (0..self.nodes.len()).rev() {
             refit_node(&mut self.nodes, &self.order, mesh, i);
+        }
+    }
+
+    /// Recomputes the bounds of the leaves holding `faces` and of their
+    /// ancestors only. Much cheaper than `refit` when a brush moved a small
+    /// part of a big mesh.
+    pub fn refit_faces(&mut self, mesh: &Mesh, faces: &[u32]) {
+        if faces.len() * 3 > self.indexed || self.nodes.is_empty() {
+            self.refit(mesh);
+            return;
+        }
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.mark.iter_mut().for_each(|m| *m = 0);
+            self.stamp = 1;
+        }
+        let mut todo: Vec<u32> = Vec::new();
+        for &f in faces {
+            let Some(&leaf) = self.leaf_of.get(f as usize) else { continue };
+            let mut n = leaf;
+            // walk up until a node already queued
+            while n != NONE && self.mark[n as usize] != self.stamp {
+                self.mark[n as usize] = self.stamp;
+                todo.push(n);
+                n = self.parent[n as usize];
+            }
+        }
+        // children have larger indices than their parents
+        todo.sort_unstable_by(|a, b| b.cmp(a));
+        for n in todo {
+            refit_node(&mut self.nodes, &self.order, mesh, n as usize);
         }
     }
 
@@ -398,5 +451,25 @@ mod tests {
         b.refit(&m);
         let h = b.raycast(&m, Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         assert!((h.point.z - 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn partial_refit_matches_full_refit() {
+        let mut m = Mesh::icosphere(4);
+        let mut a = Bvh::build(&m);
+        let mut b = Bvh::build(&m);
+        // push a patch of vertices outwards
+        let moved: Vec<u32> = (0..m.positions.len() as u32).filter(|&v| m.positions[v as usize].z > 0.8).collect();
+        for &v in &moved {
+            m.positions[v as usize] *= 1.5;
+        }
+        let faces: Vec<u32> = moved.iter().flat_map(|&v| m.vert_faces(v).to_vec()).collect();
+        a.refit_faces(&m, &faces);
+        b.refit(&m);
+        for (x, y) in a.nodes.iter().zip(&b.nodes) {
+            assert_eq!((x.min, x.max), (y.min, y.max));
+        }
+        let h = a.raycast(&m, Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z).unwrap();
+        assert!(h.point.z > 1.4);
     }
 }

@@ -128,6 +128,7 @@ impl Editor {
             return;
         }
         let m = polys.to_mesh();
+        self.sculptor.set_label(self.zm.action.name());
         self.sculptor.set_mesh(m);
         self.redraw = true;
     }
@@ -198,6 +199,7 @@ impl Editor {
             .iter()
             .map(|&f| if (f as usize) < polys.groups.len() { polys.groups[f as usize] } else { 0 })
             .collect();
+        self.sculptor.set_label_if_none(self.zm.action.name());
         self.sculptor.set_groups(groups);
         self.redraw = true;
     }
@@ -247,6 +249,7 @@ impl Editor {
             self.sculptor.replace_mesh_preview(m);
         } else {
             dr.applied = true;
+            self.sculptor.set_label(dr.action.name());
             self.sculptor.set_mesh(m);
         }
         self.redraw = true;
@@ -307,6 +310,7 @@ impl Editor {
         let d = self.zm.divisions.clamp(1, 32);
         let p = kind.build(d);
         self.cancel_drag();
+        self.sculptor.set_label(format!("New {}", kind.name()));
         self.sculptor.set_mesh(p.to_mesh());
         self.frame_mesh();
         self.redraw = true;
@@ -317,6 +321,7 @@ impl Editor {
     pub fn auto_groups(&mut self, angle_deg: f32) {
         let mut polys = self.zm_polys().0.clone();
         polys.auto_groups(angle_deg.to_radians());
+        self.sculptor.set_label("Group by normals");
         self.zm_set_groups(&polys);
     }
 
@@ -333,6 +338,7 @@ impl Editor {
             }
         }
         if any {
+            self.sculptor.set_label("Group masked");
             self.sculptor.set_groups(groups);
             self.redraw = true;
         } else {
@@ -343,6 +349,7 @@ impl Editor {
     /// Puts every face back in polygroup 0 (undoable).
     pub fn clear_groups(&mut self) {
         let n = self.sculptor.mesh.tris.len();
+        self.sculptor.set_label("Clear polygroups");
         self.sculptor.set_groups(vec![0; n]);
         self.redraw = true;
     }

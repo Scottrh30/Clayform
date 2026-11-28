@@ -191,6 +191,44 @@ pub async fn save_file(suggested_name: &str, extension: &str, title: &str, bytes
     }
 }
 
+/// Writes the crash-recovery copy (desktop app only).
+pub async fn autosave_write(bytes: &[u8]) -> Result<(), String> {
+    if !in_desktop_app() {
+        return Ok(());
+    }
+    invoke_body("autosave_write", bytes, &[]).await.map(|_| ())
+}
+
+/// (size in bytes, last written in ms since 1970) of the recovery copy.
+pub async fn autosave_info() -> Option<(f64, f64)> {
+    if !in_desktop_app() {
+        return None;
+    }
+    let v = invoke("autosave_info", serde_json::json!({})).await.ok()?;
+    if v.is_null() || v.is_undefined() {
+        return None;
+    }
+    let num = |k: &str| Reflect::get(&v, &k.into()).ok().and_then(|x| x.as_f64());
+    Some((num("size")?, num("modified")?))
+}
+
+pub async fn autosave_read() -> Result<Vec<u8>, String> {
+    let v = invoke("autosave_read", serde_json::json!({})).await?;
+    Ok(Uint8Array::new(&v).to_vec())
+}
+
+pub async fn autosave_clear() {
+    if in_desktop_app() {
+        let _ = invoke("autosave_clear", serde_json::json!({})).await;
+    }
+}
+
+/// Reads a project file by its path (desktop app only).
+pub async fn open_project_path(path: &str) -> Result<Vec<u8>, String> {
+    let v = invoke_body("open_project_path", &[], &[("path", uri(path))]).await?;
+    Ok(Uint8Array::new(&v).to_vec())
+}
+
 /// Window title (the native title bar in the desktop app).
 pub fn set_title(title: &str) {
     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {

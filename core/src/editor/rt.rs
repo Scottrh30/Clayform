@@ -166,6 +166,7 @@ impl Editor {
         let mut m = polys.to_mesh();
         m.export_center = original.export_center;
         m.export_scale = original.export_scale;
+        self.sculptor.set_label("Apply retopology");
         self.sculptor.set_mesh(m);
         let reach = {
             let (mn, mx) = original.bounds();

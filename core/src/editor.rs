@@ -301,6 +301,7 @@ impl Editor {
         self.cancel_drag();
         let m = voxel_remesh(&self.sculptor.mesh, settings)?;
         let n = m.tris.len();
+        self.sculptor.set_label("Voxel remesh");
         self.sculptor.set_mesh(m);
         self.redraw = true;
         Ok(n)
@@ -309,6 +310,7 @@ impl Editor {
     /// Replaces the sculpt with a remeshed version (undoable, keeps the view).
     pub fn apply_remeshed(&mut self, m: Mesh, bvh: Option<crate::bvh::Bvh>) {
         self.cancel_drag();
+        self.sculptor.set_label_if_none("Voxel remesh");
         self.sculptor.set_mesh_built(m, bvh);
         self.redraw = true;
     }
@@ -367,6 +369,23 @@ impl Editor {
         };
         self.camera.yaw = yaw;
         self.camera.pitch = pitch;
+        self.redraw = true;
+    }
+
+    /// Undoes or redoes until `done` steps of the history are applied
+    /// (0 = the oldest state still remembered).
+    pub fn goto_history(&mut self, done: usize) {
+        self.cancel_drag();
+        loop {
+            let (u, _) = self.sculptor.history();
+            if u.len() > done && self.sculptor.can_undo() {
+                self.sculptor.undo();
+            } else if u.len() < done && self.sculptor.can_redo() {
+                self.sculptor.redo();
+            } else {
+                break;
+            }
+        }
         self.redraw = true;
     }
 
@@ -599,6 +618,7 @@ impl Editor {
             self.paint_group = self.sculptor.mesh.groups.iter().copied().max().map_or(0, |g| g + 1);
         }
         self.sculptor.begin_stroke(self.dyntopo_active() && !self.stroke_tool.is_drag());
+        self.sculptor.label_stroke(self.stroke_tool.name());
         if self.stroke_tool.is_drag() {
             let wpp = self.camera.world_per_point(h.point, size.y);
             let r = self.brush.radius_px * wpp;
@@ -727,6 +747,7 @@ impl Editor {
         }
         self.stroke_tool = Tool::CurveSnakehook;
         self.sculptor.begin_stroke(self.dyntopo_active());
+        self.sculptor.label_stroke("Curve Snakehook");
         let mut prev = path[0];
         for k in 1..=n {
             let s = total * k as f32 / n as f32;
@@ -1033,6 +1054,28 @@ mod tests {
     }
 
     #[test]
+    fn history_names_steps_and_jumps() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(3));
+        e.view_from(ViewDir::Front);
+        e.brush.tool = Tool::Clay;
+        stroke(&mut e, Mods::default());
+        e.brush.tool = Tool::Inflate;
+        stroke(&mut e, Mods::default());
+        e.sculptor.clear_mask();
+        let (done, undone) = e.sculptor.history();
+        assert_eq!(done[done.len() - 3..], ["Clay", "Inflate", "Clear mask"]);
+        assert!(undone.is_empty());
+        let after_clay = done.len() - 2;
+        e.goto_history(after_clay);
+        let (done, undone) = e.sculptor.history();
+        assert_eq!(done.last().unwrap(), "Clay");
+        assert_eq!(undone, ["Inflate", "Clear mask"]);
+        e.goto_history(after_clay + 2);
+        assert_eq!(e.sculptor.history().0.last().unwrap(), "Clear mask");
+    }
+
+    #[test]
     fn dragging_brushes_move_and_undo() {
         for tool in [Tool::Move, Tool::MoveElastic, Tool::MoveInfiniteDepth, Tool::ClothPull, Tool::Anchors] {
             let mut e = Editor::new();
@@ -1222,5 +1265,45 @@ mod tests {
         assert!(e.mannequin_shown());
         e.mannequin_preset("Sit");
         assert!(e.mannequin_shown());
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// `cargo test --release -p clayform-core bench_stroke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_stroke() {
+        for level in [7u32, 8] {
+            let mut e = Editor::new();
+            e.set_mesh(Mesh::icosphere(level));
+            e.view_from(ViewDir::Front);
+            e.brush.symmetry.mirror = [false; 3];
+            let size = Vec2::new(1600.0, 1000.0);
+            let n = e.sculptor.tri_count();
+            let t0 = Instant::now();
+            e.pointer_down(Button::Left, size * 0.5 - Vec2::X * 200.0, size, Mods::default());
+            let mut refit = 0.0;
+            let mut gpu_verts = 0usize;
+            for i in 0..60 {
+                e.pointer_move(size * 0.5 + Vec2::new(i as f32 * 6.0 - 200.0, (i as f32 * 0.3).sin() * 40.0), size);
+                // what the frame loop does each frame
+                let t = Instant::now();
+                e.sculptor.refresh_bvh();
+                refit += t.elapsed().as_secs_f64();
+                gpu_verts += e.sculptor.dirty.take_blocks_vertices();
+            }
+            e.pointer_up();
+            let total = t0.elapsed().as_secs_f64();
+            println!(
+                "{n} tris: stroke {:.1} ms/move (refit {:.1} ms/move), GPU re-upload {:.0} verts/move",
+                total * 1000.0 / 60.0,
+                refit * 1000.0 / 60.0,
+                gpu_verts as f64 / 60.0
+            );
+        }
     }
 }
