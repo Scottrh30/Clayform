@@ -153,8 +153,13 @@ async fn open_project(app: tauri::AppHandle) -> Result<Response, String> {
 }
 
 #[tauri::command]
+async fn open_brush(app: tauri::AppHandle) -> Result<Response, String> {
+    pick_and_read(&app, "Import brush preset", "Clayform brush", &["claybrush"])
+}
+
+#[tauri::command]
 async fn open_image(app: tauri::AppHandle) -> Result<Response, String> {
-    pick_and_read(&app, "Load matcap image", "Images (PNG, JPEG)", &["png", "jpg", "jpeg", "PNG", "JPG", "JPEG"])
+    pick_and_read(&app, "Open image", "Images (PNG, JPEG)", &["png", "jpg", "jpeg", "PNG", "JPG", "JPEG"])
 }
 
 /// Saves a project. Body: file bytes. Headers: `path` (URL-encoded; empty =
@@ -319,7 +324,7 @@ fn main() {
         .manage(Jobs::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, subdivide, cancel_job, open_project, save_project, open_image])
+        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, subdivide, cancel_job, open_project, save_project, open_image, open_brush])
         .run(tauri::generate_context!())
         .expect("error while running Clayform");
 }

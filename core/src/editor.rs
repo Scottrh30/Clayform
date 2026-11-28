@@ -4,11 +4,14 @@
 use crate::camera::Camera;
 use crate::mesh::Mesh;
 use crate::remesh::{voxel_remesh, VoxelSettings};
-use crate::sculpt::{AnchorMode, DabParams, DragInput, DragKind, Gather, Sculptor, Tool};
+use crate::brush::{Alpha, FalloffCurve, LazyMouse, Rng, StrokeKind, StrokeSettings};
+use crate::sculpt::{AnchorMode, DabParams, DragInput, DragKind, Gather, Sculptor, Tip, Tool};
+use std::sync::Arc;
 use crate::symmetry::{apply_point, Symmetry};
 use glam::Mat3;
 use glam::{Vec2, Vec3, Vec4};
 
+mod cv;
 mod gz;
 mod mq;
 mod rt;
@@ -103,6 +106,8 @@ pub struct Brush {
     pub smooth_reduces: bool,
     /// What the Anchors brush does.
     pub anchor_mode: AnchorMode,
+    /// Stroke type, lazy mouse, pressure, backface masking, alpha turn, chisel shape.
+    pub stroke: StrokeSettings,
 }
 
 impl Default for Brush {
@@ -118,6 +123,7 @@ impl Default for Brush {
             detail_mode: DetailMode::Brush,
             smooth_reduces: true,
             anchor_mode: AnchorMode::Move,
+            stroke: StrokeSettings::default(),
         }
     }
 }
@@ -195,6 +201,36 @@ pub struct Editor {
     gzs: gz::GzState,
     /// Alt pressed on this point: a click (not a drag) picks a SubTool.
     alt_click: Option<Vec2>,
+    /// Brush falloff curve and alpha (shared by every brush).
+    pub falloff: FalloffCurve,
+    pub alpha: Option<Arc<Alpha>>,
+    /// Pen pressure of the latest pointer event (1 for a mouse).
+    pub pressure: f32,
+    /// Lazy mouse while a freehand stroke runs.
+    lazy: Option<LazyMouse>,
+    /// Stroke kind of the running stroke.
+    stroke_kind: StrokeKind,
+    /// Drag Rect: where the stamp was placed and the scale there.
+    rect: Option<(Vec2, f32)>,
+    rng: Rng,
+    /// Direction of the last dabs on screen (alpha "follow stroke").
+    stroke_dir: Vec2,
+}
+
+/// Per-dab changes to the brush (pressure, Spray, Drag Rect).
+#[derive(Clone, Copy, Debug)]
+struct DabMods {
+    radius_px: Option<f32>,
+    size: f32,
+    strength: f32,
+    /// Extra alpha turn in radians.
+    turn: f32,
+}
+
+impl Default for DabMods {
+    fn default() -> Self {
+        Self { radius_px: None, size: 1.0, strength: 1.0, turn: 0.0 }
+    }
 }
 
 impl Default for Editor {
@@ -246,6 +282,14 @@ impl Editor {
             gizmo: GizmoSettings::default(),
             gzs: Default::default(),
             alt_click: None,
+            falloff: FalloffCurve::default(),
+            alpha: None,
+            pressure: 1.0,
+            lazy: None,
+            stroke_kind: StrokeKind::Freehand,
+            rect: None,
+            rng: Rng::new(7),
+            stroke_dir: Vec2::X,
         };
         e.frame_mesh();
         e
@@ -453,6 +497,9 @@ impl Editor {
         }
         self.grab = None;
         self.curve.clear();
+        self.lazy = None;
+        self.rect = None;
+        self.sculptor.tip = Tip::default();
         self.zms.drag = None;
         self.rts.drag = None;
         self.mqs.drag = None;
@@ -507,6 +554,12 @@ impl Editor {
                 let mut o = Overlay { brush: true, ..Default::default() };
                 for w in self.curve.windows(2) {
                     o.lines.push((w[0], w[1], OverlayStyle::Curve));
+                }
+                if let (Some(l), Some(p)) = (self.lazy, p) {
+                    if self.drag == Drag::Sculpt && l.pos.distance(p) > 1.0 {
+                        o.lines.push((l.pos, p, OverlayStyle::Curve));
+                        o.points.push((l.pos, OverlayStyle::Active));
+                    }
                 }
                 o
             }
@@ -603,6 +656,9 @@ impl Editor {
             Mode::Sculpt if self.drag == Drag::Sculpt && self.stroke_tool == Tool::CurveSnakehook => {
                 self.finish_curve();
             }
+            Mode::Sculpt if self.drag == Drag::Sculpt && self.stroke_tool.is_curve() => {
+                self.finish_curve_mesh();
+            }
             Mode::ZModeler if self.drag == Drag::Sculpt => self.zm_up(),
             Mode::Retopo if self.drag == Drag::Sculpt => self.rt_up(),
             Mode::Mannequin if self.drag == Drag::Sculpt => self.mq_up(),
@@ -630,22 +686,63 @@ impl Editor {
         self.sym_center = (mn + mx) * 0.5;
     }
 
-    fn dab_at(&mut self, p: Vec2, size: Vec2, screen_motion: Vec2) {
+    /// Pen pressure scaling for size and strength.
+    fn pressure_mods(&self) -> DabMods {
+        let st = &self.brush.stroke;
+        let pr = self.pressure.clamp(0.0, 1.0);
+        DabMods {
+            size: if st.pressure_size { 0.15 + 0.85 * pr } else { 1.0 },
+            strength: if st.pressure_intensity { pr } else { 1.0 },
+            ..Default::default()
+        }
+    }
+
+    /// The alpha / chisel axes on the surface at `n`: screen-aligned, turned
+    /// by the brush angle, the stroke direction (if followed) and `turn`.
+    fn tip_frame(&self, n: Vec3, turn: f32) -> (Vec3, Vec3) {
+        let f = self.camera.forward();
+        let right = f.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(f);
+        let st = &self.brush.stroke;
+        let mut ang = st.alpha_angle.to_radians() + turn;
+        if st.alpha_follow && self.stroke_kind != StrokeKind::DragRect {
+            ang += self.stroke_dir.y.atan2(self.stroke_dir.x);
+        }
+        let (sn, cs) = ang.sin_cos();
+        // screen directions of the image's x and y (y points down the screen)
+        let sx = right * cs - up * sn;
+        let sy = -(right * sn + up * cs) ;
+        let proj = |d: Vec3| (d - n * d.dot(n)).normalize_or(d);
+        let u = proj(sx);
+        let v = n.cross(u).normalize_or(proj(sy));
+        // keep v pointing down the screen like the image rows
+        let v = if v.dot(sy) < 0.0 { -v } else { v };
+        (u, v)
+    }
+
+    fn dab_with(&mut self, p: Vec2, size: Vec2, screen_motion: Vec2, m: DabMods) {
         self.last_size = size;
         let (o, d) = self.camera.ray(p, size);
         let Some(h) = self.sculptor.raycast(o, d) else { return };
         let wpp = self.camera.world_per_point(h.point, size.y);
-        let r = self.brush.radius_px * wpp;
+        let r = m.radius_px.unwrap_or(self.brush.radius_px) * m.size * wpp;
         // screen movement since the last dab, as a world-space vector in the view plane
         let f = self.camera.forward();
         let right = f.cross(Vec3::Y).normalize_or_zero();
         let up = right.cross(f);
         let motion = (right * screen_motion.x - up * screen_motion.y) * wpp;
+        let mut n = self.sculptor.mesh.face_normal_raw(h.tri as usize).normalize_or_zero();
+        if n.dot(d) > 0.0 {
+            n = -n;
+        }
+        let frame = self.tip_frame(n, m.turn);
+        self.sculptor.tip.frame = frame;
+        self.sculptor.tip.backface = self.brush.stroke.backface.then_some(n);
         let mut params = DabParams {
             tool: self.stroke_tool,
             center: h.point,
             radius: r,
-            intensity: self.brush.intensity[self.stroke_tool.index()],
+            intensity: self.brush.intensity[self.stroke_tool.index()] * m.strength,
             negative: self.stroke_negative,
             seed_tri: h.tri,
             detail: self.dab_detail(r),
@@ -655,15 +752,32 @@ impl Editor {
         };
         self.sculptor.dab(&params);
         let c = self.symmetry_center();
-        for m in self.brush.symmetry.copies() {
-            if let Some(hm) = self.sculptor.raycast(apply_point(m, c, o), m * d) {
+        for mm in self.brush.symmetry.copies() {
+            if let Some(hm) = self.sculptor.raycast(apply_point(mm, c, o), mm * d) {
                 params.center = hm.point;
                 params.seed_tri = hm.tri;
-                params.motion = m * motion;
+                params.motion = mm * motion;
+                // the mirrored tip: mirrored axes (and normal for backface)
+                self.sculptor.tip.frame = ((mm * frame.0).normalize_or_zero(), (mm * frame.1).normalize_or_zero());
+                self.sculptor.tip.backface = self.brush.stroke.backface.then_some((mm * n).normalize_or_zero());
                 self.sculptor.dab(&params);
             }
         }
         self.redraw = true;
+    }
+
+    /// Sets the brush tip (curve, alpha, chisel) for a stroke with `tool`.
+    fn setup_tip(&mut self, tool: Tool) {
+        let tip = &mut self.sculptor.tip;
+        *tip = Tip::default();
+        if !self.falloff.is_default() {
+            tip.curve = Some(Box::new(self.falloff.lut()));
+        }
+        if tool == Tool::Chisel {
+            tip.chisel = Some(self.brush.stroke.chisel);
+        } else if !matches!(tool, Tool::Mask | Tool::GroupPaint) {
+            tip.alpha = self.alpha.clone();
+        }
     }
 
     fn begin_sculpt(&mut self, p: Vec2, size: Vec2, mods: Mods) -> bool {
@@ -681,7 +795,12 @@ impl Editor {
         if self.stroke_tool == Tool::GroupPaint {
             self.paint_group = self.sculptor.mesh.groups.iter().copied().max().map_or(0, |g| g + 1);
         }
-        self.sculptor.begin_stroke(self.dyntopo_active() && !self.stroke_tool.is_drag());
+        self.stroke_kind = if self.stroke_tool == Tool::Chisel { StrokeKind::DragRect } else { self.brush.stroke.kind };
+        self.setup_tip(self.stroke_tool);
+        // Drag Rect redraws its stamp from the stroke's saved points, which
+        // dynamic topology would invalidate
+        let dynamic = self.dyntopo_active() && !self.stroke_tool.is_drag() && self.stroke_kind != StrokeKind::DragRect;
+        self.sculptor.begin_stroke(dynamic);
         self.sculptor.label_stroke(self.stroke_tool.name());
         if self.stroke_tool.is_drag() {
             let wpp = self.camera.world_per_point(h.point, size.y);
@@ -715,15 +834,30 @@ impl Editor {
             self.drag_start = p;
             self.drag_wpp = wpp;
             self.drag = Drag::Sculpt;
-        } else if self.stroke_tool == Tool::CurveSnakehook {
-            // draw the path first; the horn is pulled on release
+        } else if self.stroke_tool.is_curve() {
+            // draw the path first; the horn / tube is made on release
             self.curve = vec![p];
             self.drag = Drag::Sculpt;
         } else {
             // the drag state must be Sculpt while the first dab is applied
             self.drag = Drag::Sculpt;
-            self.dab_at(p, size, Vec2::ZERO);
+            self.stroke_dir = Vec2::X;
             self.last_dab = p;
+            match self.stroke_kind {
+                StrokeKind::DragRect => {
+                    // nothing yet: the stamp appears as you drag out its size
+                    let wpp = self.camera.world_per_point(h.point, size.y);
+                    self.rect = Some((p, wpp));
+                }
+                StrokeKind::Spray => self.spray_at(p, size, Vec2::ZERO),
+                _ => {
+                    if self.brush.stroke.lazy && self.stroke_kind == StrokeKind::Freehand {
+                        self.lazy = Some(LazyMouse::new(p));
+                    }
+                    let m = self.pressure_mods();
+                    self.dab_with(p, size, Vec2::ZERO, m);
+                }
+            }
         }
         true
     }
@@ -746,23 +880,91 @@ impl Editor {
             }
             return;
         }
-        if self.stroke_tool == Tool::CurveSnakehook {
+        if self.stroke_tool.is_curve() {
             if self.curve.last().is_none_or(|q| q.distance(p) > 3.0) {
                 self.curve.push(p);
                 self.redraw = true;
             }
             return;
         }
-        let spacing = (self.brush.radius_px * 0.1).max(1.0);
-        let mut from = self.last_dab;
-        let mut dist = (p - from).length();
-        while dist >= spacing {
-            let dir = (p - from) / dist;
-            from += dir * spacing;
-            dist -= spacing;
-            self.dab_at(from, size, dir * spacing);
+        match self.stroke_kind {
+            StrokeKind::DragRect => self.drag_rect(p, size),
+            StrokeKind::Dots => {
+                // one dab per pointer event, wherever it lands
+                let mv = p - self.last_dab;
+                if mv.length() > 0.5 {
+                    self.stroke_dir = mv.normalize();
+                }
+                let m = self.pressure_mods();
+                self.dab_with(p, size, mv, m);
+                self.last_dab = p;
+            }
+            StrokeKind::Freehand | StrokeKind::Spray => {
+                // the brush trails the pointer when lazy mouse is on
+                let target = match self.lazy.as_mut() {
+                    Some(l) => {
+                        l.pull(p, self.brush.stroke.lazy_radius);
+                        self.redraw = true;
+                        l.pos
+                    }
+                    None => p,
+                };
+                let frac = if self.stroke_kind == StrokeKind::Spray { self.brush.stroke.spacing.max(0.25) } else { self.brush.stroke.spacing };
+                let spacing = (self.brush.radius_px * frac.clamp(0.02, 2.0)).max(1.0);
+                let mut from = self.last_dab;
+                let mut dist = (target - from).length();
+                while dist >= spacing {
+                    let dir = (target - from) / dist;
+                    from += dir * spacing;
+                    dist -= spacing;
+                    self.stroke_dir = dir;
+                    if self.stroke_kind == StrokeKind::Spray {
+                        self.spray_at(from, size, dir * spacing);
+                    } else {
+                        let m = self.pressure_mods();
+                        self.dab_with(from, size, dir * spacing, m);
+                    }
+                }
+                self.last_dab = from;
+            }
         }
-        self.last_dab = from;
+    }
+
+    /// Spray: a few scattered dabs of varied size, strength and turn.
+    fn spray_at(&mut self, p: Vec2, size: Vec2, motion: Vec2) {
+        let st = self.brush.stroke;
+        let base = self.pressure_mods();
+        let n = 1 + (st.scatter * 2.0).round() as usize;
+        for _ in 0..n {
+            let a = self.rng.f() * std::f32::consts::TAU;
+            let rr = self.rng.f().sqrt() * st.scatter * self.brush.radius_px;
+            let q = p + Vec2::new(a.cos(), a.sin()) * rr;
+            let m = DabMods {
+                size: base.size * (1.0 - st.jitter * 0.7 * self.rng.f()),
+                strength: base.strength * (1.0 - st.jitter * 0.8 * self.rng.f()),
+                turn: st.jitter * std::f32::consts::TAU * self.rng.f(),
+                ..base
+            };
+            self.dab_with(q, size, motion, m);
+        }
+    }
+
+    /// Drag Rect: the stamp sits where the press was; dragging sets its size
+    /// and turn, redrawn from the original surface each time.
+    fn drag_rect(&mut self, p: Vec2, size: Vec2) {
+        let Some((p0, _)) = self.rect else { return };
+        let d = p - p0;
+        let r = d.length();
+        if r < 2.0 {
+            return;
+        }
+        self.sculptor.stroke_reset();
+        self.sculptor.refresh_bvh();
+        // the image's top points away from the drag, as in ZBrush
+        let turn = d.y.atan2(d.x) + std::f32::consts::FRAC_PI_2;
+        let m = DabMods { radius_px: Some(r), turn, ..self.pressure_mods() };
+        self.dab_with(p0, size, Vec2::ZERO, DabMods { size: 1.0, ..m });
+        self.sculptor.refresh_bvh();
     }
 
     /// Curve Snakehook: pulls the surface at the curve's start along the
@@ -1465,5 +1667,178 @@ mod bench {
                 gpu_verts as f64 / 60.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod brush_tests {
+    use super::*;
+    use crate::brush::{ChiselShape, FalloffCurve};
+
+    const SIZE: Vec2 = Vec2::new(800.0, 600.0);
+
+    fn setup(tool: Tool) -> Editor {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(5));
+        e.view_from(ViewDir::Front);
+        e.brush.tool = tool;
+        e.brush.symmetry.mirror = [false; 3];
+        e
+    }
+
+    fn moved(e: &Editor, before: &[Vec3]) -> Vec<f32> {
+        e.sculptor.mesh.positions.iter().zip(before).map(|(a, b)| a.distance(*b)).collect()
+    }
+
+    fn press_drag(e: &mut Editor, from: Vec2, to: Vec2, steps: usize) {
+        e.pointer_down(Button::Left, from, SIZE, Mods::default());
+        for i in 1..=steps {
+            e.pointer_move(from.lerp(to, i as f32 / steps as f32), SIZE);
+        }
+        e.pointer_up();
+        e.sculptor.refresh_bvh();
+    }
+
+    fn dab(e: &mut Editor) -> Vec<f32> {
+        let before = e.sculptor.mesh.positions.clone();
+        press_drag(e, SIZE * 0.5, SIZE * 0.5, 0);
+        moved(e, &before)
+    }
+
+    #[test]
+    fn falloff_curve_shapes_the_dab() {
+        let mut e = setup(Tool::Draw);
+        let soft = dab(&mut e);
+        let mut e = setup(Tool::Draw);
+        e.falloff = FalloffCurve::preset(4); // Flat: full strength most of the way out
+        let flat = dab(&mut e);
+        let count = |v: &[f32], t: f32| v.iter().filter(|d| **d > t).count();
+        let peak = soft.iter().copied().fold(0.0, f32::max);
+        assert!(count(&flat, peak * 0.5) > count(&soft, peak * 0.5) * 2, "{} vs {}", count(&flat, peak * 0.5), count(&soft, peak * 0.5));
+    }
+
+    #[test]
+    fn alpha_masks_part_of_the_tip() {
+        let mut e = setup(Tool::Draw);
+        // left half black, right half white
+        e.alpha = Some(Arc::new(Alpha::from_luma("half", 8, 1, &[0, 0, 0, 0, 255, 255, 255, 255]).unwrap()));
+        let before = e.sculptor.mesh.positions.clone();
+        let d = dab(&mut e);
+        let side = |right: bool| {
+            before.iter().zip(&d).filter(|(p, _)| p.z > 0.5 && (p.x > 0.0) == right && p.x.abs() > 0.1).map(|(_, d)| *d).fold(0.0, f32::max)
+        };
+        assert!(side(true) > 0.005 && side(false) < side(true) * 0.1, "right {} left {}", side(true), side(false));
+    }
+
+    #[test]
+    fn backface_masking_spares_the_far_side() {
+        for (back, far_moves) in [(true, false), (false, true)] {
+            let mut e = setup(Tool::Inflate);
+            e.brush.stroke.backface = back;
+            e.brush.radius_px = 2000.0; // reaches right through the ball
+            let before = e.sculptor.mesh.positions.clone();
+            let d = dab(&mut e);
+            let far = before.iter().zip(&d).filter(|(p, _)| p.z < -0.5).map(|(_, d)| *d).fold(0.0, f32::max);
+            assert_eq!(far > 1e-4, far_moves, "backface {back}: far side moved {far}");
+        }
+    }
+
+    #[test]
+    fn drag_rect_stamps_once_at_the_final_size() {
+        let mut e = setup(Tool::Draw);
+        e.brush.stroke.kind = StrokeKind::DragRect;
+        let before = e.sculptor.mesh.positions.clone();
+        let undo0 = e.sculptor.history().0.len();
+        // drag out far, then back to a small size: only the small stamp stays
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        for i in 1..=10 {
+            e.pointer_move(SIZE * 0.5 + Vec2::X * (i as f32 * 15.0), SIZE);
+        }
+        e.pointer_move(SIZE * 0.5 + Vec2::X * 30.0, SIZE);
+        e.pointer_up();
+        let d = moved(&e, &before);
+        let reach = before.iter().zip(&d).filter(|(_, d)| **d > 1e-5).map(|(p, _)| (p.x * p.x + p.y * p.y).sqrt()).fold(0.0, f32::max);
+        let wpp = e.camera.world_per_point(Vec3::Z, SIZE.y);
+        assert!(reach < 30.0 * wpp * 1.3, "stamp reaches {reach}, expected about {}", 30.0 * wpp);
+        assert!(d.iter().any(|d| *d > 1e-3));
+        assert_eq!(e.sculptor.history().0.len(), undo0 + 1);
+        e.undo();
+        assert_eq!(e.sculptor.mesh.positions, before);
+    }
+
+    #[test]
+    fn chisel_presses_a_shape() {
+        let mut e = setup(Tool::Chisel);
+        e.brush.stroke.chisel = ChiselShape::Ring;
+        let before = e.sculptor.mesh.positions.clone();
+        press_drag(&mut e, SIZE * 0.5, SIZE * 0.5 + Vec2::new(0.0, 80.0), 8);
+        let d = moved(&e, &before);
+        let wpp = e.camera.world_per_point(Vec3::Z, SIZE.y);
+        let r = 80.0 * wpp;
+        // a ring: the rim rises, the middle stays
+        let at = |lo: f32, hi: f32| {
+            before.iter().zip(&d).filter(|(p, _)| p.z > 0.5 && { let q = (p.x * p.x + p.y * p.y).sqrt() / r; q >= lo && q < hi }).map(|(_, d)| *d).fold(0.0, f32::max)
+        };
+        assert!(at(0.55, 0.75) > 0.05 * r && at(0.0, 0.3) < at(0.55, 0.75) * 0.1, "rim {} middle {}", at(0.55, 0.75), at(0.0, 0.3));
+        e.undo();
+        assert_eq!(e.sculptor.mesh.positions, before);
+    }
+
+    #[test]
+    fn lazy_mouse_holds_back_short_moves() {
+        let run = |lazy: bool| {
+            let mut e = setup(Tool::Draw);
+            e.brush.stroke.lazy = lazy;
+            e.brush.stroke.lazy_radius = 100.0;
+            let before = e.sculptor.mesh.positions.clone();
+            press_drag(&mut e, SIZE * 0.5, SIZE * 0.5 + Vec2::X * 80.0, 16);
+            let d = moved(&e, &before);
+            before.iter().zip(&d).filter(|(_, d)| **d > 1e-4).map(|(p, _)| p.x).fold(f32::MIN, f32::max)
+        };
+        let (plain, lazy) = (run(false), run(true));
+        assert!(lazy < plain - 0.1, "lazy reaches x={lazy}, plain x={plain}");
+    }
+
+    #[test]
+    fn pressure_shrinks_the_brush() {
+        let mut e = setup(Tool::Draw);
+        let full = dab(&mut e).iter().filter(|d| **d > 1e-5).count();
+        let mut e = setup(Tool::Draw);
+        e.pressure = 0.2;
+        let light = dab(&mut e).iter().filter(|d| **d > 1e-5).count();
+        assert!(light * 4 < full, "{light} vs {full}");
+    }
+
+    #[test]
+    fn spray_and_dots_sculpt() {
+        for kind in [StrokeKind::Spray, StrokeKind::Dots] {
+            let mut e = setup(Tool::Clay);
+            e.brush.stroke.kind = kind;
+            let before = e.sculptor.mesh.positions.clone();
+            press_drag(&mut e, SIZE * 0.5 - Vec2::X * 60.0, SIZE * 0.5 + Vec2::X * 60.0, 6);
+            assert!(moved(&e, &before).iter().any(|d| *d > 1e-3), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn curve_tube_and_strap_add_closed_geometry() {
+        for tool in [Tool::CurveTube, Tool::CurveStrap] {
+            let mut e = setup(tool);
+            e.brush.radius_px = 20.0;
+            let n0 = e.sculptor.mesh.positions.len();
+            let t0 = e.sculptor.tri_count();
+            press_drag(&mut e, SIZE * 0.5 - Vec2::new(80.0, 40.0), SIZE * 0.5 + Vec2::new(80.0, 40.0), 30);
+            assert!(e.sculptor.tri_count() > t0 + 50, "{tool:?}");
+            assert!(e.sculptor.mesh.positions.len() > n0);
+            assert!(!e.sculptor.mesh.boundary.iter().any(|b| *b));
+            assert_eq!(e.subtool_count(), 1);
+            e.undo();
+            assert_eq!(e.sculptor.tri_count(), t0);
+        }
+        // with several levels the tube becomes its own SubTool
+        let mut e = setup(Tool::CurveTube);
+        e.sculptor.subdivide().unwrap();
+        press_drag(&mut e, SIZE * 0.5 - Vec2::X * 80.0, SIZE * 0.5 + Vec2::X * 80.0, 20);
+        assert_eq!(e.subtool_count(), 2);
     }
 }

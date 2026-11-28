@@ -54,7 +54,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 - **Arrays** (Array folder): repeat the active SubTool along a **line** (offset, turn and scale per copy), around a
   **circle** (radius, sweep, axis) or in a **grid** (counts and gap), up to 64 copies. Copies are drawn live while
   you sculpt the original, take part in Live Boolean and export, and **Convert to mesh** makes them real geometry.
-- **38 brushes**, grouped in the Tool list, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
+- **41 brushes**, grouped in the Tool list, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
   - **Draw, Clay, Clay Buildup:** add material. Clay Buildup lays down fast, square-edged strips.
   - **Smooth, Flatten, Trim Dynamic, Scrape:** level the surface. Trim cuts peaks to crisp planes, and Scrape shaves
     high spots (Ctrl fills low ones).
@@ -72,9 +72,31 @@ Like SculptGL, the functions are grouped into dropdown areas:
     the connected surface, with a long rubbery falloff, or straight through the whole model.
   - **Anchors:** drag to **move, rotate, scale, inflate, twist or bend** the region under the brush.
   - **Curve Snakehook:** draw a path, release, and a horn is pulled along it, tapering to the tip.
+  - **Curve Tube, Curve Strap:** draw a curve over the model and release to add a round tube or a flat strap along
+    it (brush size sets the thickness; intensity how far a tube sits out of the surface; Ctrl tapers a tube). The new
+    geometry joins the sculpt as one undo step, or becomes its own SubTool if the sculpt has several levels.
+  - **Chisel:** press and drag out a 3D shape (rivet, button, ring, star, cross, gem, screw head, ridge) onto the
+    surface; Ctrl presses it in. The shapes are height fields, so they can't undercut like ZBrush's vector chisels.
   - **Cloth Pull, Cloth Twist, Cloth Inflate:** move the surface like fabric (edge lengths are kept, so it folds
     instead of stretching).
   - **Polygroup Paint:** paints a new polygroup.
+- **Stroke & alpha folder:**
+  - **Stroke types:** **Freehand** (evenly spaced dabs, with a Spacing slider), **Dots** (a dab per pointer event),
+    **Drag Rect** (press where the stamp goes, drag out its size and turn, release to keep it) and **Spray** (scattered
+    dabs varying in size, strength and turn).
+  - **Lazy mouse:** the brush trails the pointer on a string (a line shows it), for clean, smooth lines.
+  - **Pen pressure:** with a drawing tablet or pen, pressure can change the size and/or the strength.
+  - **Backface masking** (on by default): brushes leave alone surfaces facing away, so thin parts like ears and
+    fingers don't get sculpted through.
+  - **Falloff curve editor:** drag the points (left is the brush centre, right its edge), click the line to add a
+    point and double-click to remove one, or pick a shape (Smooth, Linear, Sharp, Dome, Flat, Hard, Ring). It
+    applies to every brush, including Move and the cloth brushes.
+  - **Alphas:** ten built-in grayscale stamps (pores, scales, weave, rings, square, noise, cracks, bumps, stitches,
+    hexagons) or **Load image…** for your own PNG/JPEG. White raises (or carves, with Negative), black leaves the
+    surface alone. **Turn** rotates the alpha; **Turn with the stroke** makes it follow the stroke direction.
+- **Brush presets:** save the current brush (tool, size, strength, stroke, falloff and alpha) under a name, load it
+  with a click, and **export** it as a `.claybrush` file to share or **import** one. Six starter presets show the
+  features (skin pores, reptile scales, fabric weave, clean lines, rivets, a stitched seam).
 - **ZModeler** (polygon modelling, like ZBrush's ZModeler): hover a polygon to see the target highlighted, then
   click or drag. Actions: **Extrude**, **Inset**, **Bevel** (drag to set the amount, one undo step), **Insert edge
   loop**, **Delete**, **Bridge** (click two polygons or holes, with the same number of edges, to join them with a
@@ -200,7 +222,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -214,7 +236,7 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Multithreaded brushes (needs WebAssembly threads in the window), automatic (ZRemesher-style) retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
+Multithreaded brushes (needs WebAssembly threads in the window), automatic (ZRemesher-style) retopology, layers, vertex painting, and a lasso mask.
 
 ## Automated testing hook
 

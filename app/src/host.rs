@@ -144,6 +144,11 @@ pub async fn open_project() -> Result<Option<OpenedProject>, String> {
     open_with("open_project", ".clayform").await
 }
 
+/// Asks for a brush preset (.claybrush).
+pub async fn open_brush() -> Result<Option<OpenedProject>, String> {
+    open_with("open_brush", ".claybrush,application/json").await
+}
+
 /// Asks for a PNG or JPEG image.
 pub async fn open_image() -> Result<Option<OpenedProject>, String> {
     open_with("open_image", "image/png,image/jpeg").await

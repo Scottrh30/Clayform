@@ -226,3 +226,41 @@ button.mini.on { color: #fff; border-color: var(--accent-2); }
 .mode-overlay .ov-x { stroke: #ff5d5d; fill: #ff5d5d; stroke-width: 2.4; }
 .mode-overlay .ov-y { stroke: #74d66b; fill: #74d66b; stroke-width: 2.4; }
 .mode-overlay .ov-z { stroke: #5d9bff; fill: #5d9bff; stroke-width: 2.4; }
+
+/* ---------------------------------------------------------------- brush tip */
+.segmented.wrap { flex-wrap: wrap; gap: 3px; }
+.segmented.wrap button, .segmented.wrap button:first-child, .segmented.wrap button:last-child {
+  border-radius: 4px; border-left: 1px solid var(--line); padding: 3px 7px;
+}
+.segmented.wrap button.on { border-color: var(--accent-2); }
+.curve-editor {
+  display: block; width: 100%; height: auto; margin: 2px 0 4px; touch-action: none; cursor: crosshair;
+}
+.curve-bg { fill: #17181c; stroke: var(--line); }
+.curve-grid { stroke: #2d2e35; stroke-dasharray: 3 3; }
+.curve-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.curve-pt { fill: #fff; stroke: var(--accent-2); stroke-width: 1.5; cursor: grab; }
+.alpha-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 4px; margin: 4px 0; }
+.alpha-tile {
+  aspect-ratio: 1; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: #111;
+  overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--dim); font-size: 11px;
+}
+.alpha-tile img { width: 100%; height: 100%; display: block; image-rendering: auto; }
+.alpha-tile:hover { border-color: var(--accent-2); }
+.alpha-tile.on { border: 2px solid var(--accent); }
+.preset-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; max-height: 220px; overflow-y: auto; }
+.preset-row { display: flex; align-items: center; gap: 3px; }
+.preset-name {
+  flex: 1; display: flex; justify-content: space-between; align-items: baseline; gap: 6px; text-align: left;
+  padding: 4px 7px; background: var(--panel-2); border: 1px solid transparent; border-radius: 4px; min-width: 0;
+}
+.preset-name:hover { border-color: var(--accent-2); color: #fff; }
+.preset-tool { color: var(--dim); font-size: 11px; white-space: nowrap; }
+.preset-row button.icon {
+  width: 24px; height: 24px; padding: 0; background: none; border: 1px solid transparent; border-radius: 4px; color: var(--dim);
+}
+.preset-row button.icon:hover { border-color: var(--line); color: #fff; }
+.folder-body input[type="text"] {
+  width: 100%; padding: 4px 7px; background: #17181c; border: 1px solid var(--line); border-radius: 4px;
+}
+.ov-lazy { stroke: #fff; }

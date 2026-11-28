@@ -1,5 +1,6 @@
 //! Sculpting engine: brushes, strokes, symmetry helpers and undo/redo.
 
+use crate::brush::{lut_at, Alpha, ChiselShape, LUT_SIZE};
 use crate::bvh::{Bvh, Hit};
 use crate::dyntopo::remesh_region;
 use crate::mesh::{Marker, Mesh};
@@ -45,6 +46,9 @@ pub enum Tool {
     ClothTwist,
     ClothInflate,
     GroupPaint,
+    Chisel,
+    CurveTube,
+    CurveStrap,
 }
 
 /// What the Anchors brush does while dragging.
@@ -74,10 +78,10 @@ impl AnchorMode {
 }
 
 /// Groups for the brush menu.
-pub const TOOL_CATEGORIES: [&str; 6] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves"];
+pub const TOOL_CATEGORIES: [&str; 7] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves", "Stamps"];
 
 impl Tool {
-    pub const ALL: [Tool; 38] = [
+    pub const ALL: [Tool; 41] = [
         Tool::Draw,
         Tool::Clay,
         Tool::ClayBuildup,
@@ -116,6 +120,9 @@ impl Tool {
         Tool::ClothTwist,
         Tool::ClothInflate,
         Tool::GroupPaint,
+        Tool::Chisel,
+        Tool::CurveTube,
+        Tool::CurveStrap,
     ];
 
     /// Index into `TOOL_CATEGORIES`.
@@ -126,7 +133,8 @@ impl Tool {
             Grab | Move | MoveElastic | MoveInfiniteDepth | Snakehook | Nudge | Anchors => 2,
             ClothPull | ClothTwist | ClothInflate => 3,
             Mask | GroupPaint => 4,
-            CurveSnakehook => 5,
+            CurveSnakehook | CurveTube | CurveStrap => 5,
+            Chisel => 6,
             _ => 0,
         }
     }
@@ -183,6 +191,9 @@ impl Tool {
             Tool::ClothTwist => "Cloth Twist",
             Tool::ClothInflate => "Cloth Inflate",
             Tool::GroupPaint => "Polygroup Paint",
+            Tool::Chisel => "Chisel",
+            Tool::CurveTube => "Curve Tube",
+            Tool::CurveStrap => "Curve Strap",
         }
     }
 
@@ -258,6 +269,9 @@ impl Tool {
             Tool::ClothTwist => "Twists the surface like fabric, gathering it into folds",
             Tool::ClothInflate => "Puffs the surface out like cloth, wrinkling at the edges",
             Tool::GroupPaint => "Paints a new polygroup onto the faces under the brush",
+            Tool::Chisel => "Drag out a 3D shape (rivet, button, star…) pressed onto the surface; Ctrl presses it in",
+            Tool::CurveTube => "Draw a curve over the model, release to add a round tube along it",
+            Tool::CurveStrap => "Draw a curve over the model, release to add a flat strap lying on the surface",
         }
     }
 
@@ -273,6 +287,7 @@ impl Tool {
             Tool::DamStandard => 0.45,
             Tool::Move | Tool::MoveElastic | Tool::MoveInfiniteDepth | Tool::Anchors | Tool::ClothPull | Tool::ClothTwist => 1.0,
             Tool::CurveSnakehook | Tool::GroupPaint => 1.0,
+            Tool::CurveTube | Tool::CurveStrap => 0.5,
             Tool::Polish | Tool::HPolish | Tool::MPolish | Tool::SmoothValleys | Tool::SmoothPeaks | Tool::SmoothStronger => 0.6,
             Tool::Planar | Tool::TrimFront => 0.5,
             _ => 0.4,
@@ -286,7 +301,7 @@ impl Tool {
             && !matches!(
                 self,
                 Smooth | Flatten | Snakehook | Nudge | TrimDynamic | Planar | TrimFront | Polish | HPolish | MPolish
-                    | SmoothValleys | SmoothPeaks | SmoothStronger | CurveSnakehook | GroupPaint
+                    | SmoothValleys | SmoothPeaks | SmoothStronger | CurveSnakehook | GroupPaint | CurveTube | CurveStrap
             )
     }
 
@@ -296,6 +311,11 @@ impl Tool {
     }
 
     /// Brushes that move geometry along the stroke instead of the normal.
+    /// Brushes that draw a curve first and act when it's released.
+    pub fn is_curve(self) -> bool {
+        matches!(self, Tool::CurveSnakehook | Tool::CurveTube | Tool::CurveStrap)
+    }
+
     pub fn uses_motion(self) -> bool {
         matches!(self, Tool::Snakehook | Tool::Nudge | Tool::ClayTubes | Tool::Rake | Tool::CurveSnakehook)
     }
@@ -563,8 +583,54 @@ impl Stroke {
 const UNDO_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 pub const MAX_TRIANGLES: usize = 6_000_000;
 
+/// How the brush tip weighs the points it reaches, beyond the distance
+/// falloff: a falloff curve, an alpha image, and backface masking.
+#[derive(Clone, Default)]
+pub struct Tip {
+    /// Falloff table; None = the standard smooth falloff.
+    pub curve: Option<Box<[f32; LUT_SIZE]>>,
+    pub alpha: Option<std::sync::Arc<Alpha>>,
+    /// The tip's image axes in the surface plane (unit length), set per dab.
+    pub frame: (Vec3, Vec3),
+    /// Brush normal for backface masking: points facing away are left alone.
+    pub backface: Option<Vec3>,
+    pub chisel: Option<ChiselShape>,
+}
+
+impl Tip {
+    #[inline]
+    fn fall(&self, x: f32) -> f32 {
+        match &self.curve {
+            Some(l) => lut_at(l, x),
+            None => falloff(x),
+        }
+    }
+
+    /// Alpha and backface factor for a point at `q` with normal `n`.
+    #[inline]
+    fn shape(&self, q: Vec3, n: Vec3, center: Vec3, inv_r: f32) -> f32 {
+        let mut w = 1.0;
+        if let Some(b) = self.backface {
+            let d = n.dot(b);
+            if d < -0.1 {
+                return 0.0;
+            }
+            if d < 0.2 {
+                w *= (d + 0.1) / 0.3;
+            }
+        }
+        if let Some(a) = &self.alpha {
+            let t = (q - center) * inv_r;
+            w *= a.sample(t.dot(self.frame.0), t.dot(self.frame.1));
+        }
+        w
+    }
+}
+
 pub struct Sculptor {
     pub mesh: Mesh,
+    /// Brush tip shaping (set by the editor before each stroke / dab).
+    pub tip: Tip,
     bvh: Bvh,
     bvh_dirty: bool,
     /// Faces moved since the last refit (empty with `bvh_dirty` = refit all).
@@ -625,6 +691,7 @@ impl Sculptor {
             stroke: None,
             region: Vec::new(),
             stack: Vec::new(),
+            tip: Tip::default(),
             scratch: Vec::new(),
             levels: vec![Level { mesh: None, odd: Vec::new(), details: Vec::new() }],
             level: 0,
@@ -1080,6 +1147,21 @@ impl Sculptor {
         });
     }
 
+    /// Puts every point the current stroke has moved back where it was
+    /// (Drag Rect redraws its stamp this way while you drag).
+    pub fn stroke_reset(&mut self) {
+        let Some(st) = self.stroke.as_ref() else { return };
+        if st.snapshot.is_some() || st.touched.is_empty() {
+            return;
+        }
+        let verts = st.touched.clone();
+        for (k, &v) in st.touched.iter().enumerate() {
+            self.mesh.positions[v as usize] = st.old_pos[k];
+            self.mesh.mask[v as usize] = st.old_mask[k];
+        }
+        self.after_deform(false, Some(&verts));
+    }
+
     pub fn end_stroke(&mut self) {
         if let Some(st) = self.stroke.take() {
             // the stroke's own name, keeping any label meant for the next change
@@ -1188,7 +1270,7 @@ impl Sculptor {
     /// Flood-fills outward from the hit triangle, collecting vertices inside
     /// the brush sphere together with their falloff weight.
     fn collect_region(&mut self, center: Vec3, radius: f32, seed_tri: u32, use_mask: bool) {
-        let Sculptor { mesh, vmark, region, stack, .. } = self;
+        let Sculptor { mesh, vmark, region, stack, tip, .. } = self;
         region.clear();
         stack.clear();
         if seed_tri as usize >= mesh.tris.len() || !mesh.is_alive(seed_tri) || radius <= 0.0 {
@@ -1207,9 +1289,12 @@ impl Sculptor {
             let d2 = mesh.positions[v as usize].distance_squared(center);
             let inside = d2 < r2;
             if inside {
-                let mut w = falloff(d2.sqrt() * inv_r);
+                // a chisel keeps its own profile: no distance falloff
+                let mut w = if tip.chisel.is_some() { 1.0 } else { tip.fall(d2.sqrt() * inv_r) };
                 if use_mask {
                     w *= 1.0 - mesh.mask[v as usize];
+                    // (masking and painting tools ignore the tip's alpha & backface)
+                    w *= tip.shape(mesh.positions[v as usize], mesh.normals[v as usize], center, inv_r);
                 }
                 region.push((v, w));
             }
@@ -1247,7 +1332,7 @@ impl Sculptor {
     }
 
     pub fn dab(&mut self, p: &DabParams) {
-        if p.tool.is_drag() {
+        if p.tool.is_drag() || matches!(p.tool, Tool::CurveTube | Tool::CurveStrap) {
             return;
         }
         let mut seed = p.seed_tri;
@@ -1591,6 +1676,21 @@ impl Sculptor {
                     mesh.positions[v as usize] = x[k];
                 }
             }
+            Tool::Chisel => {
+                // raise (or press in) the shape's height field over the disc
+                let shape = self.tip.chisel.unwrap_or(ChiselShape::Rivet);
+                let (fu, fv) = self.tip.frame;
+                let depth = s * r * (0.25 + 1.75 * i);
+                let inv_r = 1.0 / r;
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let t = (pv - p.center) * inv_r;
+                    let h = shape.height(t.dot(fu), t.dot(fv));
+                    if h > 0.0 {
+                        mesh.positions[v as usize] = pv + an * (h * depth * w);
+                    }
+                }
+            }
             Tool::Grab
             | Tool::Move
             | Tool::MoveElastic
@@ -1598,6 +1698,8 @@ impl Sculptor {
             | Tool::Anchors
             | Tool::ClothPull
             | Tool::ClothTwist
+            | Tool::CurveTube
+            | Tool::CurveStrap
             | Tool::GroupPaint => unreachable!(),
         }
         self.after_deform(true, None);
@@ -1682,7 +1784,7 @@ impl Sculptor {
                                 if x >= 1.0 {
                                     return None;
                                 }
-                                falloff(x)
+                                self.tip.fall(x)
                             }
                         };
                         Some((v, w * (1.0 - self.mesh.mask[v as usize])))
@@ -1694,7 +1796,7 @@ impl Sculptor {
             // the brush moves its own radius; the rest follows as cloth
             for (k, &(v, _)) in verts.clone().iter().enumerate() {
                 let d = self.mesh.positions[v as usize].distance(center);
-                verts[k].1 = falloff(d / radius) * (1.0 - self.mesh.mask[v as usize]);
+                verts[k].1 = self.tip.fall(d / radius) * (1.0 - self.mesh.mask[v as usize]);
             }
         }
         let ids: Vec<u32> = verts.iter().map(|r| r.0).collect();

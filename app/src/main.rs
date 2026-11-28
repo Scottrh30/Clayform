@@ -2,6 +2,7 @@
 //! engine runs right here in the page so strokes never wait on the host;
 //! the Tauri shell only provides native file dialogs.
 
+mod brush_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -120,6 +121,12 @@ struct Ui {
     /// Live Boolean preview resolution.
     bool_res: RwSignal<u32>,
     gizmo: RwSignal<clayform_core::editor::GizmoSettings>,
+    stroke: RwSignal<clayform_core::brush::StrokeSettings>,
+    falloff: RwSignal<clayform_core::brush::FalloffCurve>,
+    alpha: RwSignal<Option<std::sync::Arc<clayform_core::brush::Alpha>>>,
+    user_alphas: RwSignal<Vec<std::sync::Arc<clayform_core::brush::Alpha>>>,
+    /// (a pen was seen, its latest pressure)
+    pressure: RwSignal<(bool, f32)>,
 }
 
 impl Ui {
@@ -175,6 +182,11 @@ impl Ui {
             gpu: RwSignal::new(None),
             mode: RwSignal::new(Mode::Sculpt),
             anchor_mode: RwSignal::new(b.anchor_mode),
+            stroke: RwSignal::new(b.stroke),
+            falloff: RwSignal::new(Default::default()),
+            alpha: RwSignal::new(None),
+            user_alphas: RwSignal::new(Vec::new()),
+            pressure: RwSignal::new((false, 1.0)),
             zm: RwSignal::new(ZmSettings::default()),
             overlay: RwSignal::new(Overlay::default()),
             vp_size: RwSignal::new((800.0, 600.0)),
@@ -576,6 +588,7 @@ fn settings_json(ui: Ui) -> String {
             "constant_detail": brush.detail_mode == DetailMode::Constant,
             "smooth_reduces": brush.smooth_reduces,
             "anchor_mode": AnchorMode::ALL.iter().position(|m| *m == brush.anchor_mode),
+            "tip": brush_ui::tip_json(ui),
         },
         "zmodeler": {
             "action": clayform_core::poly::Action::ALL.iter().position(|a| *a == ui.zm.get_untracked().action),
@@ -674,6 +687,9 @@ fn apply_settings(ui: Ui, json: &str) {
         }
         if let Some(m) = br.get("anchor_mode").and_then(|x| x.as_u64()).and_then(|i| AnchorMode::ALL.get(i as usize)) {
             ui.anchor_mode.set(*m);
+        }
+        if let Some(t) = br.get("tip") {
+            brush_ui::apply_tip_json(ui, t);
         }
     }
     if let Some(z) = j.get("zmodeler") {
@@ -928,6 +944,19 @@ pub(crate) fn sync_scene(r: &mut Renderer, e: &mut Editor, view: &ViewSettings) 
 
 // ----------------------------------------------------------------- viewport
 
+/// Pressure of a pen (1 for a mouse or touch, which report no real pressure).
+fn pen_pressure(ui: Ui, ev: &ev::PointerEvent) -> f32 {
+    if ev.pointer_type() == "pen" {
+        let p = ev.pressure().clamp(0.0, 1.0);
+        if ui.pressure.get_untracked().0 == false || (ui.pressure.get_untracked().1 - p).abs() > 0.05 {
+            ui.pressure.set((true, p));
+        }
+        p
+    } else {
+        1.0
+    }
+}
+
 fn local_pos(ev: &web_sys::MouseEvent) -> Vec2 {
     Vec2::new(ev.offset_x() as f32, ev.offset_y() as f32)
 }
@@ -983,7 +1012,11 @@ fn Viewport(ui: Ui) -> impl IntoView {
         let busy = ui.busy.get_untracked();
         let mods = Mods { shift: ev.shift_key(), ctrl: ev.ctrl_key() || ev.meta_key(), alt: ev.alt_key() || busy };
         let size = canvas_size(&ev);
-        let d = with_ed(|e| e.pointer_down(button, local_pos(&ev), size, mods));
+        let pr = pen_pressure(ui, &ev);
+        let d = with_ed(|e| {
+            e.pressure = pr;
+            e.pointer_down(button, local_pos(&ev), size, mods)
+        });
         ui.dragging.set(d);
         if d != Drag::Orbit && d != Drag::Pan {
             ui.refresh();
@@ -994,7 +1027,9 @@ fn Viewport(ui: Ui) -> impl IntoView {
         let p = local_pos(&ev);
         let size = canvas_size(&ev);
         ui.mods.set((ev.shift_key(), ev.ctrl_key() || ev.meta_key()));
+        let pr = pen_pressure(ui, &ev);
         let mirror = with_ed(|e| {
+            e.pressure = pr;
             if e.drag() != Drag::None {
                 e.pointer_move(p, size);
             }
@@ -1508,6 +1543,8 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     on_change=move |v| ui.symmetry.update(|s| s.local = v)
                 />
             </Folder>
+            <brush_ui::BrushTipFolder ui />
+            <brush_ui::PresetsFolder ui />
             <Folder title="Masking">
                 <div class="row buttons">
                     <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>
@@ -1744,10 +1781,20 @@ fn App() -> impl IntoView {
             detail_mode: ui.detail_mode.get(),
             smooth_reduces: ui.smooth_reduces.get(),
             anchor_mode: ui.anchor_mode.get(),
+            stroke: ui.stroke.get(),
         };
         with_ed(|e| e.brush = brush);
         ui.update_overlay();
     });
+    // falloff curve and alpha -> engine
+    Effect::new(move || {
+        let (c, a) = (ui.falloff.get(), ui.alpha.get());
+        with_ed(|e| {
+            e.falloff = c;
+            e.alpha = a;
+        });
+    });
+    brush_ui::restore_user_alphas(ui);
     // mode and ZModeler settings -> engine
     Effect::new(move || {
         let mode = ui.mode.get();
