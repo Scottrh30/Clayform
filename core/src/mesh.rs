@@ -32,6 +32,20 @@ pub struct Mesh {
     pub export_scale: f32,
     /// Creased edges (smaller vertex index first): subdivision keeps them sharp.
     pub creases: Vec<[u32; 2]>,
+    /// Polypaint: RGBA per vertex (alpha = how much paint covers the
+    /// material). Empty when the mesh was never painted.
+    pub colors: Vec<[u8; 4]>,
+    /// Texture coordinates per triangle corner (empty = not unwrapped).
+    pub uvs: Vec<[glam::Vec2; 3]>,
+}
+
+/// An unpainted vertex.
+pub const NO_PAINT: [u8; 4] = [255, 255, 255, 0];
+
+/// Average of two vertex colours.
+#[inline]
+pub fn mix_color(a: [u8; 4], b: [u8; 4]) -> [u8; 4] {
+    [0, 1, 2, 3].map(|k| ((a[k] as u16 + b[k] as u16 + 1) / 2) as u8)
 }
 
 /// Generation-stamp marker: O(1) "visited" tests without clearing arrays.
@@ -110,6 +124,8 @@ impl MeshBuilder {
                 export_center: Vec3::ZERO,
                 export_scale: 1.0,
                 creases: Vec::new(),
+                colors: Vec::new(),
+                uvs: Vec::new(),
             },
             phase: 0,
             i: 0,
@@ -324,6 +340,9 @@ impl Mesh {
 
     /// Appends a vertex with no faces; returns its index.
     pub fn add_vertex(&mut self, p: Vec3, n: Vec3, mask: f32) -> u32 {
+        if !self.colors.is_empty() {
+            self.colors.push(NO_PAINT);
+        }
         self.positions.push(p);
         self.normals.push(n);
         self.mask.push(mask);
@@ -401,23 +420,33 @@ impl Mesh {
         let mut remap = vec![NONE; self.positions.len()];
         let mut positions = Vec::with_capacity(self.positions.len());
         let mut mask = Vec::with_capacity(self.positions.len());
+        let mut colors = Vec::new();
+        let painted = self.colors.len() == self.positions.len();
         for t in self.tris.iter().filter(|t| t[0] != NONE) {
             for &v in t {
                 if remap[v as usize] == NONE {
                     remap[v as usize] = positions.len() as u32;
                     positions.push(self.positions[v as usize]);
                     mask.push(self.mask[v as usize]);
+                    if painted {
+                        colors.push(self.colors[v as usize]);
+                    }
                 }
             }
         }
         let mut face_remap = vec![NONE; self.tris.len()];
         let mut tris = Vec::with_capacity(self.tris.len());
         let mut groups = Vec::with_capacity(self.tris.len());
+        let mut uvs = Vec::new();
+        let has_uv = self.uvs.len() == self.tris.len();
         for (f, t) in self.tris.iter().enumerate() {
             if t[0] != NONE {
                 face_remap[f] = tris.len() as u32;
                 tris.push([remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]]);
                 groups.push(self.groups[f]);
+                if has_uv {
+                    uvs.push(self.uvs[f]);
+                }
             }
         }
         let partner: Vec<u32> = (0..self.tris.len())
@@ -438,6 +467,8 @@ impl Mesh {
             .collect();
         *self = MeshBuilder::new(positions, tris).with_faces(Some(groups), Some(partner)).finish();
         self.creases = creases;
+        self.colors = colors;
+        self.uvs = uvs;
         self.mask = mask;
         self.export_center = c;
         self.export_scale = s;
@@ -635,6 +666,7 @@ impl Mesh {
         let mut odd: Vec<[u32; 4]> = Vec::with_capacity(self.tris.len() * 3 / 2);
         let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
         let mut new_groups: Vec<u32> = Vec::with_capacity(self.tris.len() * 4);
+        let mut new_uvs: Vec<[glam::Vec2; 3]> = Vec::new();
         for (ti, t) in self.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
             if ti % 16384 == 0 && !progress(0.6 * ti as f32 / total as f32) {
                 return Err(());
@@ -659,6 +691,10 @@ impl Mesh {
             let [ab, bc, ca] = mids;
             let g = self.groups[ti];
             new_groups.extend([g; 4]);
+            if let Some(&[ua, ub, uc]) = self.uvs.get(ti).filter(|_| self.uvs.len() == self.tris.len()) {
+                let (uab, ubc, uca) = ((ua + ub) * 0.5, (ub + uc) * 0.5, (uc + ua) * 0.5);
+                new_uvs.extend([[ua, uab, uca], [uab, ub, ubc], [uca, ubc, uc], [uab, ubc, uca]]);
+            }
             new_tris.push([a, ab, ca]);
             new_tris.push([ab, b, bc]);
             new_tris.push([ca, bc, c]);
@@ -673,6 +709,13 @@ impl Mesh {
         };
         let mut mask = self.mask.clone();
         mask.extend(odd.iter().map(|s| (self.mask[s[0] as usize] + self.mask[s[1] as usize]) * 0.5));
+        let colors = if self.colors.len() == self.positions.len() {
+            let mut c = self.colors.clone();
+            c.extend(odd.iter().map(|s| mix_color(self.colors[s[0] as usize], self.colors[s[1] as usize])));
+            c
+        } else {
+            Vec::new()
+        };
         if !progress(0.7) {
             return Err(());
         }
@@ -685,6 +728,10 @@ impl Mesh {
             }
         }
         out.mask = mask;
+        out.colors = colors;
+        if new_uvs.len() == out.tris.len() {
+            out.uvs = new_uvs;
+        }
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;
         progress(1.0);

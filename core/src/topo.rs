@@ -343,6 +343,8 @@ pub fn decimate(m: &Mesh, target: usize, keep_groups: bool, progress: &mut dyn F
     let mut remap = vec![NONE; nv];
     let mut out_pos = Vec::new();
     let mut out_mask = Vec::new();
+    let mut out_col = Vec::new();
+    let painted = m.colors.len() == m.positions.len();
     let mut out_tris = Vec::new();
     let mut groups = Vec::new();
     for (f, t) in tris.iter().enumerate() {
@@ -356,6 +358,9 @@ pub fn decimate(m: &Mesh, target: usize, keep_groups: bool, progress: &mut dyn F
                 remap[v] = out_pos.len() as u32;
                 out_pos.push(pos[v].as_vec3());
                 out_mask.push(mask[v]);
+                if painted {
+                    out_col.push(m.colors[v]);
+                }
             }
             nt[k] = remap[v];
         }
@@ -364,6 +369,7 @@ pub fn decimate(m: &Mesh, target: usize, keep_groups: bool, progress: &mut dyn F
     }
     let mut out = MeshBuilder::new(out_pos, out_tris).with_faces(Some(groups), None).finish();
     out.mask = out_mask;
+    out.colors = out_col;
     out.export_center = m.export_center;
     out.export_scale = m.export_scale;
     progress(1.0);
@@ -560,6 +566,29 @@ pub fn mirror_weld(m: &Mesh) -> Result<Mesh, String> {
 
 // ------------------------------------------------------------------ creases
 
+/// Gives a mesh made by subdividing `coarse` (in its face order: four
+/// children per live triangle) the creases and UVs it would have had.
+pub(crate) fn carry_up_extras(coarse: &Mesh, fine: &mut Mesh, odd: &[[u32; 4]]) {
+    let n = coarse.positions.len() as u32;
+    if fine.creases.is_empty() && !coarse.creases.is_empty() {
+        let map: HashMap<(u32, u32), u32> = odd.iter().enumerate().map(|(i, s)| ((s[0].min(s[1]), s[0].max(s[1])), n + i as u32)).collect();
+        for &[a, b] in &coarse.creases {
+            if let Some(&m) = map.get(&(a, b)) {
+                fine.creases.push([a.min(m), a.max(m)]);
+                fine.creases.push([b.min(m), b.max(m)]);
+            }
+        }
+    }
+    let live: Vec<usize> = (0..coarse.tris.len()).filter(|&f| coarse.tris[f][0] != NONE).collect();
+    if fine.uvs.is_empty() && coarse.uvs.len() == coarse.tris.len() && fine.tris.len() == live.len() * 4 {
+        for f in live {
+            let [ua, ub, uc] = coarse.uvs[f];
+            let (uab, ubc, uca) = ((ua + ub) * 0.5, (ub + uc) * 0.5, (uc + ua) * 0.5);
+            fine.uvs.extend([[ua, uab, uca], [uab, ub, ubc], [uca, ubc, uc], [uab, ubc, uca]]);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CreaseMode {
     /// Edges between polygroups.
@@ -592,7 +621,7 @@ pub fn crease_edges(m: &Mesh, mode: CreaseMode) -> Vec<[u32; 2]> {
                     // quad diagonals are never creased
                     let (f0, f1) = (fs[0], fs[1]);
                     m.partner[f0 as usize] != f1
-                        && m.face_normals[f0 as usize].dot(m.face_normals[f1 as usize]) < deg.to_radians().cos()
+                        && m.face_normals[f0 as usize].normalize_or_zero().dot(m.face_normals[f1 as usize].normalize_or_zero()) < deg.to_radians().cos()
                 }
             }
             CreaseMode::Borders => fs.len() == 1,

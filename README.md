@@ -124,6 +124,20 @@ Like SculptGL, the functions are grouped into dropdown areas:
 - **Retopology helpers:** Shift+click an open edge to continue a strip of quads the same size; the **topology
   brush** (tick "Drag draws topology strokes") turns crossing strokes into points and the cells between them into
   faces.
+- **Polypaint** (Paint folder): the **Paint** brush paints colour with its radius, intensity, falloff and alpha
+  (Ctrl erases; masked areas are protected). Pick a colour from the swatches or the colour box, or **Pick** it off
+  the model; **Fill** paints everything unmasked; **Clear paint**. Paint is kept per level (painting a lower level
+  carries up), survives remeshes and other topology changes, is saved in projects, and exports as vertex colours
+  in OBJ, PLY and glTF.
+- **Spotlight:** place a reference image over the model (Reference images folder), pick it in the Paint folder and
+  tick "Paint brush takes colours from the image": the brush paints each point with the image colour over it.
+- **Texture folder:**
+  - **UV unwrap:** automatic charts of faces facing roughly one way (or split at polygroups, so you choose the
+    seams), each flattened with least-squares conformal maps, scaled to their true size and packed into the
+    square; a preview of the layout shows in the panel. Higher levels inherit the UVs of the level you unwrap.
+  - **Bake maps:** bakes the highest level onto the unwrapped level: a tangent-space normal map, a 16-bit
+    displacement map and (if painted) a colour map, at 512–4096 pixels, saved as a ZIP with the low mesh as OBJ
+    + MTL.
 - **Brush presets:** save the current brush (tool, size, strength, stroke, falloff and alpha) under a name, load it
   with a click, and **export** it as a `.claybrush` file to share or **import** one. Six starter presets show the
   features (skin pores, reptile scales, fabric weave, clean lines, rivets, a stitched seam).
@@ -252,7 +266,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: polypaint (levels, remesh, projects, Spotlight), UV unwrapping, baking, QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -266,7 +280,7 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Multithreaded brushes (needs WebAssembly threads in the window), feature-following (ZRemesher-style) edge flow, vertex painting, and a lasso mask.
+Multithreaded brushes (needs WebAssembly threads in the window), feature-following (ZRemesher-style) edge flow and a lasso mask.
 
 ## Automated testing hook
 

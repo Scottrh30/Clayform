@@ -11,8 +11,16 @@ fn live_tris(mesh: &Mesh) -> impl Iterator<Item = (usize, &[u32; 3])> {
     mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE)
 }
 
-/// Each vertex's colour: the polygroup colour of its first face.
+/// Each vertex's colour: its polypaint if painted, else the polygroup
+/// colour of its first face.
 fn vertex_colors(mesh: &Mesh) -> Vec<[u8; 3]> {
+    if mesh.colors.len() == mesh.positions.len() {
+        return mesh
+            .colors
+            .iter()
+            .map(|c| crate::paint::shown_color(*c, glam::Vec3::splat(0.8)).to_array().map(|x| (x * 255.0).round().clamp(0.0, 255.0) as u8))
+            .collect();
+    }
     let mut out = vec![[200u8, 200, 200]; mesh.positions.len()];
     let mut set = vec![false; mesh.positions.len()];
     for (f, t) in live_tris(mesh) {

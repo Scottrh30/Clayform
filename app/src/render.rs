@@ -21,6 +21,8 @@ struct GpuVertex {
     mask: f32,
     /// Local concavity (+ in creases, - on ridges) for cavity shading.
     cavity: f32,
+    /// Polypaint (alpha = coverage).
+    col: [u8; 4],
 }
 
 /// How far a vertex sits below (+) or above (-) the average of its
@@ -95,6 +97,8 @@ pub struct ObjectView<'a> {
     pub dim: bool,
     /// Copy transforms (array); empty = just the object.
     pub instances: &'a [Mat4],
+    /// Show its polypaint.
+    pub paint: bool,
 }
 
 /// Polygroup colour in linear RGB.
@@ -199,6 +203,8 @@ pub struct ViewSettings {
     pub cavity_strength: f32,
     /// Colour faces by polygroup.
     pub polygroups: bool,
+    /// Show polypaint.
+    pub paint: bool,
     pub lighting: Lighting,
 }
 
@@ -295,8 +301,8 @@ fn group_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    const ATTRS: [wgpu::VertexAttribute; 4] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32];
+    const ATTRS: [wgpu::VertexAttribute; 5] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Unorm8x4];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GpuVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
@@ -918,7 +924,7 @@ impl Renderer {
         self.order.push(ov.id);
         // object uniforms (cheap; written when they change)
         let mut obj = ObjUniform::zeroed();
-        obj.params = [if ov.dim { 1.0 } else { 0.0 }, ov.instances.len().max(1) as f32, 0.0, 0.0];
+        obj.params = [if ov.dim { 1.0 } else { 0.0 }, ov.instances.len().max(1) as f32, if ov.paint { 1.0 } else { 0.0 }, 0.0];
         if ov.instances.is_empty() {
             obj.instances[0] = Mat4::IDENTITY.to_cols_array_2d();
         } else {
@@ -951,6 +957,7 @@ impl Renderer {
             nrm: mesh.normals[i].to_array(),
             mask: mesh.mask[i],
             cavity: cavity(mesh, i),
+            col: mesh.colors.get(i).copied().unwrap_or([255, 255, 255, 0]),
         };
         if dirty.topology || g.vbuf.is_none() {
             // Dynamic topology re-uploads every frame while sculpting, so

@@ -217,6 +217,11 @@ pub struct Editor {
     rng: Rng,
     /// Retopology: dragging draws topology strokes instead of placing points.
     pub retopo_draw: bool,
+    /// Polypaint colour (0..1 sRGB values), and the reference image to paint
+    /// from instead when Spotlight is on.
+    pub paint_color: Vec3,
+    pub spotlight: Option<Arc<crate::paint::Spotlight>>,
+    pub spotlight_on: bool,
     /// Draw creased edges over the model.
     pub show_creases: bool,
     /// Direction of the last dabs on screen (alpha "follow stroke").
@@ -296,6 +301,9 @@ impl Editor {
             rect: None,
             rng: Rng::new(7),
             retopo_draw: false,
+            paint_color: Vec3::new(0.8, 0.2, 0.15),
+            spotlight: None,
+            spotlight_on: false,
             show_creases: true,
             stroke_dir: Vec2::X,
         };
@@ -772,6 +780,7 @@ impl Editor {
             motion,
             view: f,
             group: self.paint_group,
+            color: self.paint_color,
         };
         self.sculptor.dab(&params);
         let c = self.symmetry_center();
@@ -795,6 +804,16 @@ impl Editor {
         *tip = Tip::default();
         if !self.falloff.is_default() {
             tip.curve = Some(Box::new(self.falloff.lut()));
+        }
+        if tool == Tool::Paint && self.spotlight_on {
+            if let Some(img) = &self.spotlight {
+                let size = self.last_size;
+                tip.spot = Some(crate::paint::SpotSampler {
+                    image: img.clone(),
+                    view_proj: self.camera.proj(size.x / size.y.max(1.0)) * self.camera.view(),
+                    size,
+                });
+            }
         }
         if tool == Tool::Chisel {
             tip.chisel = Some(self.brush.stroke.chisel);
@@ -1058,6 +1077,7 @@ impl Editor {
                 motion,
                 view: f,
                 group: 0,
+                color: self.paint_color,
             };
             self.sculptor.dab(&params);
             tip += motion * params.intensity;

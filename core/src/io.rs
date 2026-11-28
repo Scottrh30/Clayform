@@ -177,9 +177,16 @@ fn write_obj<W: Write>(mesh: &Mesh, pl: &Placement, w: &mut W) -> std::io::Resul
     let (polys, _) = crate::poly::Polys::from_mesh(mesh);
     writeln!(w, "# Exported from Clayform")?;
     writeln!(w, "o sculpt")?;
-    for p in &mesh.positions {
+    let painted = mesh.colors.len() == mesh.positions.len();
+    for (i, p) in mesh.positions.iter().enumerate() {
         let p = pl.pos(*p);
-        writeln!(w, "v {:.6} {:.6} {:.6}", p.x, p.y, p.z)?;
+        if painted {
+            // polypaint as vertex colours (the common "v x y z r g b" extension)
+            let c = crate::paint::shown_color(mesh.colors[i], glam::Vec3::splat(0.8));
+            writeln!(w, "v {:.6} {:.6} {:.6} {:.4} {:.4} {:.4}", p.x, p.y, p.z, c.x, c.y, c.z)?;
+        } else {
+            writeln!(w, "v {:.6} {:.6} {:.6}", p.x, p.y, p.z)?;
+        }
     }
     for n in &mesh.normals {
         let n = pl.nrm(*n);

@@ -193,6 +193,9 @@ pub fn bake(mesh: &Mesh, xfs: &[Mat4]) -> Mesh {
     }
     let mut out = MeshBuilder::new(pos, tris).with_faces(Some(gs), None).finish();
     out.mask = mask;
+    if mesh.colors.len() == mesh.positions.len() {
+        out.colors = mesh.colors.repeat(xfs.len());
+    }
     out.export_center = mesh.export_center;
     out.export_scale = mesh.export_scale;
     out
@@ -224,6 +227,15 @@ pub fn concat(meshes: &[&Mesh]) -> (Mesh, Vec<usize>) {
     }
     let mut out = MeshBuilder::new(pos, tris).with_faces(Some(groups), None).finish();
     out.mask = mask;
+    if meshes.iter().any(|m| !m.colors.is_empty()) {
+        for m in meshes {
+            if m.colors.len() == m.positions.len() {
+                out.colors.extend_from_slice(&m.colors);
+            } else {
+                out.colors.extend(std::iter::repeat_n(crate::mesh::NO_PAINT, m.positions.len()));
+            }
+        }
+    }
     if let Some(m) = meshes.first() {
         out.export_center = m.export_center;
         out.export_scale = m.export_scale;

@@ -30,7 +30,7 @@ pub fn sync_preview(r: &mut Renderer, view: &ViewSettings, dragging: bool) {
     }
     PREVIEW.with(|p| {
         if let Some((m, d)) = p.borrow_mut().as_mut() {
-            let ov = render::ObjectView { id: PREVIEW_ID, visible: !dragging, dim: false, instances: &[] };
+            let ov = render::ObjectView { id: PREVIEW_ID, visible: !dragging, dim: false, instances: &[], paint: view.paint };
             r.sync_object(&ov, m, d, view.wireframe, false);
         }
     });

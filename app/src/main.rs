@@ -5,6 +5,7 @@
 mod brush_ui;
 mod detail_ui;
 mod topo_ui;
+mod paint_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -131,6 +132,11 @@ struct Ui {
     pressure: RwSignal<(bool, f32)>,
     sdetail: RwSignal<detail_ui::DetailState>,
     noise: RwSignal<clayform_core::detail::NoiseSettings>,
+    paint_color: RwSignal<clayform_core::glam::Vec3>,
+    /// The next click on the model picks its colour.
+    picking: RwSignal<bool>,
+    spot_on: RwSignal<bool>,
+    spot_ref: RwSignal<Option<u32>>,
 }
 
 impl Ui {
@@ -163,6 +169,7 @@ impl Ui {
                 cavity: true,
                 cavity_strength: 0.6,
                 polygroups: false,
+                paint: true,
                 lighting: render::Lighting::default(),
             }),
             fov: RwSignal::new(40.0),
@@ -193,6 +200,10 @@ impl Ui {
             pressure: RwSignal::new((false, 1.0)),
             sdetail: RwSignal::new(Default::default()),
             noise: RwSignal::new(detail_ui::default_noise()),
+            paint_color: RwSignal::new(clayform_core::glam::Vec3::new(0.85, 0.2, 0.15)),
+            picking: RwSignal::new(false),
+            spot_on: RwSignal::new(false),
+            spot_ref: RwSignal::new(None),
             zm: RwSignal::new(ZmSettings::default()),
             overlay: RwSignal::new(Overlay::default()),
             vp_size: RwSignal::new((800.0, 600.0)),
@@ -941,6 +952,7 @@ pub(crate) fn sync_scene(r: &mut Renderer, e: &mut Editor, view: &ViewSettings) 
             visible: info.visible && !preview,
             dim: !active && e.subtool_count() > 1,
             instances: &xfs,
+            paint: view.paint,
         };
         let s = e.sculptor_at_mut(i);
         r.sync_object(&ov, &s.mesh, &mut s.dirty, view.wireframe, view.polygroups);
@@ -1007,6 +1019,9 @@ fn Viewport(ui: Ui) -> impl IntoView {
         ev.prevent_default();
         conveniences::touch();
         ui.menu.set(None);
+        if ev.button() == 0 && paint_ui::try_pick(ui, local_pos(&ev), canvas_size(&ev)) {
+            return;
+        }
         if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
             let _ = el.set_pointer_capture(ev.pointer_id());
         }
@@ -1555,6 +1570,8 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             <detail_ui::LayersFolder ui />
             <detail_ui::SurfaceFolder ui />
             <topo_ui::TopologyToolsFolder ui />
+            <paint_ui::PaintFolder ui />
+            <paint_ui::TextureFolder ui />
             <Folder title="Masking">
                 <div class="row buttons">
                     <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>

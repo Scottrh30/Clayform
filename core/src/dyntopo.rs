@@ -18,6 +18,9 @@ pub fn split_edge(m: &mut Mesh, a: u32, b: u32, touched: &mut Vec<u32>) -> u32 {
     let mask = (m.mask[a as usize] + m.mask[b as usize]) * 0.5;
     let faces: Vec<u32> = m.vert_faces(a).iter().copied().filter(|&f| m.tris[f as usize].contains(&b)).collect();
     let nv = m.add_vertex(mid, nrm, mask);
+    if m.colors.len() == m.positions.len() {
+        m.colors[nv as usize] = crate::mesh::mix_color(m.colors[a as usize], m.colors[b as usize]);
+    }
     for f in faces {
         let t = m.tris[f as usize];
         // orient so (x, y) is the edge in this face's winding order

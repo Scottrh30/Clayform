@@ -50,6 +50,7 @@ pub enum Tool {
     CurveTube,
     CurveStrap,
     Morph,
+    Paint,
 }
 
 /// What the Anchors brush does while dragging.
@@ -79,10 +80,10 @@ impl AnchorMode {
 }
 
 /// Groups for the brush menu.
-pub const TOOL_CATEGORIES: [&str; 7] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves", "Stamps"];
+pub const TOOL_CATEGORIES: [&str; 8] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves", "Stamps", "Paint"];
 
 impl Tool {
-    pub const ALL: [Tool; 42] = [
+    pub const ALL: [Tool; 43] = [
         Tool::Draw,
         Tool::Clay,
         Tool::ClayBuildup,
@@ -125,6 +126,7 @@ impl Tool {
         Tool::CurveTube,
         Tool::CurveStrap,
         Tool::Morph,
+        Tool::Paint,
     ];
 
     /// Index into `TOOL_CATEGORIES`.
@@ -137,6 +139,7 @@ impl Tool {
             Mask | GroupPaint => 4,
             CurveSnakehook | CurveTube | CurveStrap => 5,
             Chisel => 6,
+            Paint => 7,
             _ => 0,
         }
     }
@@ -197,6 +200,7 @@ impl Tool {
             Tool::CurveTube => "Curve Tube",
             Tool::CurveStrap => "Curve Strap",
             Tool::Morph => "Morph",
+            Tool::Paint => "Paint",
         }
     }
 
@@ -276,6 +280,7 @@ impl Tool {
             Tool::CurveTube => "Draw a curve over the model, release to add a round tube along it",
             Tool::CurveStrap => "Draw a curve over the model, release to add a flat strap lying on the surface",
             Tool::Morph => "Brushes the surface back towards the stored morph target",
+            Tool::Paint => "Polypaint: paints colour onto the surface (or from a reference image with Spotlight)",
         }
     }
 
@@ -292,6 +297,7 @@ impl Tool {
             Tool::Move | Tool::MoveElastic | Tool::MoveInfiniteDepth | Tool::Anchors | Tool::ClothPull | Tool::ClothTwist => 1.0,
             Tool::CurveSnakehook | Tool::GroupPaint => 1.0,
             Tool::CurveTube | Tool::CurveStrap => 0.5,
+            Tool::Paint => 0.8,
             Tool::Polish | Tool::HPolish | Tool::MPolish | Tool::SmoothValleys | Tool::SmoothPeaks | Tool::SmoothStronger => 0.6,
             Tool::Planar | Tool::TrimFront => 0.5,
             _ => 0.4,
@@ -341,6 +347,8 @@ pub struct DabParams {
     pub view: Vec3,
     /// Polygroup the Polygroup Paint brush paints.
     pub group: u32,
+    /// Colour the Paint brush paints (linear 0..1 sRGB values).
+    pub color: Vec3,
 }
 
 impl Default for DabParams {
@@ -356,6 +364,7 @@ impl Default for DabParams {
             motion: Vec3::ZERO,
             view: Vec3::NEG_Z,
             group: 0,
+            color: Vec3::ONE,
         }
     }
 }
@@ -436,6 +445,10 @@ pub(crate) enum Undo {
     Verts { idx: Vec<u32>, pos: Vec<Vec3>, mask: Vec<f32> },
     /// Sculpt layers / morph target and the active level's positions.
     Extra(Box<(crate::detail::Extra, Vec<Vec3>)>),
+    /// Polypaint of these vertices.
+    Colors { idx: Vec<u32>, col: Vec<[u8; 4]> },
+    /// The whole polypaint (empty = unpainted).
+    AllColors(Vec<[u8; 4]>),
     State(Box<State>),
     /// Go back to this multiresolution level (level changes are exactly
     /// reversible, so nothing needs copying).
@@ -458,6 +471,8 @@ impl Undo {
                 level.mesh.as_ref().map_or(0, mesh_bytes) + level.odd.len() * 16 + level.details.len() * 12
             }
             Undo::Extra(b) => b.0.bytes() + b.1.len() * 12,
+            Undo::Colors { idx, .. } => idx.len() * 8,
+            Undo::AllColors(c) => c.len() * 4,
             Undo::State(s) => {
                 mesh_bytes(&s.mesh)
                     + s.levels
@@ -571,10 +586,24 @@ pub(crate) struct Stroke {
     /// Polygroup paint: faces' groups before the stroke.
     group_old: Vec<(u32, u32)>,
     group_seen: std::collections::HashSet<u32>,
+    /// Paint strokes record colours instead of positions.
+    pub(crate) paint: bool,
+    pub(crate) old_col: Vec<[u8; 4]>,
 }
 
 impl Stroke {
     #[inline]
+    /// Paint strokes: records `v` once; true the first time.
+    pub(crate) fn mark_paint(&mut self, v: u32) -> bool {
+        self.modified = true;
+        if self.mark.mark(v) {
+            self.touched.push(v);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn touch(&mut self, v: u32, mesh: &Mesh) {
         self.modified = true;
         if self.snapshot.is_some() {
@@ -603,6 +632,8 @@ pub struct Tip {
     /// Brush normal for backface masking: points facing away are left alone.
     pub backface: Option<Vec3>,
     pub chisel: Option<ChiselShape>,
+    /// Paint colours from a reference image (Spotlight).
+    pub spot: Option<crate::paint::SpotSampler>,
 }
 
 impl Tip {
@@ -784,6 +815,7 @@ impl Sculptor {
                 Undo::AddTop { .. } => "Remove level",
                 Undo::Groups { .. } => "Polygroups",
                 Undo::Extra(_) => "Layers",
+                Undo::Colors { .. } | Undo::AllColors(_) => "Paint",
             }
             .to_string()
         });
@@ -830,9 +862,10 @@ impl Sculptor {
     /// Like `set_mesh`, optionally with a picking hierarchy built elsewhere
     /// (e.g. a slice at a time by the interface). The old sculpt moves into
     /// the undo history instead of being copied.
-    pub fn set_mesh_built(&mut self, mesh: Mesh, bvh: Option<Bvh>) {
+    pub fn set_mesh_built(&mut self, mut mesh: Mesh, bvh: Option<Bvh>) {
         self.end_stroke();
         self.stop_recording();
+        self.carry_paint_to(&mut mesh);
         // keep the highest level's shape so its detail can be reprojected
         if self.levels.len() > 1 {
             let top = self.levels.len() - 1;
@@ -903,11 +936,14 @@ impl Sculptor {
     }
 
     /// Installs a subdivided top level computed from the current mesh.
-    pub fn finish_subdivide(&mut self, fine: Mesh, odd: Vec<[u32; 4]>, bvh: Option<Bvh>) -> Result<(), String> {
+    pub fn finish_subdivide(&mut self, mut fine: Mesh, odd: Vec<[u32; 4]>, bvh: Option<Bvh>) -> Result<(), String> {
         if fine.positions.len() != self.mesh.positions.len() + odd.len() {
             self.abort_subdivide();
             return Err("The subdivided mesh doesn't match the current one".into());
         }
+        // a mesh subdivided elsewhere (desktop) arrives without paint, UVs or creases
+        crate::paint::carry_paint_up(&self.mesh, &mut fine, &odd);
+        crate::topo::carry_up_extras(&self.mesh, &mut fine, &odd);
         let then_level = self.pending_level.take().unwrap_or(self.level);
         let details = vec![Vec3::ZERO; fine.positions.len()];
         let coarse = std::mem::replace(&mut self.mesh, fine);
@@ -1052,6 +1088,7 @@ impl Sculptor {
             fine.mask[n + i] = (self.mesh.mask[st[0] as usize] + self.mesh.mask[st[1] as usize]) * 0.5;
         }
         fine.compute_all_normals();
+        crate::paint::carry_paint_up(&self.mesh, &mut fine, &self.levels[k].odd);
         let coarse = std::mem::replace(&mut self.mesh, fine);
         self.levels[k - 1].mesh = Some(coarse);
         self.levels[k].mesh = None;
@@ -1067,6 +1104,9 @@ impl Sculptor {
         let n = coarse.positions.len();
         coarse.positions.copy_from_slice(&self.mesh.positions[..n]);
         coarse.mask.copy_from_slice(&self.mesh.mask[..n]);
+        if self.mesh.colors.len() == self.mesh.positions.len() {
+            coarse.colors = self.mesh.colors[..n].to_vec();
+        }
         coarse.compute_all_normals();
         let s = coarse.loop_positions(&self.levels[k].odd);
         let actual = std::mem::replace(&mut self.mesh.positions, s);
@@ -1177,6 +1217,8 @@ impl Sculptor {
             label: None,
             group_old: Vec::new(),
             group_seen: std::collections::HashSet::new(),
+            paint: false,
+            old_col: Vec::new(),
         });
     }
 
@@ -1199,10 +1241,15 @@ impl Sculptor {
     /// Per-sculpt data added by later features (see `export_extras`).
     pub(crate) fn export_more_extras(&self, out: &mut Vec<u8>) {
         self.export_creases(out);
+        self.export_colors(out);
+        self.export_uvs(out);
     }
     pub(crate) fn import_more_extras(&mut self, tag: &[u8; 4], body: &[u8]) {
-        if tag == b"CRSE" {
-            self.import_creases(body);
+        match tag {
+            b"CRSE" => self.import_creases(body),
+            b"COLR" => self.import_colors(body),
+            b"UVS0" => self.import_uvs(body),
+            _ => {}
         }
     }
 
@@ -1233,6 +1280,8 @@ impl Sculptor {
                     }
                     self.push_undo(Undo::State(snap));
                 }
+            } else if st.paint && !st.touched.is_empty() {
+                self.push_undo(Undo::Colors { idx: st.touched, col: st.old_col });
             } else if !st.touched.is_empty() {
                 self.push_undo(Undo::Verts { idx: st.touched, pos: st.old_pos, mask: st.old_mask });
             } else if !st.group_old.is_empty() {
@@ -1257,8 +1306,9 @@ impl Sculptor {
 
     /// Replaces the mesh without adding an undo step (live previews; the
     /// change that started the preview is the undo step).
-    pub fn replace_mesh_preview(&mut self, mesh: Mesh) {
+    pub fn replace_mesh_preview(&mut self, mut mesh: Mesh) {
         self.end_stroke();
+        self.carry_paint_to(&mut mesh);
         self.mesh = mesh;
         self.revision += 1;
         self.topology_changed();
@@ -1407,6 +1457,10 @@ impl Sculptor {
         }
         if p.tool == Tool::GroupPaint {
             self.paint_group(p.group);
+            return;
+        }
+        if p.tool == Tool::Paint {
+            self.paint_dab(p);
             return;
         }
         if let Some(st) = self.stroke.as_mut() {
@@ -1767,6 +1821,7 @@ impl Sculptor {
             | Tool::ClothTwist
             | Tool::CurveTube
             | Tool::CurveStrap
+            | Tool::Paint
             | Tool::GroupPaint => unreachable!(),
         }
         self.after_deform(true, None);
@@ -1958,6 +2013,8 @@ impl Sculptor {
     /// Dynamic topology for one dab. Returns a live face to start the brush
     /// region from (the hit face may have been collapsed away).
     fn remesh(&mut self, seed: u32, center: Vec3, radius: f32, detail: f32) -> u32 {
+        // dynamic topology rebuilds faces, so texture coordinates can't survive
+        self.mesh.uvs.clear();
         let mut changed = Vec::new();
         let stats = {
             let Sculptor { mesh, fmark, vmark, .. } = self;
@@ -2031,6 +2088,22 @@ impl Sculptor {
                 Undo::Verts { idx, pos: cur_pos, mask: cur_mask }
             }
             Undo::State(s) => Undo::State(self.restore(s)),
+            Undo::Colors { idx, col } => {
+                let mut cur = Vec::with_capacity(idx.len());
+                if self.mesh.colors.len() == self.mesh.positions.len() {
+                    for (k, &v) in idx.iter().enumerate() {
+                        cur.push(self.mesh.colors[v as usize]);
+                        self.mesh.colors[v as usize] = col[k];
+                        self.dirty.add(v);
+                    }
+                }
+                Undo::Colors { idx, col: cur }
+            }
+            Undo::AllColors(c) => {
+                let cur = std::mem::replace(&mut self.mesh.colors, c);
+                self.dirty.all(self.mesh.positions.len());
+                Undo::AllColors(cur)
+            }
             Undo::Extra(b) => {
                 let (extra, pos) = *b;
                 let cur_extra = std::mem::replace(&mut self.extra, extra);

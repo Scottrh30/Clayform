@@ -39,6 +39,7 @@ struct VIn {
     @location(1) nrm: vec3<f32>,
     @location(2) mask: f32,
     @location(3) cavity: f32,
+    @location(4) col: vec4<f32>,
 };
 
 struct VOut {
@@ -48,6 +49,7 @@ struct VOut {
     @location(2) vpos: vec3<f32>,
     @location(3) cavity: f32,
     @location(4) lpos: vec4<f32>,
+    @location(5) col: vec4<f32>,
 };
 
 @vertex
@@ -62,6 +64,7 @@ fn vs_mesh(v: VIn, @builtin(instance_index) ii: u32) -> VOut {
     o.mask = v.mask;
     o.cavity = v.cavity;
     o.lpos = u.light_vp * vec4<f32>(pos + nrm * u.lighting.w, 1.0);
+    o.col = v.col;
     return o;
 }
 
@@ -163,6 +166,7 @@ fn fs_group(i: GOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     v.vpos = i.vpos;
     v.cavity = i.cavity;
     v.lpos = i.lpos;
+    v.col = vec4<f32>(0.0);
     return vec4<f32>(encode(shade(v, front, i.color, true)), 1.0);
 }
 
@@ -266,17 +270,27 @@ fn shade(i: VOut, front: bool, tint: vec3<f32>, tinted: bool) -> vec3<f32> {
         n = -n;
     }
     let id = i32(u.params.x + 0.5);
+    // polypaint covers the material by its alpha
+    var paint = 0.0;
+    if (obj.params.z > 0.5 && !tinted) {
+        paint = i.col.a;
+    }
+    let pc = srgb(i.col.rgb);
     var c = vec3<f32>(0.0);
     if (id >= 7) {
         var m = lit_material(id);
         if (tinted) {
             m.base = tint;
         }
+        m.base = mix(m.base, pc, paint);
         c = tonemap(lit_shade(n, i.vpos, m, shadow_factor(i.lpos)));
     } else if (tinted) {
         c = studio(n, tint, 24.0, 0.12, tint, 0.2, 0.3);
     } else {
         c = material(n, id);
+        if (paint > 0.0) {
+            c = mix(c, studio(n, pc, 24.0, 0.1, pc, 0.18, 0.3), paint);
+        }
     }
     // cavity: darken creases, lift ridges
     let k = u.shading.z;
