@@ -4,8 +4,12 @@
 
 mod host;
 mod render;
+mod tools_ui;
 
-use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mods, ViewDir};
+use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mode, Mods, Overlay, ViewDir, ZmSettings};
+use clayform_core::sculpt::{AnchorMode, TOOL_CATEGORIES};
+use clayform_core::snapshot::SnapshotSettings;
+use tools_ui::RefImage;
 use clayform_core::glam::Vec2;
 use clayform_core::io;
 use clayform_core::bvh::{Bvh, BvhBuilder};
@@ -78,6 +82,23 @@ struct Ui {
     mods: RwSignal<(bool, bool)>,
     dragging: RwSignal<Drag>,
     gpu: RwSignal<Option<String>>,
+    mode: RwSignal<Mode>,
+    anchor_mode: RwSignal<AnchorMode>,
+    zm: RwSignal<ZmSettings>,
+    /// Lines and points drawn over the viewport for the current mode.
+    overlay: RwSignal<Overlay>,
+    vp_size: RwSignal<(f32, f32)>,
+    snap: RwSignal<SnapshotSettings>,
+    /// Snapshot image preview (data URL).
+    snap_thumb: RwSignal<Option<String>>,
+    /// Size of an added/subtracted snapshot relative to the model.
+    snap_scale: RwSignal<f32>,
+    refs: RwSignal<Vec<RefImage>>,
+    retopo_levels: RwSignal<u32>,
+    /// Retopology vertices and faces.
+    retopo_count: RwSignal<(usize, usize)>,
+    group_angle: RwSignal<f32>,
+    bulk: RwSignal<f32>,
 }
 
 impl Ui {
@@ -109,6 +130,7 @@ impl Ui {
                 ao_strength: 0.8,
                 cavity: true,
                 cavity_strength: 0.6,
+                polygroups: false,
             }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
@@ -129,24 +151,46 @@ impl Ui {
             mods: RwSignal::new((false, false)),
             dragging: RwSignal::new(Drag::None),
             gpu: RwSignal::new(None),
+            mode: RwSignal::new(Mode::Sculpt),
+            anchor_mode: RwSignal::new(b.anchor_mode),
+            zm: RwSignal::new(ZmSettings::default()),
+            overlay: RwSignal::new(Overlay::default()),
+            vp_size: RwSignal::new((800.0, 600.0)),
+            snap: RwSignal::new(SnapshotSettings::default()),
+            snap_thumb: RwSignal::new(None),
+            snap_scale: RwSignal::new(0.6),
+            refs: RwSignal::new(Vec::new()),
+            retopo_levels: RwSignal::new(2),
+            retopo_count: RwSignal::new((0, 0)),
+            group_angle: RwSignal::new(30.0),
+            bulk: RwSignal::new(1.0),
         }
     }
 
     /// Pulls mesh statistics and undo state from the engine.
     fn refresh(self) {
-        let (v, t, u, r, lv, lc, top, rev) = with_ed(|e| {
+        let (v, t, u, r, lv, lc, top, rev, rt, msg) = with_ed(|e| {
+            let rt = (e.retopo.verts.len(), e.retopo.faces.len());
+            let retopo_undo = e.mode == Mode::Retopo && e.retopo.can_undo();
             let s = &e.sculptor;
             (
                 s.mesh.vertex_count(),
                 s.tri_count(),
-                s.can_undo(),
+                s.can_undo() || retopo_undo,
                 s.can_redo(),
                 s.level(),
                 s.level_count(),
                 s.top_tri_count(),
                 s.revision(),
+                rt,
+                e.message.take(),
             )
         });
+        self.retopo_count.set(rt);
+        if let Some(m) = msg {
+            self.status.set(m);
+        }
+        self.update_overlay();
         self.rev.set(rev);
         self.stats.set((v, t));
         self.can_undo.set(u);
@@ -154,6 +198,16 @@ impl Ui {
         self.level.set(lv);
         self.level_count.set(lc);
         self.top_tris.set(top);
+    }
+
+    /// Recomputes what's drawn over the viewport (hover targets, retopology, joints).
+    fn update_overlay(self) {
+        let cursor = self.cursor.get_untracked().map(|c| Vec2::new(c.0, c.1));
+        let (w, h) = self.vp_size.get_untracked();
+        let o = with_ed(|e| e.overlay(cursor, Vec2::new(w.max(1.0), h.max(1.0))));
+        if o != self.overlay.get_untracked() {
+            self.overlay.set(o);
+        }
     }
 }
 
@@ -199,6 +253,8 @@ enum Action {
     ResetCamera,
     View(ViewDir),
     TogglePanelSide,
+    NewPrimitive(clayform_core::poly::Primitive),
+    NewMannequin,
 }
 
 fn act(ui: Ui, a: Action) {
@@ -263,7 +319,24 @@ fn act(ui: Ui, a: Action) {
                 }
             });
         }
-        Action::Undo => with_ed(|e| e.undo()),
+        Action::Undo => with_ed(|e| {
+            if !e.retopo_undo() {
+                e.undo()
+            }
+        }),
+        Action::NewPrimitive(p) => {
+            with_ed(|e| e.new_primitive(p));
+            ui.status.set(format!("{} — quads with one polygroup per side; try ZModeler mode", p.name()));
+        }
+        Action::NewMannequin => {
+            with_ed(|e| {
+                e.mannequin = clayform_core::mannequin::Mannequin::default();
+                e.mannequin.bulk = ui.bulk.get_untracked();
+                e.mannequin_changed();
+            });
+            ui.mode.set(Mode::Mannequin);
+            ui.status.set("Mannequin — drag the joints to pose it, then Convert to sculpt".into());
+        }
         Action::Redo => with_ed(|e| e.redo()),
         Action::Subdivide => {
             if host::in_desktop_app() {
@@ -321,58 +394,8 @@ fn act(ui: Ui, a: Action) {
             if ui.busy.get_untracked() {
                 return;
             }
-            let settings = ui.voxel.get_untracked();
-            if host::in_desktop_app() {
-                let bytes = with_ed(|e| {
-                    e.cancel_drag();
-                    wire::encode(&e.sculptor.mesh, &[])
-                });
-                start_job(ui, "Remeshing");
-                spawn_local(async move {
-                    let t0 = now_ms();
-                    let headers = [
-                        ("resolution", settings.resolution.to_string()),
-                        ("smooth", settings.smooth.to_string()),
-                        ("project", if settings.project { "1" } else { "0" }.to_string()),
-                    ];
-                    let result = host::invoke_bytes("remesh", &bytes, &headers).await.and_then(|b| wire::decode_parts(&b));
-                    let result = match result {
-                        Ok(parts) => Ok(build_in_slices(ui, parts).await),
-                        Err(e) => Err(e),
-                    };
-                    match result {
-                        Ok((m, _, bvh)) => {
-                            let n = m.tris.len();
-                            with_ed(|e| e.apply_remeshed(m, Some(bvh)));
-                            ui.status.set(format!(
-                                "Remeshed — {} triangles in {:.1} s",
-                                fmt_count(n),
-                                (now_ms() - t0) / 1000.0
-                            ));
-                        }
-                        Err(e) => ui.status.set(job_error("Remesh", &e)),
-                    }
-                    end_job(ui);
-                });
-                return;
-            }
-            ui.busy.set(true);
-            ui.status.set(format!("Remeshing at resolution {}…", settings.resolution));
-            spawn_local(async move {
-                // let the status line paint before the (blocking) remesh
-                sleep_ms(40).await;
-                let t0 = now_ms();
-                match with_ed(|e| e.voxel_remesh(&settings)) {
-                    Ok(n) => ui.status.set(format!(
-                        "Remeshed — {} triangles in {:.1} s",
-                        fmt_count(n),
-                        (now_ms() - t0) / 1000.0
-                    )),
-                    Err(e) => ui.status.set(format!("Remesh failed: {e}")),
-                }
-                ui.busy.set(false);
-                ui.refresh();
-            });
+            run_remesh(ui, None, ui.voxel.get_untracked(), "Remeshed");
+            return;
         }
         Action::ToggleDyntopo => {
             if ui.level_count.get_untracked() > 1 {
@@ -395,6 +418,71 @@ fn act(ui: Ui, a: Action) {
         Action::TogglePanelSide => ui.panel_right.update(|r| *r = !*r),
     }
     ui.refresh();
+}
+
+/// Voxel-remeshes `mesh` (or the sculpt) in the background and makes the
+/// result the sculpt. `done` starts the status message.
+fn run_remesh(ui: Ui, mesh: Option<Mesh>, settings: VoxelSettings, done: &'static str) {
+    if host::in_desktop_app() {
+        let bytes = with_ed(|e| {
+            e.cancel_drag();
+            wire::encode(mesh.as_ref().unwrap_or(&e.sculptor.mesh), &[])
+        });
+        start_job(ui, "Remeshing");
+        spawn_local(async move {
+            let t0 = now_ms();
+            let headers = [
+                ("resolution", settings.resolution.to_string()),
+                ("smooth", settings.smooth.to_string()),
+                ("project", if settings.project { "1" } else { "0" }.to_string()),
+                ("signed", if settings.signed { "1" } else { "0" }.to_string()),
+            ];
+            let result = host::invoke_bytes("remesh", &bytes, &headers).await.and_then(|b| wire::decode_parts(&b));
+            let result = match result {
+                Ok(parts) => Ok(build_in_slices(ui, parts).await),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((m, _, bvh)) => {
+                    let n = m.tris.len();
+                    with_ed(|e| e.apply_remeshed(m, Some(bvh)));
+                    ui.status.set(format!(
+                        "{done} — {} triangles in {:.1} s",
+                        fmt_count(n),
+                        (now_ms() - t0) / 1000.0
+                    ));
+                }
+                Err(e) => ui.status.set(job_error("Remesh", &e)),
+            }
+            end_job(ui);
+        });
+        return;
+    }
+    ui.busy.set(true);
+    ui.status.set(format!("Remeshing at resolution {}…", settings.resolution));
+    spawn_local(async move {
+        // let the status line paint before the (blocking) remesh
+        sleep_ms(40).await;
+        let t0 = now_ms();
+        let result = match &mesh {
+            Some(m) => clayform_core::remesh::voxel_remesh(m, &settings).map(|r| {
+                let n = r.tris.len();
+                with_ed(|e| e.apply_remeshed(r, None));
+                n
+            }),
+            None => with_ed(|e| e.voxel_remesh(&settings)),
+        };
+        match result {
+            Ok(n) => ui.status.set(format!(
+                "{done} — {} triangles in {:.1} s",
+                fmt_count(n),
+                (now_ms() - t0) / 1000.0
+            )),
+            Err(e) => ui.status.set(format!("Remesh failed: {e}")),
+        }
+        ui.busy.set(false);
+        ui.refresh();
+    });
 }
 
 /// Builds a mesh's connectivity and picking hierarchy a slice at a time,
@@ -446,11 +534,18 @@ fn settings_json(ui: Ui) -> String {
             "detail": brush.detail,
             "constant_detail": brush.detail_mode == DetailMode::Constant,
             "smooth_reduces": brush.smooth_reduces,
+            "anchor_mode": AnchorMode::ALL.iter().position(|m| *m == brush.anchor_mode),
         },
+        "zmodeler": {
+            "action": clayform_core::poly::Action::ALL.iter().position(|a| *a == ui.zm.get_untracked().action),
+            "target": clayform_core::poly::Target::ALL.iter().position(|t| *t == ui.zm.get_untracked().target),
+            "divisions": ui.zm.get_untracked().divisions,
+        },
+        "references": tools_ui::refs_json(ui),
         "view": {
             "material": v.material, "show_mask": v.show_mask, "flat": v.flat, "wireframe": v.wireframe,
             "background": v.background, "ao": v.ao, "ao_strength": v.ao_strength,
-            "cavity": v.cavity, "cavity_strength": v.cavity_strength,
+            "cavity": v.cavity, "cavity_strength": v.cavity_strength, "polygroups": v.polygroups,
         },
         "voxel": { "resolution": vx.resolution, "smooth": vx.smooth, "project": vx.project },
     })
@@ -534,6 +629,25 @@ fn apply_settings(ui: Ui, json: &str) {
         if let Some(r) = b(br, "smooth_reduces") {
             ui.smooth_reduces.set(r);
         }
+        if let Some(m) = br.get("anchor_mode").and_then(|x| x.as_u64()).and_then(|i| AnchorMode::ALL.get(i as usize)) {
+            ui.anchor_mode.set(*m);
+        }
+    }
+    if let Some(z) = j.get("zmodeler") {
+        ui.zm.update(|s| {
+            if let Some(a) = z.get("action").and_then(|x| x.as_u64()).and_then(|i| clayform_core::poly::Action::ALL.get(i as usize)) {
+                s.action = *a;
+            }
+            if let Some(t) = z.get("target").and_then(|x| x.as_u64()).and_then(|i| clayform_core::poly::Target::ALL.get(i as usize)) {
+                s.target = *t;
+            }
+            if let Some(d) = z.get("divisions").and_then(|x| x.as_u64()) {
+                s.divisions = (d as u32).clamp(1, 32);
+            }
+        });
+    }
+    if let Some(r) = j.get("references") {
+        tools_ui::apply_refs_json(ui, r);
     }
     if let Some(v) = j.get("view") {
         ui.view.update(|s| {
@@ -550,6 +664,7 @@ fn apply_settings(ui: Ui, json: &str) {
             s.ao_strength = f(v, "ao_strength").unwrap_or(s.ao_strength);
             s.cavity = b(v, "cavity").unwrap_or(s.cavity);
             s.cavity_strength = f(v, "cavity_strength").unwrap_or(s.cavity_strength);
+            s.polygroups = b(v, "polygroups").unwrap_or(s.polygroups);
         });
     }
     if let Some(v) = j.get("voxel") {
@@ -760,7 +875,7 @@ fn draw_frame(canvas: &web_sys::HtmlCanvasElement, ui: Ui) {
         e.redraw = false;
         RENDERER.with(|r| {
             if let Some(r) = r.borrow_mut().as_mut() {
-                r.sync_mesh(&e.sculptor.mesh, &mut e.sculptor.dirty, view.wireframe);
+                r.sync_mesh(&e.sculptor.mesh, &mut e.sculptor.dirty, view.wireframe, view.polygroups);
                 r.render([w, h], e.camera.view(), e.camera.proj((cw / ch) as f32), &view, e.camera.dist * 0.06);
             }
         });
@@ -825,6 +940,9 @@ fn Viewport(ui: Ui) -> impl IntoView {
         let size = canvas_size(&ev);
         let d = with_ed(|e| e.pointer_down(button, local_pos(&ev), size, mods));
         ui.dragging.set(d);
+        if d != Drag::Orbit && d != Drag::Pan {
+            ui.refresh();
+        }
     };
     let on_move = move |ev: ev::PointerEvent| {
         let p = local_pos(&ev);
@@ -837,7 +955,9 @@ fn Viewport(ui: Ui) -> impl IntoView {
             e.mirror_screen_points(p, size)
         });
         ui.cursor.set(Some((p.x, p.y)));
+        ui.vp_size.set((size.x, size.y));
         ui.mirror.set(mirror.into_iter().map(|m| (m.x, m.y)).collect());
+        ui.update_overlay();
     };
     let on_up = move |_ev: ev::PointerEvent| {
         with_ed(|e| e.pointer_up());
@@ -848,10 +968,11 @@ fn Viewport(ui: Ui) -> impl IntoView {
         ev.prevent_default();
         let scale = if ev.delta_mode() == 1 { 30.0 } else { 1.0 };
         with_ed(|e| e.wheel(-(ev.delta_y() as f32) * scale));
+        ui.update_overlay();
     };
 
     let brush_visible = move || {
-        matches!(ui.dragging.get(), Drag::None | Drag::Sculpt) && ui.cursor.get().is_some()
+        matches!(ui.dragging.get(), Drag::None | Drag::Sculpt) && ui.cursor.get().is_some() && ui.overlay.get().brush
     };
     let brush_color = move || {
         let (shift, ctrl) = ui.mods.get();
@@ -868,7 +989,11 @@ fn Viewport(ui: Ui) -> impl IntoView {
                 on:pointermove=on_move
                 on:pointerup=on_up
                 on:pointercancel=on_up
-                on:pointerleave=move |_| if ui.dragging.get_untracked() == Drag::None { ui.cursor.set(None); ui.mirror.set(Vec::new()) }
+                on:pointerleave=move |_| if ui.dragging.get_untracked() == Drag::None {
+                    ui.cursor.set(None);
+                    ui.mirror.set(Vec::new());
+                    ui.update_overlay();
+                }
                 on:wheel=on_wheel
                 on:contextmenu=|ev: ev::MouseEvent| ev.prevent_default()
             ></canvas>
@@ -897,6 +1022,8 @@ fn Viewport(ui: Ui) -> impl IntoView {
                         .collect_view()
                 }}
             </svg>
+            <tools_ui::ModeOverlay ui />
+            <tools_ui::References ui />
             <Show when=move || ui.job.get().is_some()>
                 <div class="job-card">
                     <div class="job-row">
@@ -1065,6 +1192,12 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                 <Item ui action=Action::NewCube label="New cube" />
                 <Item ui action=Action::NewPlane label="New plane" />
                 <div class="sep"></div>
+                <Item ui action=Action::NewPrimitive(clayform_core::poly::Primitive::QCube) label="New QCube (quads)" />
+                <Item ui action=Action::NewPrimitive(clayform_core::poly::Primitive::QSphere) label="New QSphere (quads)" />
+                <Item ui action=Action::NewPrimitive(clayform_core::poly::Primitive::QCylinder) label="New QCylinder (quads)" />
+                <Item ui action=Action::NewPrimitive(clayform_core::poly::Primitive::QPlane) label="New QPlane (quads)" />
+                <Item ui action=Action::NewMannequin label="New mannequin" />
+                <div class="sep"></div>
                 <div class="menu-widget">
                     <Slider
                         label="Sphere detail"
@@ -1127,7 +1260,11 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"Middle drag, Shift + right drag"</td><td>"Pan"</td></tr>
                         <tr><td>"Wheel"</td><td>"Zoom"</td></tr>
                         <tr><td>"D C B S F Y Q I"</td><td>"Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate"</td></tr>
-                        <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask"</td></tr>
+                        <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Move Topological, Snakehook, Nudge, Mask"</td></tr>
+                        <tr><td>"J H O"</td><td>"Move, Clay Tubes, Polish (more brushes in the Tool list)"</td></tr>
+                        <tr><td>"Tab / Shift+Tab"</td><td>"Next / previous mode: Sculpt, ZModeler, Retopology, Mannequin"</td></tr>
+                        <tr><td>"Shift+G"</td><td>"Polygroup colours"</td></tr>
+                        <tr><td>"Enter / Esc"</td><td>"Retopology: close the face / drop the picked points"</td></tr>
                         <tr><td>"[  ]"</td><td>"Brush radius"</td></tr>
                         <tr><td>"X / W / N"</td><td>"Mirror X / wireframe / negative"</td></tr>
                         <tr><td>"Ctrl+O / Ctrl+S / Ctrl+Shift+S"</td><td>"Open / save / save project as"</td></tr>
@@ -1164,28 +1301,64 @@ fn SidePanel(ui: Ui) -> impl IntoView {
     let at_top = move || ui.level.get() + 1 >= ui.level_count.get();
     view! {
         <aside class="panel">
+            <tools_ui::ModeBar ui />
             <Folder title="Sculpting">
                 <label class="row">
                     <span class="label">"Tool"</span>
                     <select on:change=move |ev| {
                         if let Ok(i) = event_target_value(&ev).parse::<usize>() {
                             ui.tool.set(Tool::ALL[i]);
+                            ui.mode.set(Mode::Sculpt);
                         }
                     }>
-                        {Tool::ALL
+                        {TOOL_CATEGORIES
                             .iter()
-                            .map(|t| {
-                                let t = *t;
+                            .enumerate()
+                            .map(|(c, cat)| {
                                 view! {
-                                    <option value=t.index().to_string() title=t.description() selected=move || ui.tool.get() == t>
-                                        {format!("{}  ({})", t.name(), t.shortcut())}
-                                    </option>
+                                    <optgroup label=*cat>
+                                        {Tool::ALL
+                                            .iter()
+                                            .filter(|t| t.category() == c)
+                                            .map(|t| {
+                                                let t = *t;
+                                                let label = match t.key() {
+                                                    Some(k) => format!("{}  ({k})", t.name()),
+                                                    None => t.name().to_string(),
+                                                };
+                                                view! {
+                                                    <option value=t.index().to_string() title=t.description() selected=move || ui.tool.get() == t>
+                                                        {label}
+                                                    </option>
+                                                }
+                                            })
+                                            .collect_view()}
+                                    </optgroup>
                                 }
                             })
                             .collect_view()}
                     </select>
                 </label>
                 <div class="row info tool-desc">{move || ui.tool.get().description()}</div>
+                <Show when=move || ui.tool.get() == Tool::Anchors>
+                    <div class="row">
+                        <span class="label">"Anchor"</span>
+                        <select on:change=move |ev| {
+                            if let Ok(i) = event_target_value(&ev).parse::<usize>() {
+                                ui.anchor_mode.set(AnchorMode::ALL[i]);
+                            }
+                        }>
+                            {AnchorMode::ALL
+                                .iter()
+                                .enumerate()
+                                .map(|(i, m)| {
+                                    let m = *m;
+                                    view! { <option value=i.to_string() selected=move || ui.anchor_mode.get() == m>{m.name()}</option> }
+                                })
+                                .collect_view()}
+                        </select>
+                    </div>
+                </Show>
                 <Slider
                     label="Radius"
                     min=4f32.ln() max=400f32.ln() step=0.01
@@ -1368,6 +1541,12 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     }}
                 </div>
             </Folder>
+            <tools_ui::ZModelerFolder ui />
+            <tools_ui::PolygroupFolder ui />
+            <tools_ui::RetopoFolder ui />
+            <tools_ui::MannequinFolder ui />
+            <tools_ui::SnapshotFolder ui />
+            <tools_ui::ReferenceFolder ui />
             <Folder title="Rendering">
                 <label class="row">
                     <span class="label">"Material"</span>
@@ -1422,6 +1601,11 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     label="Wireframe  (W)"
                     value=Signal::derive(move || ui.view.get().wireframe)
                     on_change=move |v| ui.view.update(|s| s.wireframe = v)
+                />
+                <Check
+                    label="Polygroup colours  (G with Shift)"
+                    value=Signal::derive(move || ui.view.get().polygroups)
+                    on_change=move |v| ui.view.update(|s| s.polygroups = v)
                 />
             </Folder>
             <Folder title="Interface" closed=true>
@@ -1481,14 +1665,31 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "1" => act(ui, Action::View(ViewDir::Front)),
             "3" => act(ui, Action::View(ViewDir::Right)),
             "7" => act(ui, Action::View(ViewDir::Top)),
-            "escape" => ui.menu.set(None),
+            "escape" => {
+                ui.menu.set(None);
+                with_ed(|e| e.retopo.pending.clear());
+                ui.refresh();
+            }
+            "enter" if ui.mode.get_untracked() == Mode::Retopo => {
+                with_ed(|e| e.retopo_close_face());
+                ui.refresh();
+            }
+            "g" if ev.shift_key() => ui.view.update(|s| s.polygroups = !s.polygroups),
+            "tab" => {
+                let m = ui.mode.get_untracked();
+                let i = Mode::ALL.iter().position(|x| *x == m).unwrap_or(0);
+                let n = Mode::ALL.len();
+                let next = if ev.shift_key() { (i + n - 1) % n } else { (i + 1) % n };
+                ui.mode.set(Mode::ALL[next]);
+            }
             "pageup" => act(ui, Action::LevelUp),
             "pagedown" => act(ui, Action::LevelDown),
             "t" => act(ui, Action::ToggleDyntopo),
             "r" => act(ui, Action::VoxelRemesh),
             _ => {
-                if let Some(t) = Tool::ALL.iter().find(|t| t.shortcut().to_ascii_lowercase().to_string() == k) {
+                if let Some(t) = Tool::ALL.iter().find(|t| t.key().is_some_and(|c| c.to_ascii_lowercase().to_string() == k)) {
                     ui.tool.set(*t);
+                    ui.mode.set(Mode::Sculpt);
                 } else {
                     handled = false;
                 }
@@ -1517,8 +1718,21 @@ fn App() -> impl IntoView {
             detail: ui.detail.get(),
             detail_mode: ui.detail_mode.get(),
             smooth_reduces: ui.smooth_reduces.get(),
+            anchor_mode: ui.anchor_mode.get(),
         };
         with_ed(|e| e.brush = brush);
+        ui.update_overlay();
+    });
+    // mode and ZModeler settings -> engine
+    Effect::new(move || {
+        let mode = ui.mode.get();
+        with_ed(|e| e.set_mode(mode));
+        ui.refresh();
+    });
+    Effect::new(move || {
+        let zm = ui.zm.get();
+        with_ed(|e| e.zm = zm);
+        ui.update_overlay();
     });
     // display settings -> redraw
     Effect::new(move || {
@@ -1572,9 +1786,16 @@ fn App() -> impl IntoView {
                 }}</span>
                 <span class="sep">"|"</span>
                 <span>{move || {
-                    let t = ui.tool.get();
+                    let what = match ui.mode.get() {
+                        Mode::Sculpt => ui.tool.get().name().to_string(),
+                        Mode::ZModeler => {
+                            let z = ui.zm.get();
+                            format!("ZModeler: {} {}", z.action.name(), z.target.name())
+                        }
+                        m => m.name().to_string(),
+                    };
                     let sym = ui.symmetry.get().label();
-                    if sym.is_empty() { t.name().to_string() } else { format!("{} · {}", t.name(), sym) }
+                    if sym.is_empty() { what } else { format!("{what} · {sym}") }
                 }}</span>
                 <span class="sep">"|"</span>
                 <span>{move || {

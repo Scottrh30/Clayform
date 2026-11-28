@@ -4,10 +4,70 @@
 use crate::camera::Camera;
 use crate::mesh::Mesh;
 use crate::remesh::{voxel_remesh, VoxelSettings};
-use crate::sculpt::{DabParams, Sculptor, Tool};
+use crate::sculpt::{AnchorMode, DabParams, DragInput, DragKind, Gather, Sculptor, Tool};
 use crate::symmetry::{apply_point, Symmetry};
 use glam::Mat3;
 use glam::{Vec2, Vec3, Vec4};
+
+mod mq;
+mod rt;
+mod zm;
+
+pub use mq::MannequinDrag;
+pub use zm::ZmSettings;
+
+/// What the left mouse button does in the viewport.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    Sculpt,
+    /// Polygon modelling (ZModeler).
+    ZModeler,
+    /// Drawing new topology over the sculpt.
+    Retopo,
+    /// Posing a mannequin.
+    Mannequin,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 4] = [Mode::Sculpt, Mode::ZModeler, Mode::Retopo, Mode::Mannequin];
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Sculpt => "Sculpt",
+            Mode::ZModeler => "ZModeler",
+            Mode::Retopo => "Retopology",
+            Mode::Mannequin => "Mannequin",
+        }
+    }
+}
+
+/// Lines and points drawn over the viewport (screen space, points).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Overlay {
+    pub lines: Vec<(Vec2, Vec2, OverlayStyle)>,
+    pub points: Vec<(Vec2, OverlayStyle)>,
+    /// Filled polygons (retopology faces).
+    pub polys: Vec<Vec<Vec2>>,
+    /// Whether the brush circle makes sense in this mode.
+    pub brush: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayStyle {
+    /// What a click would act on.
+    Target,
+    /// The first pick of a two-step action (bridge).
+    Pending,
+    /// Retopology edges / vertices.
+    Mesh,
+    /// Retopology face being built.
+    Building,
+    /// Mannequin joints.
+    Joint,
+    /// The joint under the cursor or being dragged.
+    Active,
+    /// A curve being drawn.
+    Curve,
+}
 
 /// How dynamic topology picks its triangle size.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,6 +92,8 @@ pub struct Brush {
     pub detail_mode: DetailMode,
     /// With dynamic topology, the Smooth brush also lowers triangle density.
     pub smooth_reduces: bool,
+    /// What the Anchors brush does.
+    pub anchor_mode: AnchorMode,
 }
 
 impl Default for Brush {
@@ -46,6 +108,7 @@ impl Default for Brush {
             detail: 0.7,
             detail_mode: DetailMode::Brush,
             smooth_reduces: true,
+            anchor_mode: AnchorMode::Move,
         }
     }
 }
@@ -98,6 +161,23 @@ pub struct Editor {
     sym_center: Vec3,
     /// Set whenever the picture changes; the interface clears it after drawing.
     pub redraw: bool,
+    pub mode: Mode,
+    pub zm: ZmSettings,
+    zms: zm::ZmState,
+    pub retopo: crate::retopo::Retopo,
+    rts: rt::RtState,
+    pub mannequin: crate::mannequin::Mannequin,
+    mqs: mq::MqState,
+    /// Curve Snakehook: the screen path being drawn.
+    curve: Vec<Vec2>,
+    /// Dragging brushes: pointer and scale at the stroke start.
+    drag_start: Vec2,
+    drag_wpp: f32,
+    /// Polygroup paint: the group this stroke paints.
+    paint_group: u32,
+    last_size: Vec2,
+    /// A one-line note for the status bar (picks, errors), taken by the interface.
+    pub message: Option<String>,
 }
 
 impl Default for Editor {
@@ -121,6 +201,19 @@ impl Editor {
             stroke_extent: 2.0,
             sym_center: Vec3::ZERO,
             redraw: true,
+            mode: Mode::Sculpt,
+            zm: ZmSettings::default(),
+            zms: Default::default(),
+            retopo: Default::default(),
+            rts: Default::default(),
+            mannequin: Default::default(),
+            mqs: Default::default(),
+            curve: Vec::new(),
+            drag_start: Vec2::ZERO,
+            drag_wpp: 0.01,
+            paint_group: 0,
+            last_size: Vec2::new(800.0, 600.0),
+            message: None,
         };
         e.frame_mesh();
         e
@@ -168,7 +261,7 @@ impl Editor {
             DetailMode::Constant => self.stroke_extent / Self::constant_resolution(self.brush.detail),
         };
         // smoothing with dynamic topology evens out and coarsens, like Sculptris Pro
-        Some(if self.stroke_tool == Tool::Smooth && self.brush.smooth_reduces { base * 4.0 } else { base })
+        Some(if self.stroke_tool.is_smooth() && self.brush.smooth_reduces { base * 4.0 } else { base })
     }
 
     /// Target edge length as a fraction of the brush radius: 35 % at
@@ -296,7 +389,67 @@ impl Editor {
             self.sculptor.end_stroke();
         }
         self.grab = None;
+        self.curve.clear();
+        self.zms.drag = None;
+        self.rts.drag = None;
+        self.mqs.drag = None;
         self.drag = Drag::None;
+    }
+
+    /// Switches what the left button does.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        self.cancel_drag();
+        self.zms.bridge = None;
+        self.retopo.pending.clear();
+        if mode == Mode::Mannequin {
+            self.enter_mannequin();
+        }
+        self.mode = mode;
+        self.redraw = true;
+    }
+
+    /// Projects a world point to the viewport (None behind the camera).
+    pub fn to_screen(&self, q: Vec3, size: Vec2) -> Option<Vec2> {
+        let vp = self.camera.proj(size.x / size.y) * self.camera.view();
+        let clip = vp * Vec4::from((q, 1.0));
+        if clip.w <= 1e-6 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some(Vec2::new((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y))
+    }
+
+    /// Whether a point on (or near) the surface can be seen from the camera.
+    pub fn visible(&self, q: Vec3) -> bool {
+        let eye = self.camera.eye();
+        let d = q - eye;
+        let len = d.length();
+        if len < 1e-6 {
+            return true;
+        }
+        match self.sculptor.raycast(eye, d / len) {
+            Some(h) => h.t >= len - len * 0.01 - 1e-4,
+            None => true,
+        }
+    }
+
+    /// What to draw over the viewport for the cursor at `p`.
+    pub fn overlay(&mut self, p: Option<Vec2>, size: Vec2) -> Overlay {
+        match self.mode {
+            Mode::Sculpt => {
+                let mut o = Overlay { brush: true, ..Default::default() };
+                for w in self.curve.windows(2) {
+                    o.lines.push((w[0], w[1], OverlayStyle::Curve));
+                }
+                o
+            }
+            Mode::ZModeler => self.zm_overlay(p, size),
+            Mode::Retopo => self.rt_overlay(p, size),
+            Mode::Mannequin => self.mq_overlay(p, size),
+        }
     }
 
     // ------------------------------------------------------------------ input
@@ -304,10 +457,23 @@ impl Editor {
     /// `p` and `size` are in CSS pixels / points, origin top-left of the viewport.
     pub fn pointer_down(&mut self, button: Button, p: Vec2, size: Vec2, mods: Mods) -> Drag {
         self.cancel_drag();
+        self.last_size = size;
         self.sculptor.refresh_bvh();
         self.last_pos = p;
         self.drag = match button {
             Button::Left if mods.alt => Drag::Orbit,
+            Button::Left if self.mode != Mode::Sculpt => {
+                let handled = match self.mode {
+                    Mode::ZModeler => self.zm_down(p, size, mods),
+                    Mode::Retopo => self.rt_down(p, size, mods),
+                    _ => self.mq_down(p, size, mods),
+                };
+                match handled {
+                    Some(d) => d,
+                    None if mods.shift => Drag::Pan,
+                    None => Drag::Orbit,
+                }
+            }
             Button::Left => {
                 if self.begin_sculpt(p, size, mods) {
                     Drag::Sculpt
@@ -325,6 +491,7 @@ impl Editor {
     }
 
     pub fn pointer_move(&mut self, p: Vec2, size: Vec2) {
+        self.last_size = size;
         let d = p - self.last_pos;
         self.last_pos = p;
         match self.drag {
@@ -336,15 +503,29 @@ impl Editor {
                 self.camera.pan(d, size.y);
                 self.redraw = true;
             }
-            Drag::Sculpt => {
-                self.sculptor.refresh_bvh();
-                self.continue_sculpt(p, size);
-            }
+            Drag::Sculpt => match self.mode {
+                Mode::Sculpt => {
+                    self.sculptor.refresh_bvh();
+                    self.continue_sculpt(p, size);
+                }
+                Mode::ZModeler => self.zm_move(p, size),
+                Mode::Retopo => self.rt_move(p, size),
+                Mode::Mannequin => self.mq_move(p, size),
+            },
             Drag::None => {}
         }
     }
 
     pub fn pointer_up(&mut self) {
+        match self.mode {
+            Mode::Sculpt if self.drag == Drag::Sculpt && self.stroke_tool == Tool::CurveSnakehook => {
+                self.finish_curve();
+            }
+            Mode::ZModeler if self.drag == Drag::Sculpt => self.zm_up(),
+            Mode::Retopo if self.drag == Drag::Sculpt => self.rt_up(),
+            Mode::Mannequin if self.drag == Drag::Sculpt => self.mq_up(),
+            _ => {}
+        }
         self.cancel_drag();
     }
 
@@ -367,6 +548,7 @@ impl Editor {
     }
 
     fn dab_at(&mut self, p: Vec2, size: Vec2, screen_motion: Vec2) {
+        self.last_size = size;
         let (o, d) = self.camera.ray(p, size);
         let Some(h) = self.sculptor.raycast(o, d) else { return };
         let wpp = self.camera.world_per_point(h.point, size.y);
@@ -385,6 +567,8 @@ impl Editor {
             seed_tri: h.tri,
             detail: self.dab_detail(r),
             motion,
+            view: f,
+            group: self.paint_group,
         };
         self.sculptor.dab(&params);
         let c = self.symmetry_center();
@@ -411,17 +595,46 @@ impl Editor {
         if self.brush.symmetry.local {
             self.update_symmetry_center();
         }
-        self.sculptor.begin_stroke(self.dyntopo_active());
-        if self.stroke_tool == Tool::Grab {
-            let r = self.brush.radius_px * self.camera.world_per_point(h.point, size.y);
-            self.sculptor.grab_begin(h.point, r, h.tri, Mat3::IDENTITY);
+        if self.stroke_tool == Tool::GroupPaint {
+            self.paint_group = self.sculptor.mesh.groups.iter().copied().max().map_or(0, |g| g + 1);
+        }
+        self.sculptor.begin_stroke(self.dyntopo_active() && !self.stroke_tool.is_drag());
+        if self.stroke_tool.is_drag() {
+            let wpp = self.camera.world_per_point(h.point, size.y);
+            let r = self.brush.radius_px * wpp;
+            let view = self.camera.forward();
+            let gather = match self.stroke_tool {
+                Tool::Grab | Tool::ClothPull | Tool::ClothTwist | Tool::Anchors => Gather::Topological,
+                Tool::MoveElastic => Gather::Elastic,
+                Tool::MoveInfiniteDepth => Gather::Depth(view),
+                _ => Gather::Spatial,
+            };
+            let kind = match self.stroke_tool {
+                Tool::Anchors => DragKind::Anchor(self.brush.anchor_mode),
+                Tool::ClothPull => DragKind::ClothPull,
+                Tool::ClothTwist => DragKind::ClothTwist,
+                _ => DragKind::Move,
+            };
+            self.sculptor.drag_begin(h.point, r, h.tri, Mat3::IDENTITY, gather, kind);
             let c = self.symmetry_center();
             for m in self.brush.symmetry.copies() {
-                if let Some(hm) = self.sculptor.raycast(apply_point(m, c, o), m * d) {
-                    self.sculptor.grab_begin(hm.point, r, hm.tri, m);
+                let (om, dm) = (apply_point(m, c, o), m * d);
+                if let Some(hm) = self.sculptor.raycast(om, dm) {
+                    let gm = match gather {
+                        Gather::Depth(v) => Gather::Depth(m * v),
+                        g => g,
+                    };
+                    self.sculptor.drag_begin(hm.point, r, hm.tri, m, gm, kind);
                 }
             }
-            self.grab = Some((h.point, self.camera.forward()));
+            self.grab = Some((h.point, view));
+            self.drag_start = p;
+            self.drag_wpp = wpp;
+            self.drag = Drag::Sculpt;
+        } else if self.stroke_tool == Tool::CurveSnakehook {
+            // draw the path first; the horn is pulled on release
+            self.curve = vec![p];
+            self.drag = Drag::Sculpt;
         } else {
             // the drag state must be Sculpt while the first dab is applied
             self.drag = Drag::Sculpt;
@@ -432,13 +645,25 @@ impl Editor {
     }
 
     fn continue_sculpt(&mut self, p: Vec2, size: Vec2) {
-        if self.stroke_tool == Tool::Grab {
+        if self.stroke_tool.is_drag() {
             let Some((anchor, normal)) = self.grab else { return };
             let (o, d) = self.camera.ray(p, size);
             let denom = d.dot(normal);
             if denom.abs() > 1e-6 {
                 let t = (anchor - o).dot(normal) / denom;
-                self.sculptor.grab_update(o + d * t - anchor);
+                self.sculptor.drag_update(DragInput {
+                    delta: o + d * t - anchor,
+                    screen: p - self.drag_start,
+                    view: normal,
+                    wpp: self.drag_wpp,
+                });
+                self.redraw = true;
+            }
+            return;
+        }
+        if self.stroke_tool == Tool::CurveSnakehook {
+            if self.curve.last().is_none_or(|q| q.distance(p) > 3.0) {
+                self.curve.push(p);
                 self.redraw = true;
             }
             return;
@@ -453,6 +678,98 @@ impl Editor {
             self.dab_at(from, size, dir * spacing);
         }
         self.last_dab = from;
+    }
+
+    /// Curve Snakehook: pulls the surface at the curve's start along the
+    /// drawn path, the brush shrinking towards the tip.
+    fn finish_curve(&mut self) {
+        let path = std::mem::take(&mut self.curve);
+        if path.len() < 2 {
+            return;
+        }
+        let size = self.last_size;
+        let full = self.brush.radius_px;
+        // resample evenly so the taper follows length, not pointer speed
+        let total: f32 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
+        if total < 2.0 {
+            return;
+        }
+        let step = (full * 0.08).max(1.5);
+        let n = (total / step).ceil() as usize;
+        let at = |s: f32| -> Vec2 {
+            let mut left = s;
+            for w in path.windows(2) {
+                let l = w[0].distance(w[1]);
+                if left <= l {
+                    return w[0].lerp(w[1], if l > 0.0 { left / l } else { 0.0 });
+                }
+                left -= l;
+            }
+            *path.last().unwrap()
+        };
+        self.sculptor.refresh_bvh();
+        // the horn starts where the curve starts on the surface; each step
+        // drags the brush (on the tip) forward along the path, in the view plane
+        let (o, d) = self.camera.ray(path[0], size);
+        let Some(h0) = self.sculptor.raycast(o, d) else { return };
+        let wpp = self.camera.world_per_point(h0.point, size.y);
+        let f = self.camera.forward();
+        let right = f.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(f);
+        let mut tip = h0.point;
+        let mut tri = h0.tri;
+        let mut mirror_tips: Vec<(Mat3, Vec3, u32)> = Vec::new();
+        let c = self.symmetry_center();
+        for m in self.brush.symmetry.copies() {
+            if let Some(hm) = self.sculptor.raycast(apply_point(m, c, o), m * d) {
+                mirror_tips.push((m, hm.point, hm.tri));
+            }
+        }
+        self.stroke_tool = Tool::CurveSnakehook;
+        self.sculptor.begin_stroke(self.dyntopo_active());
+        let mut prev = path[0];
+        for k in 1..=n {
+            let s = total * k as f32 / n as f32;
+            let q = at(s);
+            let sm = q - prev;
+            prev = q;
+            let motion = (right * sm.x - up * sm.y) * wpp;
+            let taper = 1.0 - 0.75 * (s / total);
+            let r = full * taper * wpp;
+            let mut params = DabParams {
+                tool: Tool::CurveSnakehook,
+                center: tip,
+                radius: r,
+                intensity: self.brush.intensity[Tool::CurveSnakehook.index()],
+                negative: false,
+                seed_tri: tri,
+                detail: self.dab_detail(r),
+                motion,
+                view: f,
+                group: 0,
+            };
+            self.sculptor.dab(&params);
+            tip += motion * params.intensity;
+            for (m, mt, mtri) in mirror_tips.iter_mut() {
+                params.center = *mt;
+                params.seed_tri = *mtri;
+                params.motion = *m * motion;
+                self.sculptor.dab(&params);
+                *mt += params.motion * params.intensity;
+            }
+            // keep the seed face live and near the tip
+            self.sculptor.refresh_bvh();
+            if let Some(nt) = self.sculptor.nearest_face(tip) {
+                tri = nt;
+            }
+            for (_, mt, mtri) in mirror_tips.iter_mut() {
+                if let Some(nt) = self.sculptor.nearest_face(*mt) {
+                    *mtri = nt;
+                }
+            }
+        }
+        self.sculptor.end_stroke();
+        self.redraw = true;
     }
 
     /// Where each symmetric copy of the brush lands on screen (cursor over
@@ -536,7 +853,7 @@ mod tests {
         e.sculptor.subdivide().unwrap();
         let (yaw, dist) = (e.camera.yaw, e.camera.dist);
         let n0 = e.sculptor.tri_count();
-        let n = e.voxel_remesh(&VoxelSettings { resolution: 48, smooth: 1, project: true }).unwrap();
+        let n = e.voxel_remesh(&VoxelSettings { resolution: 48, smooth: 1, project: true, signed: false }).unwrap();
         assert_eq!(e.sculptor.tri_count(), n);
         assert_eq!(e.sculptor.level_count(), 1);
         assert_eq!((e.camera.yaw, e.camera.dist), (yaw, dist));
@@ -700,5 +1017,210 @@ mod tests {
         let p = Vec2::new(SIZE.x * 0.5 + 100.0, SIZE.y * 0.5);
         let m = e.mirror_screen_points(p, SIZE)[0];
         assert!((m.x - (SIZE.x * 0.5 - 100.0)).abs() < 3.0, "{m:?}");
+    }
+
+    fn front_z(e: &Editor) -> f32 {
+        e.sculptor.raycast(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z).unwrap().point.z
+    }
+
+    fn drag(e: &mut Editor, from: Vec2, to: Vec2) {
+        e.pointer_down(Button::Left, from, SIZE, Mods::default());
+        for i in 1..=10 {
+            e.pointer_move(from.lerp(to, i as f32 / 10.0), SIZE);
+        }
+        e.pointer_up();
+        e.sculptor.refresh_bvh();
+    }
+
+    #[test]
+    fn dragging_brushes_move_and_undo() {
+        for tool in [Tool::Move, Tool::MoveElastic, Tool::MoveInfiniteDepth, Tool::ClothPull, Tool::Anchors] {
+            let mut e = Editor::new();
+            e.set_mesh(Mesh::icosphere(4));
+            e.view_from(ViewDir::Front);
+            e.brush.tool = tool;
+            e.brush.symmetry.mirror = [false; 3];
+            e.brush.anchor_mode = AnchorMode::Move;
+            let before = e.sculptor.mesh.positions.clone();
+            drag(&mut e, SIZE * 0.5, SIZE * 0.5 + Vec2::new(80.0, 0.0));
+            let moved = e.sculptor.mesh.positions.iter().zip(&before).filter(|(a, b)| a.distance(**b) > 1e-3).count();
+            assert!(moved > 10, "{tool:?} moved {moved}");
+            assert!(e.sculptor.mesh.positions.iter().all(|p| p.is_finite()));
+            if tool == Tool::MoveInfiniteDepth {
+                // the back of the sphere moves too
+                let back = e.sculptor.mesh.positions.iter().zip(&before).filter(|(a, b)| b.z < -0.9 && a.x > b.x + 0.05).count();
+                assert!(back > 3, "{back}");
+            }
+            e.undo();
+            assert_eq!(e.sculptor.mesh.positions, before);
+        }
+    }
+
+    #[test]
+    fn anchors_scale_and_twist() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.brush.tool = Tool::Anchors;
+        e.brush.anchor_mode = AnchorMode::Inflate;
+        let z0 = front_z(&e);
+        drag(&mut e, SIZE * 0.5, SIZE * 0.5 - Vec2::new(0.0, 60.0));
+        assert!(front_z(&e) > z0 + 0.05);
+        e.brush.anchor_mode = AnchorMode::Twist;
+        drag(&mut e, SIZE * 0.5, SIZE * 0.5 + Vec2::new(60.0, 0.0));
+        assert!(e.sculptor.mesh.positions.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn curve_snakehook_pulls_a_horn() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.brush.tool = Tool::CurveSnakehook;
+        e.brush.symmetry.mirror = [false; 3];
+        let n0 = e.sculptor.tri_count();
+        let before = e.sculptor.mesh.positions.clone();
+        // drawing alone changes nothing
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        for i in 1..=20 {
+            e.pointer_move(SIZE * 0.5 + Vec2::new(i as f32 * 8.0, -(i as f32) * 2.0), SIZE);
+        }
+        assert_eq!(e.sculptor.mesh.positions, before);
+        assert!(e.overlay(None, SIZE).lines.len() > 10);
+        e.pointer_up();
+        let pulled = e.sculptor.mesh.positions.iter().zip(&before).map(|(a, b)| a.distance(*b)).fold(0.0f32, f32::max);
+        assert!(pulled > 0.5, "horn pulled {pulled}");
+        // the tip follows the curve to the right and up
+        let tip = e.sculptor.mesh.positions.iter().zip(&before).max_by(|x, y| x.0.distance(*x.1).total_cmp(&y.0.distance(*y.1))).unwrap().0;
+        assert!(tip.x > 0.4 && tip.y > 0.05, "{tip:?}");
+        assert_eq!(e.sculptor.tri_count(), n0);
+        e.undo();
+        assert_eq!(e.sculptor.mesh.positions, before);
+    }
+
+    #[test]
+    fn polygroup_paint_and_undo() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.brush.tool = Tool::GroupPaint;
+        stroke(&mut e, Mods::default());
+        let painted = e.sculptor.mesh.groups.iter().filter(|&&g| g == 1).count();
+        assert!(painted > 20, "{painted}");
+        e.undo();
+        assert!(e.sculptor.mesh.groups.iter().all(|&g| g == 0));
+    }
+
+    #[test]
+    fn zmodeler_extrude_by_dragging_is_one_undo_step() {
+        let mut e = Editor::new();
+        e.new_primitive(crate::poly::Primitive::QCube);
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::ZModeler);
+        e.brush.symmetry.mirror = [false; 3];
+        e.zm.action = crate::poly::Action::Extrude;
+        let n0 = e.sculptor.tri_count();
+        let z0 = front_z(&e);
+        assert!(!e.overlay(Some(SIZE * 0.5), SIZE).lines.is_empty(), "hover shows the target");
+        drag(&mut e, SIZE * 0.5, SIZE * 0.5 - Vec2::new(0.0, 80.0));
+        assert!(front_z(&e) > z0 + 0.1);
+        assert_eq!(e.sculptor.tri_count(), n0 + 8, "four side quads");
+        e.undo();
+        assert_eq!(e.sculptor.tri_count(), n0);
+        // click actions: delete a polygon, then polygroup one
+        e.zm.action = crate::poly::Action::Delete;
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        e.pointer_up();
+        assert_eq!(e.sculptor.tri_count(), n0 - 2);
+        e.undo();
+        e.zm.action = crate::poly::Action::Polygroup;
+        e.pointer_down(Button::Left, SIZE * 0.5, SIZE, Mods::default());
+        e.pointer_up();
+        let g = e.sculptor.mesh.groups.iter().copied().max().unwrap();
+        assert_eq!(e.sculptor.mesh.groups.iter().filter(|&&x| x == g).count(), 2);
+    }
+
+    #[test]
+    fn zmodeler_mirror_extrudes_both_sides() {
+        let mut e = Editor::new();
+        e.zm.divisions = 2;
+        e.new_primitive(crate::poly::Primitive::QCube);
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::ZModeler);
+        e.brush.symmetry.mirror[0] = true;
+        let n0 = e.sculptor.tri_count();
+        // a front quad off the centre line
+        let target = Vec3::new(0.4, 0.4, 0.8);
+        let sp = e.to_screen(target, SIZE).unwrap();
+        drag(&mut e, sp, sp - Vec2::new(0.0, 60.0));
+        // the two quads touch at the centre line, so they extrude as one block
+        assert_eq!(e.sculptor.tri_count(), n0 + 12);
+        e.undo();
+        // apart, each gets its own walls
+        e.zm.divisions = 4;
+        e.new_primitive(crate::poly::Primitive::QCube);
+        let n0 = e.sculptor.tri_count();
+        let sp = e.to_screen(Vec3::new(0.5, 0.1, 0.8), SIZE).unwrap();
+        drag(&mut e, sp, sp - Vec2::new(0.0, 60.0));
+        assert_eq!(e.sculptor.tri_count(), n0 + 16);
+    }
+
+    #[test]
+    fn retopo_clicks_build_a_face_and_undo() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::Retopo);
+        for p in [Vec2::new(-60.0, -60.0), Vec2::new(60.0, -60.0), Vec2::new(60.0, 60.0), Vec2::new(-60.0, 60.0)] {
+            e.pointer_down(Button::Left, SIZE * 0.5 + p, SIZE, Mods::default());
+            e.pointer_up();
+        }
+        assert_eq!(e.retopo.faces.len(), 1);
+        assert_eq!(e.overlay(None, SIZE).polys.len(), 1);
+        // dragging a vertex moves it along the surface
+        let v0 = e.retopo.verts[0];
+        drag(&mut e, SIZE * 0.5 + Vec2::new(-60.0, -60.0), SIZE * 0.5 + Vec2::new(-90.0, -60.0));
+        assert!(e.retopo.verts[0].x < v0.x - 0.05);
+        assert!(e.retopo_undo());
+        assert_eq!(e.retopo.verts[0], v0);
+        assert!(e.retopo_undo());
+        assert!(e.retopo.faces.is_empty());
+    }
+
+    #[test]
+    fn retopo_quad_patch_projects_onto_the_sphere() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(4));
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::Retopo);
+        for p in [Vec2::new(-60.0, -60.0), Vec2::new(60.0, -60.0), Vec2::new(60.0, 60.0), Vec2::new(-60.0, 60.0)] {
+            e.pointer_down(Button::Left, SIZE * 0.5 + p, SIZE, Mods::default());
+            e.pointer_up();
+        }
+        e.retopo_apply(2).unwrap();
+        assert_eq!(e.mode, Mode::Sculpt);
+        assert_eq!(e.sculptor.level_count(), 3);
+        for p in &e.sculptor.mesh.positions {
+            assert!((p.length() - 1.0).abs() < 0.01, "projected onto the sphere: {}", p.length());
+        }
+    }
+
+    #[test]
+    fn mannequin_mode_poses_by_dragging_joints() {
+        let mut e = Editor::new();
+        e.set_mode(Mode::Mannequin);
+        assert!(e.mannequin_shown());
+        e.view_from(ViewDir::Front);
+        let o = e.overlay(None, SIZE);
+        assert!(o.points.len() > 15);
+        let hand = e.mannequin.find("L hand").unwrap();
+        let hp = e.mannequin.world()[hand].0;
+        let sp = e.to_screen(hp, SIZE).unwrap();
+        drag(&mut e, sp, sp - Vec2::new(0.0, 150.0));
+        let moved = e.mannequin.world()[hand].0;
+        assert!(moved.y > hp.y + 0.1, "{hp:?} -> {moved:?}");
+        assert!(e.mannequin_shown());
+        e.mannequin_preset("Sit");
+        assert!(e.mannequin_shown());
     }
 }

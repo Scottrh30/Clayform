@@ -249,12 +249,17 @@ impl Bvh {
 impl Bvh {
     /// Closest point on the surface to `p`, if one lies within `max_dist`.
     pub fn closest_point(&self, mesh: &Mesh, p: Vec3, max_dist: f32) -> Option<Vec3> {
+        self.closest(mesh, p, max_dist).map(|c| c.0)
+    }
+
+    /// Closest surface point within `max_dist`, with its triangle.
+    pub fn closest(&self, mesh: &Mesh, p: Vec3, max_dist: f32) -> Option<(Vec3, u32)> {
         if self.nodes.is_empty() {
             return None;
         }
         let mut best_d2 = max_dist * max_dist;
         let mut best = None;
-        let test = |t: u32, best_d2: &mut f32, best: &mut Option<Vec3>| {
+        let test = |t: u32, best_d2: &mut f32, best: &mut Option<(Vec3, u32)>| {
             let [a, b, c] = mesh.tris[t as usize];
             if a == NONE {
                 return;
@@ -263,7 +268,7 @@ impl Bvh {
             let d2 = q.distance_squared(p);
             if d2 < *best_d2 {
                 *best_d2 = d2;
-                *best = Some(q);
+                *best = Some((q, t));
             }
         };
         for t in self.indexed.min(mesh.tris.len())..mesh.tris.len() {

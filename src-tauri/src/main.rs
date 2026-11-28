@@ -58,7 +58,7 @@ async fn run_job(
     Ok(Response::new(out))
 }
 
-/// Voxel remesh. Body: mesh (wire format). Headers: resolution, smooth, project.
+/// Voxel remesh. Body: mesh (wire format). Headers: resolution, smooth, project, signed.
 #[tauri::command]
 async fn remesh(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'_>) -> Result<Response, String> {
     let bytes = raw_body(&request)?;
@@ -67,6 +67,7 @@ async fn remesh(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'
         resolution: header(&request, "resolution").and_then(|v| v.parse().ok()).unwrap_or(defaults.resolution),
         smooth: header(&request, "smooth").and_then(|v| v.parse().ok()).unwrap_or(defaults.smooth),
         project: header(&request, "project").map_or(defaults.project, |v| v == "1"),
+        signed: header(&request, "signed").is_some_and(|v| v == "1"),
     };
     run_job(app, &jobs, move |progress| {
         let (mesh, _) = wire::decode(&bytes)?;

@@ -41,8 +41,17 @@ fn export_pos(mesh: &Mesh, p: Vec3) -> Vec3 {
 }
 
 pub fn parse_obj(src: &str) -> Result<Mesh, String> {
-    let mut positions: Vec<Vec3> = Vec::new();
-    let mut tris: Vec<[u32; 3]> = Vec::new();
+    // quads become partner pairs; "g" / "o" names become polygroups
+    let mut p = crate::poly::Polys {
+        pos: Vec::new(),
+        mask: Vec::new(),
+        faces: Vec::new(),
+        groups: Vec::new(),
+        export_center: Vec3::ZERO,
+        export_scale: 1.0,
+    };
+    let mut group_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut group = 0u32;
     for (ln, line) in src.lines().enumerate() {
         let line = line.trim();
         let mut it = line.split_whitespace();
@@ -55,30 +64,35 @@ pub fn parse_obj(src: &str) -> Result<Mesh, String> {
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| format!("Bad vertex on line {}", ln + 1))?;
                 }
-                positions.push(Vec3::from(c));
+                p.pos.push(Vec3::from(c));
+            }
+            Some("g") | Some("o") => {
+                let name = it.collect::<Vec<_>>().join(" ");
+                let next = group_ids.len() as u32;
+                group = *group_ids.entry(name).or_insert(next);
             }
             Some("f") => {
                 let mut poly: Vec<u32> = Vec::with_capacity(4);
                 for tok in it {
                     let first = tok.split('/').next().unwrap_or("");
                     let i: i64 = first.parse().map_err(|_| format!("Bad face on line {}", ln + 1))?;
-                    let idx = if i < 0 { positions.len() as i64 + i } else { i - 1 };
-                    if idx < 0 || idx as usize >= positions.len() {
+                    let idx = if i < 0 { p.pos.len() as i64 + i } else { i - 1 };
+                    if idx < 0 || idx as usize >= p.pos.len() {
                         return Err(format!("Face index out of range on line {}", ln + 1));
                     }
                     poly.push(idx as u32);
                 }
-                for k in 1..poly.len().saturating_sub(1) {
-                    let t = [poly[0], poly[k], poly[k + 1]];
-                    if t[0] != t[1] && t[1] != t[2] && t[0] != t[2] {
-                        tris.push(t);
-                    }
+                poly.dedup();
+                if poly.len() >= 3 {
+                    p.faces.push(poly);
+                    p.groups.push(group);
                 }
             }
             _ => {}
         }
     }
-    Ok(Mesh::new(positions, tris))
+    p.mask = vec![0.0; p.pos.len()];
+    Ok(p.to_mesh())
 }
 
 pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
@@ -114,6 +128,8 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
 }
 
 fn write_obj<W: Write>(mesh: &Mesh, w: &mut W) -> std::io::Result<()> {
+    // quads are written as quads, and each polygroup as its own "g" group
+    let (polys, _) = crate::poly::Polys::from_mesh(mesh);
     writeln!(w, "# Exported from Clayform")?;
     writeln!(w, "o sculpt")?;
     for p in &mesh.positions {
@@ -123,9 +139,20 @@ fn write_obj<W: Write>(mesh: &Mesh, w: &mut W) -> std::io::Result<()> {
     for n in &mesh.normals {
         writeln!(w, "vn {:.5} {:.5} {:.5}", n.x, n.y, n.z)?;
     }
-    for t in &mesh.tris {
-        let (a, b, c) = (t[0] + 1, t[1] + 1, t[2] + 1);
-        writeln!(w, "f {a}//{a} {b}//{b} {c}//{c}")?;
+    let mut order: Vec<usize> = (0..polys.faces.len()).collect();
+    order.sort_by_key(|&f| polys.groups[f]);
+    let several = polys.groups.iter().any(|&g| g != polys.groups[0]);
+    let mut current = u32::MAX;
+    for f in order {
+        if several && polys.groups[f] != current {
+            current = polys.groups[f];
+            writeln!(w, "g group{current}")?;
+        }
+        write!(w, "f")?;
+        for &v in &polys.faces[f] {
+            write!(w, " {}//{}", v + 1, v + 1)?;
+        }
+        writeln!(w)?;
     }
     Ok(())
 }
@@ -175,6 +202,23 @@ mod tests {
         assert_eq!(m.tris.len(), 80);
         assert!(load("ball.fbx", &bytes).is_err());
         assert!(String::from_utf8(save(&m, "obj")).unwrap().starts_with("# Exported from Clayform"));
+    }
+
+    #[test]
+    fn obj_keeps_quads_and_groups() {
+        let q = crate::poly::Polys::qcube(2).to_mesh();
+        let mut buf = Vec::new();
+        write_obj(&q, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text.lines().filter(|l| l.starts_with("f ")).count(), 24);
+        assert_eq!(text.lines().filter(|l| l.starts_with("g ")).count(), 6);
+        let back = parse_obj(&text).unwrap();
+        assert_eq!(back.tris.len(), 48);
+        assert!(back.partner.iter().all(|&p| p != crate::mesh::NONE));
+        let mut g = back.groups.clone();
+        g.sort_unstable();
+        g.dedup();
+        assert_eq!(g.len(), 6);
     }
 
     #[test]

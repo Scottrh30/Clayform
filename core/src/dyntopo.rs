@@ -23,8 +23,9 @@ pub fn split_edge(m: &mut Mesh, a: u32, b: u32, touched: &mut Vec<u32>) -> u32 {
         // orient so (x, y) is the edge in this face's winding order
         let i = (0..3).find(|&i| (t[i] == a && t[(i + 1) % 3] == b) || (t[i] == b && t[(i + 1) % 3] == a)).unwrap();
         let (x, y, c) = (t[i], t[(i + 1) % 3], t[(i + 2) % 3]);
+        let g = m.groups[f as usize];
         m.set_face(f, [x, nv, c]);
-        m.add_face([nv, y, c]);
+        m.add_face_in_group([nv, y, c], g);
         touched.push(c);
     }
     touched.extend([a, b, nv]);

@@ -6,10 +6,14 @@ pub mod camera;
 pub mod dyntopo;
 pub mod editor;
 pub mod io;
+pub mod mannequin;
 pub mod mesh;
+pub mod poly;
 pub mod project;
 pub mod remesh;
+pub mod retopo;
 pub mod sculpt;
+pub mod snapshot;
 pub mod symmetry;
 pub mod wire;
 

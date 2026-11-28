@@ -100,8 +100,52 @@ fn material(n: vec3<f32>, id: i32) -> vec3<f32> {
     }
 }
 
+struct GIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) nrm: vec3<f32>,
+    @location(2) mask: f32,
+    @location(3) cavity: f32,
+    @location(4) color: vec3<f32>,
+};
+
+struct GOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) vn: vec3<f32>,
+    @location(1) mask: f32,
+    @location(2) vpos: vec3<f32>,
+    @location(3) cavity: f32,
+    @location(4) color: vec3<f32>,
+};
+
+@vertex
+fn vs_group(v: GIn) -> GOut {
+    var o: GOut;
+    o.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
+    o.vn = (u.view * vec4<f32>(v.nrm, 0.0)).xyz;
+    o.vpos = (u.view * vec4<f32>(v.pos, 1.0)).xyz;
+    o.mask = v.mask;
+    o.cavity = v.cavity;
+    o.color = v.color;
+    return o;
+}
+
+@fragment
+fn fs_group(i: GOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    var v: VOut;
+    v.clip = i.clip;
+    v.vn = i.vn;
+    v.mask = i.mask;
+    v.vpos = i.vpos;
+    v.cavity = i.cavity;
+    return vec4<f32>(encode(shade(v, front, i.color, true)), 1.0);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return vec4<f32>(encode(shade(i, front, vec3<f32>(1.0), false)), 1.0);
+}
+
+fn shade(i: VOut, front: bool, tint: vec3<f32>, tinted: bool) -> vec3<f32> {
     var n = normalize(i.vn);
     if (u.params.z > 0.5) {
         n = normalize(cross(dpdx(i.vpos), dpdy(i.vpos)));
@@ -110,6 +154,9 @@ fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         n = -n;
     }
     var c = material(n, i32(u.params.x + 0.5));
+    if (tinted) {
+        c = studio(n, tint, 24.0, 0.12, tint, 0.2, 0.3);
+    }
     // cavity: darken creases, lift ridges
     let k = u.shading.z;
     if (k > 0.0) {
@@ -130,7 +177,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         let m = clamp(i.mask, 0.0, 1.0);
         c = mix(c, c * vec3<f32>(0.18, 0.2, 0.28), m * 0.85);
     }
-    return vec4<f32>(encode(c), 1.0);
+    return c;
 }
 
 // Surfaces without an sRGB format (some WebGL setups) need manual encoding.

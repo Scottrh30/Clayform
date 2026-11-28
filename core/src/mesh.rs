@@ -18,6 +18,10 @@ pub struct Mesh {
     pub normals: Vec<Vec3>,
     pub mask: Vec<f32>,
     pub tris: Vec<[u32; 3]>,
+    /// Polygroup of each triangle.
+    pub groups: Vec<u32>,
+    /// For triangles that are half of a quad, the other half (else NONE).
+    pub partner: Vec<u32>,
     pub face_normals: Vec<Vec3>,
     vf: Vec<Vec<u32>>,
     nbr: Vec<Vec<u32>>,
@@ -94,6 +98,8 @@ impl MeshBuilder {
                 normals: vec![Vec3::Y; n],
                 mask: vec![0.0; n],
                 face_normals: vec![Vec3::Y; nt],
+                groups: vec![0; nt],
+                partner: vec![NONE; nt],
                 positions,
                 tris,
                 vf: vec![Vec::new(); n],
@@ -117,6 +123,19 @@ impl MeshBuilder {
         }
         self.mesh.export_center = center;
         self.mesh.export_scale = scale;
+        self
+    }
+
+    /// Sets per-triangle polygroups and quad partners (ignored if the
+    /// lengths don't match the triangles).
+    pub fn with_faces(mut self, groups: Option<Vec<u32>>, partner: Option<Vec<u32>>) -> Self {
+        let nt = self.mesh.tris.len();
+        if let Some(g) = groups.filter(|g| g.len() == nt) {
+            self.mesh.groups = g;
+        }
+        if let Some(p) = partner.filter(|p| p.len() == nt && p.iter().all(|&x| x == NONE || (x as usize) < nt)) {
+            self.mesh.partner = p;
+        }
         self
     }
 
@@ -313,8 +332,15 @@ impl Mesh {
 
     /// Appends a face and registers it with its vertices; returns its index.
     pub fn add_face(&mut self, t: [u32; 3]) -> u32 {
+        self.add_face_in_group(t, 0)
+    }
+
+    /// Appends a face in polygroup `g`.
+    pub fn add_face_in_group(&mut self, t: [u32; 3], g: u32) -> u32 {
         let f = self.tris.len() as u32;
         self.tris.push(t);
+        self.groups.push(g);
+        self.partner.push(NONE);
         self.face_normals.push(Vec3::ZERO);
         for &v in &t {
             self.vf[v as usize].push(f);
@@ -322,8 +348,18 @@ impl Mesh {
         f
     }
 
+    /// A face whose corners change is no longer half of a quad.
+    fn unpair(&mut self, f: u32) {
+        let p = self.partner[f as usize];
+        if p != NONE {
+            self.partner[p as usize] = NONE;
+            self.partner[f as usize] = NONE;
+        }
+    }
+
     /// Replaces the corners of a live face, keeping vertex→face lists right.
     pub fn set_face(&mut self, f: u32, t: [u32; 3]) {
+        self.unpair(f);
         let old = self.tris[f as usize];
         for &v in &old {
             if !t.contains(&v) {
@@ -344,6 +380,7 @@ impl Mesh {
         if old[0] == NONE {
             return;
         }
+        self.unpair(f);
         for &v in &old {
             self.vf[v as usize].retain(|&x| x != f);
         }
@@ -370,14 +407,25 @@ impl Mesh {
                 }
             }
         }
-        let tris: Vec<[u32; 3]> = self
-            .tris
-            .iter()
-            .filter(|t| t[0] != NONE)
-            .map(|t| [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]])
+        let mut face_remap = vec![NONE; self.tris.len()];
+        let mut tris = Vec::with_capacity(self.tris.len());
+        let mut groups = Vec::with_capacity(self.tris.len());
+        for (f, t) in self.tris.iter().enumerate() {
+            if t[0] != NONE {
+                face_remap[f] = tris.len() as u32;
+                tris.push([remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]]);
+                groups.push(self.groups[f]);
+            }
+        }
+        let partner: Vec<u32> = (0..self.tris.len())
+            .filter(|&f| self.tris[f][0] != NONE)
+            .map(|f| {
+                let p = self.partner[f];
+                if p == NONE { NONE } else { face_remap[p as usize] }
+            })
             .collect();
         let (c, s) = (self.export_center, self.export_scale);
-        *self = Mesh::new(positions, tris);
+        *self = MeshBuilder::new(positions, tris).with_faces(Some(groups), Some(partner)).finish();
         self.mask = mask;
         self.export_center = c;
         self.export_scale = s;
@@ -556,6 +604,7 @@ impl Mesh {
         let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(self.tris.len() * 3 / 2);
         let mut odd: Vec<[u32; 4]> = Vec::with_capacity(self.tris.len() * 3 / 2);
         let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
+        let mut new_groups: Vec<u32> = Vec::with_capacity(self.tris.len() * 4);
         for (ti, t) in self.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
             if ti % 16384 == 0 && !progress(0.6 * ti as f32 / total as f32) {
                 return Err(());
@@ -578,6 +627,8 @@ impl Mesh {
             }
             let [a, b, c] = *t;
             let [ab, bc, ca] = mids;
+            let g = self.groups[ti];
+            new_groups.extend([g; 4]);
             new_tris.push([a, ab, ca]);
             new_tris.push([ab, b, bc]);
             new_tris.push([ca, bc, c]);
@@ -595,7 +646,7 @@ impl Mesh {
         if !progress(0.7) {
             return Err(());
         }
-        let mut out = Mesh::new(positions, new_tris);
+        let mut out = MeshBuilder::new(positions, new_tris).with_faces(Some(new_groups), None).finish();
         out.mask = mask;
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;

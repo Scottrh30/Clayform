@@ -143,3 +143,28 @@ button, select, input { font: inherit; color: inherit; }
 .doc-name { align-self: center; color: var(--dim); padding-right: 10px; margin-right: 4px; border-right: 1px solid var(--line); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .doc-name .dirty { color: var(--accent); }
 .segmented.toggles button { min-width: 34px; }
+
+/* ---- modes & tool overlays */
+.modebar { padding: 8px 10px 2px; border-bottom: 1px solid var(--line); }
+.segmented.modes { width: 100%; }
+.segmented.modes button { flex: 1; padding-left: 2px; padding-right: 2px; font-size: 11.5px; }
+.mode-overlay line { stroke-width: 1.6; }
+.mode-overlay .ov-target { stroke: #ffb25a; stroke-width: 2; }
+.mode-overlay .ov-pending { stroke: #5ad7ff; stroke-width: 2.2; stroke-dasharray: 5 3; }
+.mode-overlay .ov-active { stroke: #fff; fill: #ffd25a; stroke-width: 2.4; }
+.mode-overlay .ov-mesh { stroke: #6fe39a; fill: #6fe39a; }
+.mode-overlay .ov-building { stroke: #ffe07a; fill: #ffe07a; stroke-dasharray: 4 3; }
+.mode-overlay .ov-joint { stroke: #8fc3ff; fill: #2b6fd6; stroke-width: 1.5; }
+.mode-overlay .ov-curve { stroke: #ff965a; stroke-width: 2; }
+.mode-overlay .ov-face { fill: rgba(111, 227, 154, 0.16); stroke: none; }
+.snap-thumb img { max-width: 100%; max-height: 120px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+.ref-item { border-top: 1px solid var(--line); padding: 4px 0; }
+.ref-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+button.mini { background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; color: var(--dim); }
+button.mini.on { color: #fff; border-color: var(--accent-2); }
+.refs { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.ref-image { position: absolute; pointer-events: auto; cursor: move; outline: 1px dashed rgba(255,255,255,0.35); }
+.ref-image img { display: block; width: 100%; height: auto; pointer-events: none; user-select: none; }
+.ref-image.locked { pointer-events: none; outline: none; }
+.ref-resize { position: absolute; right: -6px; bottom: -6px; width: 14px; height: 14px; background: var(--accent-2); border-radius: 3px; cursor: nwse-resize; }
+.ref-image.locked .ref-resize { display: none; }

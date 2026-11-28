@@ -24,11 +24,14 @@ pub struct VoxelSettings {
     pub smooth: u32,
     /// Snap the new vertices back onto the original surface.
     pub project: bool,
+    /// Respect face orientation: parts turned inside out are cut away
+    /// (boolean subtract) instead of merged.
+    pub signed: bool,
 }
 
 impl Default for VoxelSettings {
     fn default() -> Self {
-        Self { resolution: 128, smooth: 1, project: true }
+        Self { resolution: 128, smooth: 1, project: true, signed: false }
     }
 }
 
@@ -219,7 +222,8 @@ pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut
                         w += col[ci].1 as i32;
                         ci += 1;
                     }
-                    if w != 0 {
+                    // (crossings into an outward-facing surface count -1)
+                    if if s.signed { w < 0 } else { w != 0 } {
                         inside.insert(grid.key(i, j, k), ());
                     }
                     if ci == col.len() {
@@ -402,7 +406,7 @@ mod tests {
     #[test]
     fn sphere_remesh_is_closed_round_and_outward() {
         let src = Mesh::icosphere(4);
-        let m = voxel_remesh(&src, &VoxelSettings { resolution: 48, smooth: 1, project: true }).unwrap();
+        let m = voxel_remesh(&src, &VoxelSettings { resolution: 48, smooth: 1, project: true, signed: false }).unwrap();
         let (edges, bad) = edge_counts(&m);
         assert!(edges > 1000);
         assert!(bad * 1000 < edges, "{bad} non-manifold edges of {edges}");
@@ -415,8 +419,8 @@ mod tests {
     #[test]
     fn resolution_controls_density() {
         let src = Mesh::icosphere(4);
-        let lo = voxel_remesh(&src, &VoxelSettings { resolution: 32, smooth: 0, project: false }).unwrap();
-        let hi = voxel_remesh(&src, &VoxelSettings { resolution: 64, smooth: 0, project: false }).unwrap();
+        let lo = voxel_remesh(&src, &VoxelSettings { resolution: 32, smooth: 0, project: false, signed: false }).unwrap();
+        let hi = voxel_remesh(&src, &VoxelSettings { resolution: 64, smooth: 0, project: false, signed: false }).unwrap();
         let ratio = hi.tris.len() as f32 / lo.tris.len() as f32;
         assert!((3.0..5.0).contains(&ratio), "{ratio}");
     }
@@ -425,7 +429,7 @@ mod tests {
     fn overlapping_parts_merge_into_one_surface() {
         let s = Mesh::icosphere(4);
         let two = merged(&s, &s, Vec3::new(1.0, 0.0, 0.0));
-        let m = voxel_remesh(&two, &VoxelSettings { resolution: 64, smooth: 1, project: true }).unwrap();
+        let m = voxel_remesh(&two, &VoxelSettings { resolution: 64, smooth: 1, project: true, signed: false }).unwrap();
         let (a, b) = (Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0));
         for p in &m.positions {
             // every vertex lies on the outside of the union, none buried inside
@@ -456,9 +460,22 @@ mod tests {
     }
 
     #[test]
+    fn signed_mode_subtracts_inverted_parts() {
+        let a = Mesh::icosphere(3);
+        let mut b = Mesh::icosphere(3);
+        for t in &mut b.tris {
+            t.swap(1, 2);
+        }
+        let two = merged(&a, &b, Vec3::new(1.0, 0.0, 0.0));
+        let m = voxel_remesh(&two, &VoxelSettings { resolution: 48, smooth: 0, project: false, signed: true }).unwrap();
+        let (mn, mx) = m.bounds();
+        assert!(mx.x < 0.55 && mn.x < -0.9, "the cutter takes a bite and adds nothing: {mn:?} {mx:?}");
+    }
+
+    #[test]
     fn open_plane_becomes_closed_shell() {
         let src = Mesh::plane(3);
-        let m = voxel_remesh(&src, &VoxelSettings { resolution: 32, smooth: 0, project: false }).unwrap();
+        let m = voxel_remesh(&src, &VoxelSettings { resolution: 32, smooth: 0, project: false, signed: false }).unwrap();
         assert!(m.boundary.iter().all(|b| !b), "shell should have no open edges");
         let (mn, mx) = m.bounds();
         assert!(mx.y - mn.y < 0.2 && mx.x - mn.x > 1.8);

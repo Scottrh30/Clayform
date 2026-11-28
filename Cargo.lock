@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "clayform"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "clayform-core",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "clayform-app"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "clayform-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "glam",
 ]

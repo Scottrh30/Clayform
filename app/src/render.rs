@@ -43,6 +43,36 @@ fn cavity(mesh: &Mesh, i: usize) -> f32 {
     if l <= 0.0 { 0.0 } else { mesh.normals[i].dot(avg / k - p) / l }
 }
 
+/// Vertex of the expanded (one per triangle corner) polygroup view.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GroupVertex {
+    pos: [f32; 3],
+    nrm: [f32; 3],
+    mask: f32,
+    cavity: f32,
+    color: [f32; 3],
+}
+
+/// A distinct, stable colour for polygroup `g` (golden-ratio hues).
+pub fn group_color(g: u32) -> [f32; 3] {
+    let h = (g as f32 * 0.618_034 + 0.12).fract() * 6.0;
+    let (s, v) = (0.55 + 0.25 * ((g / 7) % 2) as f32, 0.95 - 0.2 * ((g / 3) % 2) as f32);
+    let c = v * s;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let (r, gg, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    // to linear
+    [(r + m).powf(2.2), (gg + m).powf(2.2), (b + m).powf(2.2)]
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
@@ -71,6 +101,8 @@ pub struct ViewSettings {
     /// Cavity shading (darken creases, lighten ridges).
     pub cavity: bool,
     pub cavity_strength: f32,
+    /// Colour faces by polygroup.
+    pub polygroups: bool,
 }
 
 /// Background presets: (name, top colour, bottom colour), linear RGB.
@@ -107,6 +139,10 @@ pub struct Renderer {
     srgb_surface: bool,
     mesh_pipe: wgpu::RenderPipeline,
     wire_pipe: wgpu::RenderPipeline,
+    group_pipe: wgpu::RenderPipeline,
+    gbuf: Option<wgpu::Buffer>,
+    group_count: u32,
+    groups_stale: bool,
     bg_pipe: wgpu::RenderPipeline,
     depth_pipe: wgpu::RenderPipeline,
     ssao_pipe: wgpu::RenderPipeline,
@@ -128,6 +164,17 @@ pub struct Renderer {
     index_staging: Vec<u32>,
     targets: Option<Targets>,
     pub adapter_name: String,
+}
+
+fn group_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+        0 => Float32x3, 1 => Float32x3, 2 => Float32, 3 => Float32, 4 => Float32x3
+    ];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GroupVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &ATTRS,
+    }
 }
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -395,6 +442,17 @@ impl Renderer {
             Default::default(),
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
+        let group_pipe = make(
+            "polygroups",
+            "vs_group",
+            "fs_group",
+            &[group_layout()],
+            wgpu::PrimitiveTopology::TriangleList,
+            true,
+            wgpu::CompareFunction::Less,
+            wgpu::DepthBiasState { constant: 2, slope_scale: 1.0, clamp: 0.0 },
+            None,
+        );
         let bg_pipe = make(
             "background",
             "vs_bg",
@@ -416,6 +474,10 @@ impl Renderer {
             queue,
             mesh_pipe,
             wire_pipe,
+            group_pipe,
+            gbuf: None,
+            group_count: 0,
+            groups_stale: true,
             bg_pipe,
             depth_pipe,
             ssao_pipe,
@@ -542,7 +604,10 @@ impl Renderer {
     }
 
     /// Uploads whatever changed in the mesh since the last frame.
-    pub fn sync_mesh(&mut self, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool) {
+    pub fn sync_mesh(&mut self, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool, need_groups: bool) {
+        if dirty.topology || dirty.range.is_some() {
+            self.groups_stale = true;
+        }
         let n = mesh.positions.len();
         let to_gpu = |i: usize| GpuVertex {
             pos: mesh.positions[i].to_array(),
@@ -600,9 +665,15 @@ impl Renderer {
         if need_edges && self.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);
             let mut edges: Vec<u32> = Vec::with_capacity(mesh.tris.len() * 3);
-            for t in mesh.tris.iter().filter(|t| t[0] != NONE) {
+            for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
+                // the diagonal shared with a quad partner isn't drawn
+                let p = mesh.partner.get(f).copied().unwrap_or(NONE);
+                let pt = if p != NONE { mesh.tris[p as usize] } else { [NONE; 3] };
                 for k in 0..3 {
                     let (a, b) = (t[k], t[(k + 1) % 3]);
+                    if p != NONE && pt.contains(&a) && pt.contains(&b) {
+                        continue;
+                    }
                     if seen.insert((a.min(b), a.max(b))) {
                         edges.push(a);
                         edges.push(b);
@@ -619,6 +690,30 @@ impl Renderer {
             self.ebuf = Some(ebuf);
             self.edge_count = edges.len() as u32;
             self.edges_stale = false;
+        }
+        if need_groups && self.groups_stale {
+            let mut verts: Vec<GroupVertex> = Vec::with_capacity(mesh.tris.len() * 3);
+            for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
+                let color = group_color(mesh.groups.get(f).copied().unwrap_or(0));
+                for &v in t {
+                    let g = &self.staging[v as usize];
+                    verts.push(GroupVertex { pos: g.pos, nrm: g.nrm, mask: g.mask, cavity: g.cavity, color });
+                }
+            }
+            let bytes = (verts.len().max(1) * std::mem::size_of::<GroupVertex>()) as u64;
+            if self.gbuf.as_ref().is_none_or(|b| b.size() < bytes) {
+                self.gbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("polygroup vertices"),
+                    size: bytes + bytes / 4,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if !verts.is_empty() {
+                self.queue.write_buffer(self.gbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
+            }
+            self.group_count = verts.len() as u32;
+            self.groups_stale = false;
         }
     }
 
@@ -725,10 +820,20 @@ impl Renderer {
             pass.set_pipeline(&self.bg_pipe);
             pass.draw(0..3, 0..1);
             if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {
+                match (&self.gbuf, s.polygroups) {
+                    (Some(gb), true) => {
+                        pass.set_vertex_buffer(0, gb.slice(..));
+                        pass.set_pipeline(&self.group_pipe);
+                        pass.draw(0..self.group_count, 0..1);
+                    }
+                    _ => {
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_pipeline(&self.mesh_pipe);
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..self.index_count, 0, 0..1);
+                    }
+                }
                 pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_pipeline(&self.mesh_pipe);
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
                 if s.wireframe {
                     if let Some(eb) = &self.ebuf {
                         pass.set_pipeline(&self.wire_pipe);

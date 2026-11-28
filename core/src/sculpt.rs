@@ -3,7 +3,7 @@
 use crate::bvh::{Bvh, Hit};
 use crate::dyntopo::remesh_region;
 use crate::mesh::{Marker, Mesh};
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Quat, Vec2, Vec3};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -23,10 +23,61 @@ pub enum Tool {
     Snakehook,
     Nudge,
     Mask,
+    ClayTubes,
+    Blob,
+    Magnify,
+    Planar,
+    TrimFront,
+    Polish,
+    HPolish,
+    MPolish,
+    SmoothValleys,
+    SmoothPeaks,
+    SmoothStronger,
+    Move,
+    MoveElastic,
+    MoveInfiniteDepth,
+    Rake,
+    Slash,
+    CurveSnakehook,
+    Anchors,
+    ClothPull,
+    ClothTwist,
+    ClothInflate,
+    GroupPaint,
 }
 
+/// What the Anchors brush does while dragging.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnchorMode {
+    Move,
+    Rotate,
+    Scale,
+    Inflate,
+    Twist,
+    Bend,
+}
+
+impl AnchorMode {
+    pub const ALL: [AnchorMode; 6] =
+        [AnchorMode::Move, AnchorMode::Rotate, AnchorMode::Scale, AnchorMode::Inflate, AnchorMode::Twist, AnchorMode::Bend];
+    pub fn name(self) -> &'static str {
+        match self {
+            AnchorMode::Move => "Move",
+            AnchorMode::Rotate => "Rotate",
+            AnchorMode::Scale => "Scale",
+            AnchorMode::Inflate => "Inflate",
+            AnchorMode::Twist => "Twist",
+            AnchorMode::Bend => "Bend",
+        }
+    }
+}
+
+/// Groups for the brush menu.
+pub const TOOL_CATEGORIES: [&str; 6] = ["Sculpt", "Smooth & polish", "Move", "Cloth", "Mask & groups", "Curves"];
+
 impl Tool {
-    pub const ALL: [Tool; 16] = [
+    pub const ALL: [Tool; 38] = [
         Tool::Draw,
         Tool::Clay,
         Tool::ClayBuildup,
@@ -43,7 +94,50 @@ impl Tool {
         Tool::Snakehook,
         Tool::Nudge,
         Tool::Mask,
+        Tool::ClayTubes,
+        Tool::Blob,
+        Tool::Magnify,
+        Tool::Planar,
+        Tool::TrimFront,
+        Tool::Polish,
+        Tool::HPolish,
+        Tool::MPolish,
+        Tool::SmoothValleys,
+        Tool::SmoothPeaks,
+        Tool::SmoothStronger,
+        Tool::Move,
+        Tool::MoveElastic,
+        Tool::MoveInfiniteDepth,
+        Tool::Rake,
+        Tool::Slash,
+        Tool::CurveSnakehook,
+        Tool::Anchors,
+        Tool::ClothPull,
+        Tool::ClothTwist,
+        Tool::ClothInflate,
+        Tool::GroupPaint,
     ];
+
+    /// Index into `TOOL_CATEGORIES`.
+    pub fn category(self) -> usize {
+        use Tool::*;
+        match self {
+            Smooth | Polish | HPolish | MPolish | SmoothValleys | SmoothPeaks | SmoothStronger => 1,
+            Grab | Move | MoveElastic | MoveInfiniteDepth | Snakehook | Nudge | Anchors => 2,
+            ClothPull | ClothTwist | ClothInflate => 3,
+            Mask | GroupPaint => 4,
+            CurveSnakehook => 5,
+            _ => 0,
+        }
+    }
+
+    /// Brushes that drag a region picked when the stroke starts.
+    pub fn is_drag(self) -> bool {
+        matches!(
+            self,
+            Tool::Grab | Tool::Move | Tool::MoveElastic | Tool::MoveInfiniteDepth | Tool::Anchors | Tool::ClothPull | Tool::ClothTwist
+        )
+    }
 
     pub fn index(self) -> usize {
         Tool::ALL.iter().position(|t| *t == self).unwrap()
@@ -63,11 +157,39 @@ impl Tool {
             Tool::Crease => "Crease",
             Tool::DamStandard => "Dam Standard",
             Tool::Layer => "Layer",
-            Tool::Grab => "Grab",
+            Tool::Grab => "Move Topological",
             Tool::Snakehook => "Snakehook",
             Tool::Nudge => "Nudge",
             Tool::Mask => "Mask",
+            Tool::ClayTubes => "Clay Tubes",
+            Tool::Blob => "Blob",
+            Tool::Magnify => "Magnify",
+            Tool::Planar => "Planar",
+            Tool::TrimFront => "Trim Front",
+            Tool::Polish => "Polish",
+            Tool::HPolish => "hPolish",
+            Tool::MPolish => "mPolish",
+            Tool::SmoothValleys => "Smooth Valleys",
+            Tool::SmoothPeaks => "Smooth Peaks",
+            Tool::SmoothStronger => "Smooth Stronger",
+            Tool::Move => "Move",
+            Tool::MoveElastic => "Move Elastic",
+            Tool::MoveInfiniteDepth => "Move Infinite Depth",
+            Tool::Rake => "Rake",
+            Tool::Slash => "Slash",
+            Tool::CurveSnakehook => "Curve Snakehook",
+            Tool::Anchors => "Anchors",
+            Tool::ClothPull => "Cloth Pull",
+            Tool::ClothTwist => "Cloth Twist",
+            Tool::ClothInflate => "Cloth Inflate",
+            Tool::GroupPaint => "Polygroup Paint",
         }
+    }
+
+    /// Keyboard shortcut, if the brush has one.
+    pub fn key(self) -> Option<char> {
+        let c = self.shortcut();
+        (c != ' ').then_some(c)
     }
 
     pub fn shortcut(self) -> char {
@@ -88,6 +210,10 @@ impl Tool {
             Tool::Snakehook => 'K',
             Tool::Nudge => 'U',
             Tool::Mask => 'M',
+            Tool::Move => 'J',
+            Tool::ClayTubes => 'H',
+            Tool::Polish => 'O',
+            _ => ' ',
         }
     }
 
@@ -106,10 +232,32 @@ impl Tool {
             Tool::Crease => "Cuts a soft groove and pinches its edges",
             Tool::DamStandard => "Cuts a sharp, deep crease line (wrinkles, seams)",
             Tool::Layer => "Raises the surface to a fixed height per stroke",
-            Tool::Grab => "Drags a region of the surface",
+            Tool::Grab => "Drags the connected surface under the brush (Grab)",
             Tool::Snakehook => "Pulls out horns and tentacles (best with dynamic topology)",
             Tool::Nudge => "Smears the surface sideways along the stroke",
             Tool::Mask => "Paints a mask that protects the surface; Ctrl erases",
+            Tool::ClayTubes => "Square-ended clay strokes that follow the brush direction",
+            Tool::Blob => "Bulbous, rounded build-up along the surface normals",
+            Tool::Magnify => "Spreads the surface away from the brush centre; Ctrl shrinks",
+            Tool::Planar => "Flattens to the height where the stroke started, cutting and filling",
+            Tool::TrimFront => "Cuts the surface flat, facing the camera",
+            Tool::Polish => "Smooths and flattens together for clean, polished forms",
+            Tool::HPolish => "Hard polish: crisp planes, cutting peaks and filling dips",
+            Tool::MPolish => "Metal polish: flattens surfaces while keeping their edges sharp",
+            Tool::SmoothValleys => "Smooths only the low spots, filling creases",
+            Tool::SmoothPeaks => "Smooths only the high spots, softening ridges",
+            Tool::SmoothStronger => "Several smoothing passes per dab for heavy cleanup",
+            Tool::Move => "Drags everything inside the brush sphere, connected or not",
+            Tool::MoveElastic => "Drags with a long, rubbery falloff that keeps the shape's volume",
+            Tool::MoveInfiniteDepth => "Drags everything under the cursor, through the whole model",
+            Tool::Rake => "Combs parallel grooves along the stroke",
+            Tool::Slash => "Carves very sharp, narrow cuts",
+            Tool::CurveSnakehook => "Draw a curve, release to pull a tapered horn along it",
+            Tool::Anchors => "Drag to move, rotate, scale, inflate, twist or bend the region",
+            Tool::ClothPull => "Drags the surface like fabric, folding instead of stretching",
+            Tool::ClothTwist => "Twists the surface like fabric, gathering it into folds",
+            Tool::ClothInflate => "Puffs the surface out like cloth, wrinkling at the edges",
+            Tool::GroupPaint => "Paints a new polygroup onto the faces under the brush",
         }
     }
 
@@ -123,18 +271,33 @@ impl Tool {
             Tool::Nudge => 0.6,
             Tool::ClayBuildup => 0.5,
             Tool::DamStandard => 0.45,
+            Tool::Move | Tool::MoveElastic | Tool::MoveInfiniteDepth | Tool::Anchors | Tool::ClothPull | Tool::ClothTwist => 1.0,
+            Tool::CurveSnakehook | Tool::GroupPaint => 1.0,
+            Tool::Polish | Tool::HPolish | Tool::MPolish | Tool::SmoothValleys | Tool::SmoothPeaks | Tool::SmoothStronger => 0.6,
+            Tool::Planar | Tool::TrimFront => 0.5,
             _ => 0.4,
         }
     }
 
     /// Whether Ctrl / the negative toggle has a meaning for this tool.
     pub fn has_negative(self) -> bool {
-        !matches!(self, Tool::Smooth | Tool::Flatten | Tool::Grab | Tool::Snakehook | Tool::Nudge | Tool::TrimDynamic)
+        use Tool::*;
+        !self.is_drag()
+            && !matches!(
+                self,
+                Smooth | Flatten | Snakehook | Nudge | TrimDynamic | Planar | TrimFront | Polish | HPolish | MPolish
+                    | SmoothValleys | SmoothPeaks | SmoothStronger | CurveSnakehook | GroupPaint
+            )
+    }
+
+    /// Smoothing-type brushes (dynamic topology may coarsen with these).
+    pub fn is_smooth(self) -> bool {
+        self.category() == 1
     }
 
     /// Brushes that move geometry along the stroke instead of the normal.
     pub fn uses_motion(self) -> bool {
-        matches!(self, Tool::Snakehook | Tool::Nudge)
+        matches!(self, Tool::Snakehook | Tool::Nudge | Tool::ClayTubes | Tool::Rake | Tool::CurveSnakehook)
     }
 }
 
@@ -150,6 +313,63 @@ pub struct DabParams {
     /// How far (world units, in the view plane) the brush moved since the
     /// previous dab. Used by Snakehook and Nudge.
     pub motion: Vec3,
+    /// Direction the camera looks (Trim Front).
+    pub view: Vec3,
+    /// Polygroup the Polygroup Paint brush paints.
+    pub group: u32,
+}
+
+impl Default for DabParams {
+    fn default() -> Self {
+        Self {
+            tool: Tool::Draw,
+            center: Vec3::ZERO,
+            radius: 0.1,
+            intensity: 0.5,
+            negative: false,
+            seed_tri: 0,
+            detail: None,
+            motion: Vec3::ZERO,
+            view: Vec3::NEG_Z,
+            group: 0,
+        }
+    }
+}
+
+/// How a dragging brush picks its region when the stroke starts.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Gather {
+    /// Connected surface inside the brush sphere.
+    Topological,
+    /// Everything inside the brush sphere.
+    Spatial,
+    /// Everything within three radii, with a long soft falloff.
+    Elastic,
+    /// Everything within the brush radius of the line through the centre
+    /// along this direction (the view).
+    Depth(Vec3),
+}
+
+/// What a dragging brush does with its region.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DragKind {
+    Move,
+    Anchor(AnchorMode),
+    ClothPull,
+    ClothTwist,
+}
+
+/// Pointer state for a dragging brush.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DragInput {
+    /// World-space movement in the drag plane since the stroke started.
+    pub delta: Vec3,
+    /// Screen movement since the stroke started, in points (y down).
+    pub screen: Vec2,
+    /// Direction the camera looks.
+    pub view: Vec3,
+    /// World units per screen point at the stroke start.
+    pub wpp: f32,
 }
 
 /// One multiresolution level. The active level's mesh lives in
@@ -187,6 +407,8 @@ enum Undo {
     DropTop { then_level: usize },
     /// Put a removed top level back (redoes a subdivision).
     AddTop { level: Box<Level>, then_level: usize },
+    /// Polygroups of these faces.
+    Groups { faces: Vec<u32>, groups: Vec<u32> },
 }
 
 impl Undo {
@@ -194,6 +416,7 @@ impl Undo {
         match self {
             Undo::Verts { idx, .. } => idx.len() * 20,
             Undo::Level(_) | Undo::DropTop { .. } => 16,
+            Undo::Groups { faces, .. } => faces.len() * 8,
             Undo::AddTop { level, .. } => {
                 level.mesh.as_ref().map_or(0, mesh_bytes) + level.odd.len() * 16 + level.details.len() * 12
             }
@@ -234,6 +457,14 @@ struct GrabSet {
     /// Linear part of the symmetry copy this set belongs to (identity for
     /// the original); the drag delta is transformed by it.
     xf: Mat3,
+    kind: DragKind,
+    center: Vec3,
+    normal: Vec3,
+    /// Vertex normals at the start (Anchors inflate).
+    nrm: Vec<Vec3>,
+    /// Cloth: per-vertex inverse mass and edges (local indices, rest length).
+    inv_mass: Vec<f32>,
+    edges: Vec<(u32, u32, f32)>,
 }
 
 struct Stroke {
@@ -247,6 +478,11 @@ struct Stroke {
     modified: bool,
     /// Layer brush: each vertex's position when the stroke first reached it.
     layer_base: std::collections::HashMap<u32, Vec3>,
+    /// Planar brush: the plane found by the first dab.
+    plane: Option<(Vec3, Vec3)>,
+    /// Polygroup paint: faces' groups before the stroke.
+    group_old: Vec<(u32, u32)>,
+    group_seen: std::collections::HashSet<u32>,
 }
 
 impl Stroke {
@@ -651,6 +887,21 @@ impl Sculptor {
         }
     }
 
+    /// The live face closest to `p`.
+    pub fn nearest_face(&self, p: Vec3) -> Option<u32> {
+        self.bvh.closest(&self.mesh, p, f32::MAX).map(|c| c.1)
+    }
+
+    /// Closest point on the surface within `reach`, with its face.
+    pub fn closest_face(&self, p: Vec3, reach: f32) -> Option<(Vec3, u32)> {
+        self.bvh.closest(&self.mesh, p, reach)
+    }
+
+    /// Closest point on the surface within `reach`.
+    pub fn closest_point(&self, p: Vec3, reach: f32) -> Option<Vec3> {
+        self.bvh.closest_point(&self.mesh, p, reach)
+    }
+
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<Hit> {
         self.bvh.raycast(&self.mesh, origin, dir)
     }
@@ -670,6 +921,9 @@ impl Sculptor {
             snapshot,
             modified: false,
             layer_base: std::collections::HashMap::new(),
+            plane: None,
+            group_old: Vec::new(),
+            group_seen: std::collections::HashSet::new(),
         });
     }
 
@@ -684,6 +938,92 @@ impl Sculptor {
                 }
             } else if !st.touched.is_empty() {
                 self.push_undo(Undo::Verts { idx: st.touched, pos: st.old_pos, mask: st.old_mask });
+            } else if !st.group_old.is_empty() {
+                let (faces, groups) = st.group_old.into_iter().unzip();
+                self.push_undo(Undo::Groups { faces, groups });
+            }
+        }
+    }
+
+    /// Replaces the polygroups (undoable).
+    pub fn set_groups(&mut self, groups: Vec<u32>) {
+        self.end_stroke();
+        if groups.len() != self.mesh.tris.len() {
+            return;
+        }
+        let old = std::mem::replace(&mut self.mesh.groups, groups);
+        let faces = (0..old.len() as u32).collect();
+        self.push_undo(Undo::Groups { faces, groups: old });
+        self.dirty.topology = true;
+    }
+
+    /// Replaces the mesh without adding an undo step (live previews; the
+    /// change that started the preview is the undo step).
+    pub fn replace_mesh_preview(&mut self, mesh: Mesh) {
+        self.end_stroke();
+        self.mesh = mesh;
+        self.revision += 1;
+        self.topology_changed();
+    }
+
+    /// The mesh one undo step back, if that step replaced the whole mesh.
+    pub fn mesh_before_last_change(&self) -> Option<&Mesh> {
+        match self.undo.last() {
+            Some(Undo::State(s)) => Some(&s.mesh),
+            _ => None,
+        }
+    }
+
+    fn laplacian(mesh: &Mesh, v: u32) -> Vec3 {
+        let p0 = mesh.positions[v as usize];
+        let mut sum = Vec3::ZERO;
+        let mut c = 0.0;
+        let boundary = mesh.boundary[v as usize];
+        for &u in mesh.neighbors(v) {
+            if boundary && !mesh.boundary[u as usize] {
+                continue;
+            }
+            sum += mesh.positions[u as usize];
+            c += 1.0;
+        }
+        if c > 0.0 { sum / c } else { p0 }
+    }
+
+    /// Edges among a set of vertices (local indices) with their lengths.
+    fn local_edges(&self, verts: &[u32]) -> Vec<(u32, u32, f32)> {
+        let local: std::collections::HashMap<u32, u32> =
+            verts.iter().enumerate().map(|(i, &v)| (v, i as u32)).collect();
+        let mut edges = Vec::new();
+        for (i, &v) in verts.iter().enumerate() {
+            for &u in self.mesh.neighbors(v) {
+                if u > v {
+                    if let Some(&j) = local.get(&u) {
+                        let l = self.mesh.positions[v as usize].distance(self.mesh.positions[u as usize]);
+                        edges.push((i as u32, j, l));
+                    }
+                }
+            }
+        }
+        edges
+    }
+
+    fn relax_cloth(x: &mut [Vec3], inv: &[f32], edges: &[(u32, u32, f32)], iterations: usize, stiffness: f32) {
+        for _ in 0..iterations {
+            for &(a, b, rest) in edges {
+                let (a, b) = (a as usize, b as usize);
+                let (wa, wb) = (inv[a], inv[b]);
+                let ws = wa + wb;
+                if ws <= 0.0 {
+                    continue;
+                }
+                let d = x[b] - x[a];
+                let len = d.length();
+                if len < 1e-12 {
+                    continue;
+                }
+                let corr = d * ((len - rest) / len / ws * stiffness);
+                x[a] += corr * wa;
+                x[b] -= corr * wb;
             }
         }
     }
@@ -749,18 +1089,22 @@ impl Sculptor {
     }
 
     pub fn dab(&mut self, p: &DabParams) {
-        if p.tool == Tool::Grab {
+        if p.tool.is_drag() {
             return;
         }
         let mut seed = p.seed_tri;
         if let Some(detail) = p.detail {
             let dynamic_stroke = self.stroke.as_ref().is_some_and(|s| s.snapshot.is_some());
-            if p.tool != Tool::Mask && dynamic_stroke {
+            if p.tool != Tool::Mask && p.tool != Tool::GroupPaint && dynamic_stroke {
                 seed = self.remesh(seed, p.center, p.radius, detail);
             }
         }
-        self.collect_region(p.center, p.radius, seed, p.tool != Tool::Mask);
+        self.collect_region(p.center, p.radius, seed, p.tool != Tool::Mask && p.tool != Tool::GroupPaint);
         if self.region.is_empty() {
+            return;
+        }
+        if p.tool == Tool::GroupPaint {
+            self.paint_group(p.group);
             return;
         }
         if let Some(st) = self.stroke.as_mut() {
@@ -940,9 +1284,332 @@ impl Sculptor {
                 }
                 return;
             }
-            Tool::Grab => unreachable!(),
+            Tool::ClayTubes | Tool::Rake => {
+                let mut dir = p.motion - an * p.motion.dot(an);
+                if dir.length_squared() < 1e-12 {
+                    dir = an.any_orthonormal_vector();
+                }
+                let dir = dir.normalize();
+                let side = an.cross(dir);
+                if p.tool == Tool::ClayTubes {
+                    let plane = ac + an * (s * r * 0.12);
+                    for &(v, w) in region {
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        let pv = mesh.positions[v as usize];
+                        let t = pv - p.center;
+                        let (a, b) = ((t.dot(dir) / r).abs() * 1.3, (t.dot(side) / r).abs());
+                        let sq = (1.0 - a.max(b).powi(4)).clamp(0.0, 1.0) * (1.0 - mesh.mask[v as usize]);
+                        let d = (pv - plane).dot(an);
+                        if d * s < 0.0 {
+                            mesh.positions[v as usize] = pv - an * (d * sq * i * 0.5);
+                        }
+                    }
+                } else {
+                    for &(v, w) in region {
+                        let pv = mesh.positions[v as usize];
+                        let c = (pv - p.center).dot(side) / r;
+                        let groove = 0.5 - 0.5 * (c * std::f32::consts::PI * 6.0).cos();
+                        mesh.positions[v as usize] = pv - an * (s * 0.03 * r * i * w * groove);
+                    }
+                }
+            }
+            Tool::Blob => {
+                let k = s * 0.05 * r * i;
+                for &(v, w) in region {
+                    let n = mesh.normals[v as usize];
+                    mesh.positions[v as usize] += n * (k * w.sqrt());
+                }
+            }
+            Tool::Magnify => {
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let mut t = pv - p.center;
+                    t -= an * t.dot(an);
+                    mesh.positions[v as usize] = pv + t * (s * w * i * 0.2) + an * (s * 0.01 * r * w);
+                }
+            }
+            Tool::Planar | Tool::TrimFront => {
+                let (pc, pn) = if p.tool == Tool::Planar {
+                    match self.stroke.as_mut() {
+                        Some(st) => *st.plane.get_or_insert((ac, an)),
+                        None => (ac, an),
+                    }
+                } else {
+                    (ac, -p.view.normalize_or_zero())
+                };
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let d = (pv - pc).dot(pn);
+                    if p.tool == Tool::Planar || d > 0.0 {
+                        let w = (w * 2.0).min(1.0);
+                        mesh.positions[v as usize] = pv - pn * (d * w * i * 0.6);
+                    }
+                }
+            }
+            Tool::Polish | Tool::HPolish | Tool::MPolish => {
+                self.scratch.clear();
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let d = (pv - ac).dot(an);
+                    let target = Self::laplacian(mesh, v);
+                    let q = match p.tool {
+                        Tool::Polish => pv.lerp(target, (w * i * 0.4).min(1.0)) - an * (d * w * i * 0.25),
+                        Tool::HPolish => {
+                            let w = (w * 2.0).min(1.0);
+                            pv - an * (d * w * i * 0.5)
+                        }
+                        _ => {
+                            // relax along the surface only, flatten the middle
+                            let mut t = target - pv;
+                            let n = mesh.normals[v as usize];
+                            t -= n * t.dot(n);
+                            pv + t * (w * i * 0.5) - an * (d * w * w * w * i * 0.4)
+                        }
+                    };
+                    self.scratch.push(q);
+                }
+                for (k, &(v, _)) in region.iter().enumerate() {
+                    mesh.positions[v as usize] = self.scratch[k];
+                }
+            }
+            Tool::SmoothValleys | Tool::SmoothPeaks | Tool::SmoothStronger => {
+                let passes = if p.tool == Tool::SmoothStronger { 3 } else { 1 };
+                for _ in 0..passes {
+                    self.scratch.clear();
+                    for &(v, w) in region {
+                        let pv = mesh.positions[v as usize];
+                        let mut delta = Self::laplacian(mesh, v) - pv;
+                        let n = mesh.normals[v as usize];
+                        let dn = delta.dot(n);
+                        let keep = match p.tool {
+                            Tool::SmoothValleys => dn > 0.0,
+                            Tool::SmoothPeaks => dn < 0.0,
+                            _ => true,
+                        };
+                        if !keep {
+                            delta -= n * dn; // still even out the spacing
+                        }
+                        let k = if p.tool == Tool::SmoothStronger { (w * i * 1.5).min(1.0) } else { (w * i).min(1.0) };
+                        self.scratch.push(pv + delta * k);
+                    }
+                    for (k, &(v, _)) in region.iter().enumerate() {
+                        mesh.positions[v as usize] = self.scratch[k];
+                    }
+                }
+            }
+            Tool::Slash => {
+                let push = an * (-s * 0.09 * r * i);
+                for &(v, w) in region {
+                    let pv = mesh.positions[v as usize];
+                    let mut t = p.center - pv;
+                    t -= an * t.dot(an);
+                    let w3 = w * w * w;
+                    mesh.positions[v as usize] = pv + t * (w * i * 0.5) + push * (w3 * w3);
+                }
+            }
+            Tool::CurveSnakehook => {
+                let m = p.motion * i;
+                for &(v, w) in region {
+                    mesh.positions[v as usize] += m * w;
+                }
+            }
+            Tool::ClothInflate => {
+                let verts: Vec<u32> = region.iter().map(|r| r.0).collect();
+                let edges = self.local_edges(&verts);
+                let mesh = &mut self.mesh;
+                let region = &self.region;
+                let k = s * 0.06 * r * i;
+                let mut x: Vec<Vec3> = region
+                    .iter()
+                    .map(|&(v, w)| mesh.positions[v as usize] + mesh.normals[v as usize] * (k * w))
+                    .collect();
+                // fabric doesn't stretch: pull edges back towards their length
+                let inv: Vec<f32> = region.iter().map(|&(_, w)| w.min(1.0)).collect();
+                let edges: Vec<(u32, u32, f32)> = edges.into_iter().map(|(a, b, l)| (a, b, l * 1.02)).collect();
+                Self::relax_cloth(&mut x, &inv, &edges, 4, 0.6);
+                for (k, &(v, _)) in region.iter().enumerate() {
+                    mesh.positions[v as usize] = x[k];
+                }
+            }
+            Tool::Grab
+            | Tool::Move
+            | Tool::MoveElastic
+            | Tool::MoveInfiniteDepth
+            | Tool::Anchors
+            | Tool::ClothPull
+            | Tool::ClothTwist
+            | Tool::GroupPaint => unreachable!(),
         }
         self.after_deform(true, None);
+    }
+
+    /// Polygroup paint: faces whose corners are all well inside the brush
+    /// (and their quad partners) join `group`.
+    fn paint_group(&mut self, group: u32) {
+        let inside: std::collections::HashSet<u32> =
+            self.region.iter().filter(|r| r.1 > 0.15).map(|r| r.0).collect();
+        let Some(st) = self.stroke.as_mut() else { return };
+        let mesh = &mut self.mesh;
+        let mut changed = false;
+        for &v in &inside {
+            for &f in mesh.vert_faces(v).to_vec().iter() {
+                let t = mesh.tris[f as usize];
+                if t[0] == crate::mesh::NONE || !t.iter().all(|u| inside.contains(u)) {
+                    continue;
+                }
+                let p = mesh.partner[f as usize];
+                for face in [f, p] {
+                    if face == crate::mesh::NONE || mesh.groups[face as usize] == group {
+                        continue;
+                    }
+                    if st.group_seen.insert(face) {
+                        st.group_old.push((face, mesh.groups[face as usize]));
+                    }
+                    mesh.groups[face as usize] = group;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            st.modified = true;
+            self.dirty.topology = true;
+        }
+    }
+
+    /// Starts a dragging brush region (once per symmetry side at stroke start).
+    pub fn drag_begin(&mut self, center: Vec3, radius: f32, seed_tri: u32, xf: Mat3, gather: Gather, kind: DragKind) {
+        let cloth = matches!(kind, DragKind::ClothPull | DragKind::ClothTwist);
+        // cloth simulates a wider patch than the brush so folds can form
+        let reach = if cloth { radius * 2.5 } else { radius };
+        let mut verts: Vec<(u32, f32)> = match gather {
+            Gather::Topological => {
+                self.collect_region(center, reach, seed_tri, true);
+                self.region.clone()
+            }
+            Gather::Spatial | Gather::Elastic | Gather::Depth(_) => {
+                let far = if gather == Gather::Elastic { radius * 3.0 } else { radius };
+                let (mn, mx) = (center - Vec3::splat(far), center + Vec3::splat(far));
+                (0..self.mesh.positions.len() as u32)
+                    .filter(|&v| !self.mesh.vert_faces(v).is_empty())
+                    .filter_map(|v| {
+                        let q = self.mesh.positions[v as usize];
+                        let d = match gather {
+                            Gather::Depth(dir) => {
+                                let dir = dir.normalize_or_zero();
+                                let t = q - center;
+                                (t - dir * t.dot(dir)).length()
+                            }
+                            _ => {
+                                if q.cmplt(mn).any() || q.cmpgt(mx).any() {
+                                    return None;
+                                }
+                                q.distance(center)
+                            }
+                        };
+                        let x = d / radius;
+                        let w = match gather {
+                            Gather::Elastic => {
+                                if d >= far {
+                                    return None;
+                                }
+                                (1.0 / (1.0 + x * x)).powf(1.5) * falloff(d / far)
+                            }
+                            _ => {
+                                if x >= 1.0 {
+                                    return None;
+                                }
+                                falloff(x)
+                            }
+                        };
+                        Some((v, w * (1.0 - self.mesh.mask[v as usize])))
+                    })
+                    .collect()
+            }
+        };
+        if cloth {
+            // the brush moves its own radius; the rest follows as cloth
+            for (k, &(v, _)) in verts.clone().iter().enumerate() {
+                let d = self.mesh.positions[v as usize].distance(center);
+                verts[k].1 = falloff(d / radius) * (1.0 - self.mesh.mask[v as usize]);
+            }
+        }
+        let ids: Vec<u32> = verts.iter().map(|r| r.0).collect();
+        let orig: Vec<Vec3> = ids.iter().map(|&v| self.mesh.positions[v as usize]).collect();
+        let nrm: Vec<Vec3> = ids.iter().map(|&v| self.mesh.normals[v as usize]).collect();
+        let normal = verts
+            .iter()
+            .zip(&nrm)
+            .map(|(r, n)| *n * (r.1 + 1e-4))
+            .sum::<Vec3>()
+            .try_normalize()
+            .unwrap_or(Vec3::Z);
+        let (inv_mass, edges) = if cloth {
+            let inv = ids
+                .iter()
+                .zip(&verts)
+                .map(|(&v, r)| {
+                    let d = self.mesh.positions[v as usize].distance(center);
+                    if d > reach * 0.85 || self.mesh.boundary[v as usize] && d > radius { 0.0 } else { (1.0 - r.1).powi(2) }
+                })
+                .collect();
+            (inv, self.local_edges(&ids))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if let Some(st) = self.stroke.as_mut() {
+            st.grab.push(GrabSet { verts, orig, xf, kind, center, normal, nrm, inv_mass, edges });
+        }
+    }
+
+    /// Updates every dragging-brush region for the current pointer.
+    pub fn drag_update(&mut self, input: DragInput) {
+        let Some(mut st) = self.stroke.take() else { return };
+        let mut moved: Vec<u32> = Vec::new();
+        for set in &st.grab {
+            let det = set.xf.determinant().signum();
+            let d = set.xf * input.delta;
+            let view = (set.xf * input.view).normalize_or_zero();
+            let angle = input.screen.x * 0.01 * det;
+            let mut x: Vec<Vec3> = Vec::with_capacity(set.verts.len());
+            for (k, &(_, w)) in set.verts.iter().enumerate() {
+                let o = set.orig[k];
+                let rel = o - set.center;
+                let rot = |axis: Vec3, a: f32| -> Vec3 {
+                    if axis.length_squared() < 1e-12 {
+                        return o;
+                    }
+                    set.center + Quat::from_axis_angle(axis.normalize(), a * w) * rel
+                };
+                let q = match set.kind {
+                    DragKind::Move | DragKind::ClothPull | DragKind::Anchor(AnchorMode::Move) => o + d * w,
+                    DragKind::Anchor(AnchorMode::Rotate) => rot(view, angle),
+                    DragKind::Anchor(AnchorMode::Twist) | DragKind::ClothTwist => rot(set.normal, angle),
+                    DragKind::Anchor(AnchorMode::Bend) => rot(set.normal.cross(view), angle),
+                    DragKind::Anchor(AnchorMode::Scale) => {
+                        set.center + rel * (1.0 - input.screen.y * 0.005 * w).max(0.05)
+                    }
+                    DragKind::Anchor(AnchorMode::Inflate) => o + set.nrm[k] * (-input.screen.y * input.wpp * w),
+                };
+                x.push(q);
+            }
+            if !set.edges.is_empty() {
+                Self::relax_cloth(&mut x, &set.inv_mass, &set.edges, 12, 1.0);
+            }
+            for (k, &(v, _)) in set.verts.iter().enumerate() {
+                st.modified = true;
+                if st.snapshot.is_none() && st.mark.mark(v) {
+                    st.touched.push(v);
+                    st.old_pos.push(self.mesh.positions[v as usize]);
+                    st.old_mask.push(self.mesh.mask[v as usize]);
+                }
+                self.mesh.positions[v as usize] = x[k];
+                moved.push(v);
+            }
+        }
+        self.stroke = Some(st);
+        self.after_deform(false, Some(&moved));
     }
 
     /// Dynamic topology for one dab. Returns a live face to start the brush
@@ -993,33 +1660,12 @@ impl Sculptor {
 
     /// Starts a grab region (call once per symmetry side at stroke start).
     pub fn grab_begin(&mut self, center: Vec3, radius: f32, seed_tri: u32, xf: Mat3) {
-        self.collect_region(center, radius, seed_tri, true);
-        let verts = self.region.clone();
-        let orig = verts.iter().map(|&(v, _)| self.mesh.positions[v as usize]).collect();
-        if let Some(st) = self.stroke.as_mut() {
-            st.grab.push(GrabSet { verts, orig, xf });
-        }
+        self.drag_begin(center, radius, seed_tri, xf, Gather::Topological, DragKind::Move);
     }
 
     /// Moves grabbed vertices by `delta` (world units) from where they started.
     pub fn grab_update(&mut self, delta: Vec3) {
-        let Some(mut st) = self.stroke.take() else { return };
-        let mut moved: Vec<u32> = Vec::new();
-        for set in &st.grab {
-            let d = set.xf * delta;
-            for (k, &(v, w)) in set.verts.iter().enumerate() {
-                st.modified = true;
-                if st.snapshot.is_none() && st.mark.mark(v) {
-                    st.touched.push(v);
-                    st.old_pos.push(self.mesh.positions[v as usize]);
-                    st.old_mask.push(self.mesh.mask[v as usize]);
-                }
-                self.mesh.positions[v as usize] = set.orig[k] + d * w;
-                moved.push(v);
-            }
-        }
-        self.stroke = Some(st);
-        self.after_deform(false, Some(&moved));
+        self.drag_update(DragInput { delta, ..Default::default() });
     }
 
     fn apply(&mut self, e: Undo) -> Undo {
@@ -1038,6 +1684,19 @@ impl Sculptor {
                 Undo::Verts { idx, pos: cur_pos, mask: cur_mask }
             }
             Undo::State(s) => Undo::State(self.restore(s)),
+            Undo::Groups { faces, groups } => {
+                let mut cur = Vec::with_capacity(faces.len());
+                for (k, &f) in faces.iter().enumerate() {
+                    if let Some(g) = self.mesh.groups.get_mut(f as usize) {
+                        cur.push(*g);
+                        *g = groups[k];
+                    } else {
+                        cur.push(0);
+                    }
+                }
+                self.dirty.topology = true;
+                Undo::Groups { faces, groups: cur }
+            }
             Undo::Level(l) => {
                 let cur = self.level;
                 self.goto_level(l);
@@ -1103,6 +1762,40 @@ impl Sculptor {
         self.dirty.all(n);
     }
 
+    /// Snaps every vertex of the active level onto `target`'s surface (part
+    /// of the step that created this level, so no undo step of its own).
+    pub fn project_onto(&mut self, target: &Mesh, bvh: &Bvh, reach: f32) {
+        self.end_stroke();
+        for p in &mut self.mesh.positions {
+            if let Some(q) = bvh.closest_point(target, *p, reach) {
+                *p = q;
+            }
+        }
+        self.mesh.compute_all_normals();
+        self.topology_changed();
+    }
+
+    /// Masks every vertex not touching a face of polygroup `g` (undoable).
+    pub fn mask_outside_group(&mut self, g: u32) {
+        self.end_stroke();
+        let n = self.mesh.vertex_count();
+        let mut inside = vec![false; n];
+        for (f, t) in self.mesh.tris.iter().enumerate() {
+            if t[0] != crate::mesh::NONE && self.mesh.groups[f] == g {
+                for &v in t {
+                    inside[v as usize] = true;
+                }
+            }
+        }
+        let old = self.mesh.mask.clone();
+        for (v, m) in self.mesh.mask.iter_mut().enumerate() {
+            *m = if inside[v] { 0.0 } else { 1.0 };
+        }
+        let idx: Vec<u32> = (0..n as u32).collect();
+        self.push_undo(Undo::Verts { idx, pos: self.mesh.positions.clone(), mask: old });
+        self.dirty.all(n);
+    }
+
     pub fn clear_mask(&mut self) {
         self.mask_op(|_| 0.0);
     }
@@ -1121,7 +1814,7 @@ mod tests {
 
     fn dab(s: &mut Sculptor, tool: Tool, negative: bool) {
         let h = front_hit(s);
-        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri, detail: None, motion: Vec3::new(0.05, 0.0, 0.0) });
+        s.dab(&DabParams { tool, center: h.point, radius: 0.4, intensity: 1.0, negative, seed_tri: h.tri, detail: None, motion: Vec3::new(0.05, 0.0, 0.0), ..Default::default() });
         s.refresh_bvh();
     }
 
@@ -1229,6 +1922,7 @@ mod tests {
                 seed_tri: h.tri,
                 detail: Some(0.03),
                 motion: Vec3::ZERO,
+                ..Default::default()
             });
             s.refresh_bvh();
         }
@@ -1312,6 +2006,7 @@ mod tests {
                 seed_tri: h.tri,
                 detail: Some(0.03),
                 motion: Vec3::ZERO,
+                ..Default::default()
             });
             s.refresh_bvh();
         }
@@ -1334,7 +2029,7 @@ mod tests {
         let n = s.tri_count();
         s.begin_stroke(true);
         let h = front_hit(&s);
-        s.dab(&DabParams { tool: Tool::Draw, center: h.point, radius: 0.4, intensity: 1.0, negative: false, seed_tri: h.tri, detail: Some(0.01), motion: Vec3::ZERO });
+        s.dab(&DabParams { tool: Tool::Draw, center: h.point, radius: 0.4, intensity: 1.0, negative: false, seed_tri: h.tri, detail: Some(0.01), motion: Vec3::ZERO, ..Default::default() });
         s.end_stroke();
         assert_eq!(s.tri_count(), n);
         s.delete_lower();

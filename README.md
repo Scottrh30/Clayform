@@ -5,22 +5,29 @@ A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.co
 
 ![Clayform](docs/screenshot.png)
 
+| ZModeler with polygroup colours | Mannequin |
+|---|---|
+| ![ZModeler](docs/screenshot-zmodeler.png) | ![Mannequin](docs/screenshot-mannequin.png) |
+
 ## Interface
 
 Like SculptGL, the functions are grouped into dropdown areas:
 
+- **Modes** (buttons at the top of the panel, or `Tab`): **Sculpt** (brushes), **ZModeler** (polygon modelling),
+  **Retopo** (draw new topology over the sculpt) and **Mannequin** (pose a figure).
 - **Top-bar menus:** **File** (import, export OBJ/STL), **Edit** (undo, redo), **Scene** (new sphere, cube or plane,
-  sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
+  quad QCube/QSphere/QCylinder/QPlane, mannequin, sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
   (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
 - **Side-panel folders** (click a title to fold it): **Sculpting** (tool dropdown, radius, intensity, negative,
   symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, voxel remesh, mesh statistics),
-  **Rendering** (material dropdown, flat shading, wireframe) and **Interface** (panel side).
+  **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**,
+  **Rendering** (material dropdown, AO, cavity, flat shading, wireframe, polygroup colours) and **Interface** (panel side).
 - The side panel docks on the **left or right** of the viewport. Use the **Panel left / Panel right** button in the
   top bar, or **Interface › Panel side**. Your choice is remembered.
 
 ## Features
 
-- **16 brushes**, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
+- **38 brushes**, grouped in the Tool list, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
   - **Draw, Clay, Clay Buildup:** add material. Clay Buildup lays down fast, square-edged strips.
   - **Smooth, Flatten, Trim Dynamic, Scrape:** level the surface. Trim cuts peaks to crisp planes, and Scrape shaves
     high spots (Ctrl fills low ones).
@@ -29,6 +36,40 @@ Like SculptGL, the functions are grouped into dropdown areas:
   - **Grab, Snakehook, Nudge:** move the surface. Snakehook pulls out horns and tentacles (best with dynamic
     topology), and Nudge smears it along the stroke.
   - **Mask:** protects areas from the other brushes.
+  - **Clay Tubes, Blob, Magnify, Planar, Trim Front, Rake, Slash:** square-ended clay strokes along the stroke
+    direction, bulbous build-up, spreading the surface (Ctrl shrinks it), flattening to the stroke's starting height,
+    cutting flat facing the camera, combing parallel grooves, and very sharp cuts.
+  - **Polish, hPolish, mPolish, Smooth Valleys, Smooth Peaks, Smooth Stronger:** clean, polished planes; hard planes;
+    flattening that keeps edges crisp; smoothing only the low or only the high spots; heavy multi-pass smoothing.
+  - **Move, Move Topological (Grab), Move Elastic, Move Infinite Depth:** drag everything in the brush sphere, only
+    the connected surface, with a long rubbery falloff, or straight through the whole model.
+  - **Anchors:** drag to **move, rotate, scale, inflate, twist or bend** the region under the brush.
+  - **Curve Snakehook:** draw a path, release, and a horn is pulled along it, tapering to the tip.
+  - **Cloth Pull, Cloth Twist, Cloth Inflate:** move the surface like fabric (edge lengths are kept, so it folds
+    instead of stretching).
+  - **Polygroup Paint:** paints a new polygroup.
+- **ZModeler** (polygon modelling, like ZBrush's ZModeler): hover a polygon to see the target highlighted, then
+  click or drag. Actions: **Extrude**, **Inset**, **Bevel** (drag to set the amount, one undo step), **Insert edge
+  loop**, **Delete**, **Bridge** (click two polygons or holes, with the same number of edges, to join them with a
+  tube), **Polygroup** and **PolyGroupIt**. Targets: **Polygon**, **Polygroup** or **Polyloop** (the quad strip
+  across the picked edge). Mirror X applies. Start from **QCube, QSphere, QCylinder or QPlane** with 1–12 divisions.
+- **Polygroups and quads:** every face belongs to a polygroup (shown in colour with `Shift+G`), and quads stay quads
+  (two partner triangles) through ZModeler, subdivision, projects and OBJ import/export, which also writes each
+  polygroup as an OBJ `g` group. The wireframe hides quad diagonals. **Group by normals**, **Group masked**,
+  **Clear**, the **Polygroup Paint** brush and **PolyGroupIt** set them.
+- **Retopology:** click on the sculpt to place points; every four make a quad (click the first point again or press
+  `Enter` to close a triangle or n-gon). Click existing points to share them, drag points to slide them over the
+  surface, `Ctrl`+click to delete, `Ctrl+Z` to step back. **Relax** evens the spacing while staying on the surface,
+  **Mirror X** copies to the other side, and **Apply** replaces the sculpt, optionally with 1–5 subdivision levels
+  each projected onto the old sculpt so its detail carries over.
+- **Mannequins:** a posable figure of capsules (each bone its own polygroup). Drag a joint to aim its bone; presets
+  T-pose, A-pose, Walk, Sit, Arms up and Run; a **Build** slider. **Convert to sculpt** voxel-merges it into one surface.
+- **Snapshot 3D:** turns an image's silhouette (dark pixels, or opaque ones in a transparent PNG; **Invert** for
+  light shapes) into a solid: **Inflate** (pillowy) or **Extrude** (flat), with depth and resolution. **New** starts a
+  sculpt from it, **Add** places it on the surface facing you, and **Subtract** cuts it straight through the model,
+  both merged with a voxel remesh.
+- **Reference images** (like Spotlight): pin PNG/JPEG images over the viewport, drag to place, drag the corner to
+  size, set opacity, hide, or lock them so you sculpt through. They're saved in the project.
 - **Symmetry:** mirror across X, Y and/or Z, plus **radial** copies (2–32 around X, Y or Z), about the world
   origin or the model's own centre. Ghost cursors show where every copy lands.
 - **Dynamic topology** (like SculptGL's dynamic mode or ZBrush's Sculptris Pro): long edges under the brush are
@@ -67,7 +108,11 @@ Like SculptGL, the functions are grouped into dropdown areas:
 | Middle drag, Shift + right drag | Pan |
 | Wheel | Zoom |
 | `D C B S F Y Q I` | Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate |
-| `P E V L G K U M` | Pinch, Crease, Dam Standard, Layer, Grab, Snakehook, Nudge, Mask |
+| `P E V L G K U M` | Pinch, Crease, Dam Standard, Layer, Move Topological (Grab), Snakehook, Nudge, Mask |
+| `J H O` | Move, Clay Tubes, Polish (every brush is in the Tool list) |
+| `Tab` / Shift+Tab | Next / previous mode (Sculpt, ZModeler, Retopo, Mannequin) |
+| Shift+G | Polygroup colours |
+| `Enter` / Esc | Retopology: close the face / drop the picked points |
 | `[` `]` | Brush radius |
 | `X` / `W` / `N` | Toggle mirror X / wireframe / negative |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo / redo |
@@ -98,7 +143,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh, picking, brushes, strokes, undo, symmetry, OBJ/STL).
+Tests: `cargo test` (engine: symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -112,10 +157,10 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-ZRemesher-style retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
+Automatic (ZRemesher-style) retopology, multiple objects (SubTools), alpha/stamp textures, layers, vertex painting, and a lasso mask.
 
 ## Automated testing hook
 
-If the `CLAYFORM_TEST_FILE` environment variable is set, the desktop app's Open project, Save project and Load matcap
-use that file instead of showing a dialog. It exists for scripted UI tests on machines with nobody to click the
+If the `CLAYFORM_TEST_FILE` environment variable is set, the desktop app's Open project, Save project, Load matcap
+and image pickers (Snapshot 3D, reference images) use that file instead of showing a dialog. It exists for scripted UI tests on machines with nobody to click the
 dialogs, and normal use never sets it.
