@@ -6,6 +6,7 @@ mod brush_ui;
 mod detail_ui;
 mod topo_ui;
 mod paint_ui;
+mod special_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -238,7 +239,7 @@ impl Ui {
             let sts: Vec<_> = (0..e.subtool_count()).map(|i| e.subtool_info(i).clone()).collect();
             let act = e.active_subtool();
             let scene_rev = e.scene_revision();
-            let retopo_undo = e.mode == Mode::Retopo && e.retopo.can_undo();
+            let retopo_undo = (e.mode == Mode::Retopo && e.retopo.can_undo()) || (e.mode == Mode::ZSpheres && e.zspheres.can_undo());
             let s = &e.sculptor;
             (
                 s.mesh.vertex_count(),
@@ -391,7 +392,7 @@ fn act(ui: Ui, a: Action) {
         Action::RenderImage => spawn_local(output_ui::render_still(ui, ui.render.get_untracked())),
         Action::RenderTurntable => spawn_local(output_ui::render_turntable(ui, ui.render.get_untracked())),
         Action::Undo => with_ed(|e| {
-            if !e.retopo_undo() {
+            if !e.retopo_undo() && !e.zs_undo() {
                 e.undo()
             }
         }),
@@ -622,6 +623,7 @@ fn settings_json(ui: Ui) -> String {
             "cavity": v.cavity, "cavity_strength": v.cavity_strength, "polygroups": v.polygroups,
         },
         "voxel": { "resolution": vx.resolution, "smooth": vx.smooth, "project": vx.project },
+        "zspheres": special_ui::zs_json(),
     })
     .to_string()
 }
@@ -722,6 +724,9 @@ fn apply_settings(ui: Ui, json: &str) {
                 s.divisions = (d as u32).clamp(1, 32);
             }
         });
+    }
+    if let Some(z) = j.get("zspheres") {
+        special_ui::apply_zs_json(z);
     }
     if let Some(r) = j.get("references") {
         tools_ui::apply_refs_json(ui, r);
@@ -907,6 +912,8 @@ fn start_frame_loop(canvas: web_sys::HtmlCanvasElement, ui: Ui) {
 }
 
 fn draw_frame(canvas: &web_sys::HtmlCanvasElement, ui: Ui) {
+    // a running Dynamics simulation advances every frame
+    with_ed(|e| e.dyn_tick());
     if let Some(e) = render::GPU_ERROR.lock().ok().and_then(|mut g| g.take()) {
         log(&format!("GPU error: {e}"));
         ui.gpu.set(Some(e));
@@ -949,7 +956,8 @@ pub(crate) fn sync_scene(r: &mut Renderer, e: &mut Editor, view: &ViewSettings) 
         let active = i == e.active_subtool();
         let ov = render::ObjectView {
             id: info.id,
-            visible: info.visible && !preview,
+            // in ZSpheres mode the spheres' skin stands in for the active SubTool
+            visible: info.visible && !preview && !(active && e.mode == Mode::ZSpheres && !e.zspheres.is_empty()),
             dim: !active && e.subtool_count() > 1,
             instances: &xfs,
             paint: view.paint,
@@ -958,6 +966,12 @@ pub(crate) fn sync_scene(r: &mut Renderer, e: &mut Editor, view: &ViewSettings) 
         r.sync_object(&ov, &s.mesh, &mut s.dirty, view.wireframe, view.polygroups);
     }
     scene_ui::sync_preview(r, view, dragging);
+    if e.mode == Mode::ZSpheres {
+        if let Some((m, dirty)) = e.zs_preview() {
+            let ov = render::ObjectView { id: u64::MAX - 1, visible: true, dim: false, instances: &[], paint: false };
+            r.sync_object(&ov, m, dirty, false, false);
+        }
+    }
     r.end_sync();
 }
 
@@ -1572,6 +1586,11 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             <topo_ui::TopologyToolsFolder ui />
             <paint_ui::PaintFolder ui />
             <paint_ui::TextureFolder ui />
+            <special_ui::ZSpheresFolder ui />
+            <special_ui::TextFolder ui />
+            <special_ui::FiberFolder ui />
+            <special_ui::DynamicsFolder ui />
+            <special_ui::ShadowboxFolder ui />
             <Folder title="Masking">
                 <div class="row buttons">
                     <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>

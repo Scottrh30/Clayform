@@ -218,7 +218,7 @@ async fn append_import(ui: Ui) {
     }
 }
 
-fn append(ui: Ui, m: Mesh, name: &str) {
+pub(crate) fn append(ui: Ui, m: Mesh, name: &str) {
     with_ed(|e| {
         // new parts sit beside what's there, the size of the active SubTool
         let (mn, mx) = e.scene_bounds();

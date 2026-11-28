@@ -172,6 +172,11 @@ async fn open_project(app: tauri::AppHandle) -> Result<Response, String> {
 }
 
 #[tauri::command]
+async fn open_font(app: tauri::AppHandle) -> Result<Response, String> {
+    pick_and_read(&app, "Load font", "Fonts", &["ttf", "otf", "TTF", "OTF"])
+}
+
+#[tauri::command]
 async fn open_brush(app: tauri::AppHandle) -> Result<Response, String> {
     pick_and_read(&app, "Import brush preset", "Clayform brush", &["claybrush"])
 }
@@ -343,7 +348,7 @@ fn main() {
         .manage(Jobs::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, topology, subdivide, cancel_job, open_project, save_project, open_image, open_brush])
+        .invoke_handler(tauri::generate_handler![open_mesh, save_file, autosave_write, autosave_info, autosave_read, autosave_clear, open_project_path, remesh, topology, subdivide, cancel_job, open_project, save_project, open_image, open_brush, open_font])
         .run(tauri::generate_context!())
         .expect("error while running Clayform");
 }

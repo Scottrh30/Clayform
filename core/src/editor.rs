@@ -13,12 +13,14 @@ use glam::{Vec2, Vec3, Vec4};
 
 mod cv;
 mod gz;
+mod zs;
 mod mq;
 mod rt;
 mod st;
 mod zm;
 
 pub use gz::GizmoSettings;
+pub use zs::ZsTool;
 pub use mq::MannequinDrag;
 pub use st::SubTool;
 pub use zm::ZmSettings;
@@ -35,10 +37,12 @@ pub enum Mode {
     Mannequin,
     /// Moving, turning, scaling and deforming the active SubTool.
     Transform,
+    /// Building a base mesh from a tree of spheres.
+    ZSpheres,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 5] = [Mode::Sculpt, Mode::Transform, Mode::ZModeler, Mode::Retopo, Mode::Mannequin];
+    pub const ALL: [Mode; 6] = [Mode::Sculpt, Mode::Transform, Mode::ZModeler, Mode::ZSpheres, Mode::Retopo, Mode::Mannequin];
     pub fn name(self) -> &'static str {
         match self {
             Mode::Sculpt => "Sculpt",
@@ -46,6 +50,7 @@ impl Mode {
             Mode::Retopo => "Retopology",
             Mode::Mannequin => "Mannequin",
             Mode::Transform => "Transform",
+            Mode::ZSpheres => "ZSpheres",
         }
     }
 }
@@ -217,6 +222,11 @@ pub struct Editor {
     rng: Rng,
     /// Retopology: dragging draws topology strokes instead of placing points.
     pub retopo_draw: bool,
+    pub zspheres: crate::zspheres::ZTree,
+    pub zs_tool: ZsTool,
+    zsst: zs::ZsState,
+    /// A running Dynamics simulation.
+    dyn_sim: Option<crate::dynamics::Sim>,
     /// Polypaint colour (0..1 sRGB values), and the reference image to paint
     /// from instead when Spotlight is on.
     pub paint_color: Vec3,
@@ -301,6 +311,10 @@ impl Editor {
             rect: None,
             rng: Rng::new(7),
             retopo_draw: false,
+            zspheres: Default::default(),
+            zs_tool: ZsTool::Draw,
+            zsst: Default::default(),
+            dyn_sim: None,
             paint_color: Vec3::new(0.8, 0.2, 0.15),
             spotlight: None,
             spotlight_on: false,
@@ -520,6 +534,7 @@ impl Editor {
         self.rts.drag = None;
         self.mqs.drag = None;
         self.gzs = Default::default();
+        self.zs_cancel();
         self.drag = Drag::None;
     }
 
@@ -598,6 +613,7 @@ impl Editor {
             Mode::Retopo => self.rt_overlay(p, size),
             Mode::Mannequin => self.mq_overlay(p, size),
             Mode::Transform => self.gz_overlay(p, size),
+            Mode::ZSpheres => self.zs_overlay(p, size),
         }
     }
 
@@ -617,6 +633,7 @@ impl Editor {
                     Mode::ZModeler => self.zm_down(p, size, mods),
                     Mode::Retopo => self.rt_down(p, size, mods),
                     Mode::Transform => self.gz_down(p, size, mods),
+                    Mode::ZSpheres => self.zs_down(p, size, mods),
                     _ => self.mq_down(p, size, mods),
                 };
                 match handled {
@@ -663,6 +680,7 @@ impl Editor {
                 Mode::Retopo => self.rt_move(p, size),
                 Mode::Mannequin => self.mq_move(p, size),
                 Mode::Transform => self.gz_move(p, size),
+                Mode::ZSpheres => self.zs_move(p, size),
             },
             Drag::None => {}
         }
@@ -694,6 +712,7 @@ impl Editor {
             Mode::Retopo if self.drag == Drag::Sculpt => self.rt_up(),
             Mode::Mannequin if self.drag == Drag::Sculpt => self.mq_up(),
             Mode::Transform if self.drag == Drag::Sculpt => self.gz_up(),
+            Mode::ZSpheres if self.drag == Drag::Sculpt => self.zs_up(),
             _ => {}
         }
         self.cancel_drag();
@@ -1714,6 +1733,66 @@ mod bench {
 }
 
 #[cfg(test)]
+mod special_tests {
+    use super::*;
+
+    const SIZE: Vec2 = Vec2::new(800.0, 600.0);
+
+    #[test]
+    fn zspheres_mode_grows_spheres_and_makes_a_mesh() {
+        let mut e = Editor::new();
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::ZSpheres);
+        let c = SIZE * 0.5;
+        e.pointer_down(Button::Left, c, SIZE, Mods::default());
+        e.pointer_up();
+        assert_eq!(e.zspheres.nodes.len(), 1);
+        // draw a child off the right side of the root (mirror makes a second)
+        let r = e.zspheres.nodes[0].radius / e.camera.world_per_point(e.zspheres.nodes[0].pos, SIZE.y);
+        let on = c + Vec2::new(r * 0.8, 0.0);
+        e.pointer_down(Button::Left, on, SIZE, Mods::default());
+        e.pointer_move(on + Vec2::new(30.0, 0.0), SIZE);
+        e.pointer_up();
+        assert_eq!(e.zspheres.nodes.len(), 3, "child and its mirror");
+        assert!(e.zs_preview().is_some());
+        e.zs_tool = ZsTool::Delete;
+        let child = e.zspheres.nodes[1].pos;
+        let sc = e.to_screen(child, SIZE).unwrap();
+        e.pointer_down(Button::Left, sc, SIZE, Mods::default());
+        e.pointer_up();
+        assert_eq!(e.zspheres.nodes.len(), 1, "deleted with its mirror");
+        assert!(e.zs_undo());
+        assert_eq!(e.zspheres.nodes.len(), 3);
+        let n = e.zs_make_mesh(48, true).unwrap();
+        assert!(n > 500);
+        assert_eq!(e.subtool_count(), 2);
+        assert_eq!(e.mode, Mode::Sculpt);
+    }
+
+    #[test]
+    fn dynamics_runs_and_applies() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::plane(4));
+        let before = e.sculptor.mesh.positions.clone();
+        e.dyn_start(crate::dynamics::DynSettings::default());
+        assert!(e.dyn_running());
+        for _ in 0..20 {
+            e.dyn_tick();
+        }
+        assert_ne!(e.sculptor.mesh.positions, before);
+        e.dyn_apply();
+        assert!(!e.dyn_running());
+        e.undo();
+        assert_eq!(e.sculptor.mesh.positions, before);
+        // masking everything leaves nothing to grow fibres from... and the
+        // reverse: mask all, get fibres
+        assert!(e.grow_fibers(&Default::default()).is_err());
+        e.sculptor.invert_mask();
+        assert!(e.grow_fibers(&crate::fibers::FiberSettings { count: 50, ..Default::default() }).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod brush_tests {
     use super::*;
     use crate::brush::{ChiselShape, FalloffCurve};
@@ -1883,5 +1962,66 @@ mod brush_tests {
         e.sculptor.subdivide().unwrap();
         press_drag(&mut e, SIZE * 0.5 - Vec2::X * 80.0, SIZE * 0.5 + Vec2::X * 80.0, 20);
         assert_eq!(e.subtool_count(), 2);
+    }
+}
+
+impl Editor {
+    /// Starts Dynamics on the active SubTool (other visible SubTools are obstacles).
+    pub fn dyn_start(&mut self, settings: crate::dynamics::DynSettings) {
+        self.cancel_drag();
+        self.dyn_cancel();
+        let others: Vec<usize> = (0..self.subtool_count()).filter(|&i| i != self.active_subtool() && self.subtool_info(i).visible).collect();
+        let obstacles = (settings.collide_subtools && !others.is_empty()).then(|| {
+            let meshes: Vec<Mesh> = others.iter().map(|&i| self.baked_mesh(i)).collect();
+            let refs: Vec<&Mesh> = meshes.iter().collect();
+            crate::scene::concat(&refs).0
+        });
+        let sim = crate::dynamics::Sim::new(&self.sculptor.mesh, settings, obstacles);
+        self.sculptor.dynamics_begin();
+        self.dyn_sim = Some(sim);
+    }
+
+    pub fn dyn_running(&self) -> bool {
+        self.dyn_sim.is_some() && self.sculptor.dynamics_running()
+    }
+
+    /// One simulation frame (call every frame while running).
+    pub fn dyn_tick(&mut self) {
+        if let Some(sim) = self.dyn_sim.as_mut() {
+            if self.sculptor.dynamics_running() {
+                self.sculptor.dynamics_step(sim);
+                self.redraw = true;
+            } else {
+                // something else ended the run (a stroke, undo...)
+                self.dyn_sim = None;
+            }
+        }
+    }
+
+    pub fn dyn_settings(&mut self, s: crate::dynamics::DynSettings) {
+        if let Some(sim) = self.dyn_sim.as_mut() {
+            sim.settings = s;
+        }
+    }
+
+    pub fn dyn_apply(&mut self) {
+        self.sculptor.dynamics_apply();
+        self.dyn_sim = None;
+        self.redraw = true;
+    }
+
+    pub fn dyn_cancel(&mut self) {
+        self.sculptor.dynamics_cancel();
+        self.dyn_sim = None;
+        self.redraw = true;
+    }
+
+    /// FiberMesh: grows strands from the masked area as a new SubTool.
+    pub fn grow_fibers(&mut self, s: &crate::fibers::FiberSettings) -> Result<usize, String> {
+        let f = crate::fibers::grow(&self.sculptor.mesh, s).ok_or("Mask where the fibres should grow first (Mask brush)")?;
+        let n = f.tris.len();
+        self.append_subtool(f, "Fibers");
+        self.redraw = true;
+        Ok(n)
     }
 }

@@ -149,6 +149,11 @@ pub async fn open_brush() -> Result<Option<OpenedProject>, String> {
     open_with("open_brush", ".claybrush,application/json").await
 }
 
+/// Asks for a font file (TrueType / OpenType).
+pub async fn open_font() -> Result<Option<OpenedProject>, String> {
+    open_with("open_font", ".ttf,.otf,font/ttf,font/otf").await
+}
+
 /// Asks for a PNG or JPEG image.
 pub async fn open_image() -> Result<Option<OpenedProject>, String> {
     open_with("open_image", "image/png,image/jpeg").await

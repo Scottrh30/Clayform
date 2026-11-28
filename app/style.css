@@ -290,3 +290,12 @@ button.mini.on { color: #fff; border-color: var(--accent-2); }
 .swatch { aspect-ratio: 1; border: 1px solid var(--line); border-radius: 3px; padding: 0; }
 .swatch:hover { border-color: #fff; }
 .uv-layout { width: 100%; image-rendering: auto; border: 1px solid var(--line); border-radius: 4px; margin: 4px 0; }
+
+/* ---------------------------------------------------------------- special tools */
+.text-input {
+  width: 100%; resize: vertical; padding: 4px 7px; margin: 2px 0 4px; font: inherit; color: inherit;
+  background: #17181c; border: 1px solid var(--line); border-radius: 4px;
+}
+.mask-pads { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 4px 0; }
+.mask-pad { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; color: var(--dim); }
+.mask-pad img { width: 100%; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 3px; cursor: crosshair; touch-action: none; image-rendering: pixelated; }

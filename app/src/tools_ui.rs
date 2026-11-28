@@ -83,6 +83,7 @@ fn mode_hint(m: Mode) -> &'static str {
         Mode::Retopo => "Click on the model to place points: four make a quad. Drag points to move them, Ctrl+click deletes.",
         Mode::Mannequin => "Drag the joints to pose the figure. Convert it to a sculpt when you're happy.",
         Mode::Transform => "Move, turn and scale the active SubTool with the gizmo, or deform it (Transform folder). Hold Ctrl to snap.",
+        Mode::ZSpheres => "Click to place the first sphere, then click a sphere to grow a new one from it (drag to size it). See the ZSpheres folder.",
     }
 }
 
@@ -105,6 +106,7 @@ pub fn ModeBar(ui: Ui) -> impl IntoView {
                                 Mode::Transform => "Gizmo",
                                 Mode::Mannequin => "Pose",
                                 Mode::ZModeler => "ZModel",
+                                Mode::ZSpheres => "ZSph",
                                 _ => m.name(),
                             }}</button>
                         }
