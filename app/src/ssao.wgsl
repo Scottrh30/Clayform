@@ -28,6 +28,13 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(1) @binding(0) var depth_tex: texture_2d<f32>;
+struct Obj {
+    // x: dim (not the SubTool being sculpted), y: copies
+    params: vec4<f32>,
+    instances: array<mat4x4<f32>, 64>,
+};
+@group(2) @binding(0) var<uniform> obj: Obj;
+
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -49,10 +56,11 @@ fn far_plane() -> f32 {
 }
 
 @vertex
-fn vs_depth(v: VIn) -> DOut {
+fn vs_depth(v: VIn, @builtin(instance_index) ii: u32) -> DOut {
+    let pos = (obj.instances[ii] * vec4<f32>(v.pos, 1.0)).xyz;
     var o: DOut;
-    o.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
-    o.vz = (u.view * vec4<f32>(v.pos, 1.0)).z;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.vz = (u.view * vec4<f32>(pos, 1.0)).z;
     return o;
 }
 

@@ -155,6 +155,10 @@ impl BvhBuilder {
 
     pub fn finish(mut self, mesh: &Mesh) -> Bvh {
         self.step(mesh, &mut || true);
+        if self.order.is_empty() {
+            // nothing to index: an empty hierarchy
+            self.nodes.clear();
+        }
         let mut parent = vec![NONE; self.nodes.len()];
         let mut leaf_of = vec![NONE; self.indexed];
         for (i, n) in self.nodes.iter().enumerate() {
@@ -177,7 +181,8 @@ impl BvhBuilder {
 fn refit_node(nodes: &mut [Node], order: &[u32], mesh: &Mesh, i: usize) {
     let n = nodes[i];
     let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    if n.count > 0 {
+    // (inner nodes always point past themselves; an empty root doesn't)
+    if n.count > 0 || n.first as usize <= i {
         for &t in &order[n.first as usize..(n.first + n.count) as usize] {
             if !mesh.is_alive(t) {
                 continue;

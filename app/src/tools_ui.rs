@@ -82,6 +82,7 @@ fn mode_hint(m: Mode) -> &'static str {
         Mode::ZModeler => "Hover a polygon to see the target, then click or drag. Mirror X applies.",
         Mode::Retopo => "Click on the model to place points: four make a quad. Drag points to move them, Ctrl+click deletes.",
         Mode::Mannequin => "Drag the joints to pose the figure. Convert it to a sculpt when you're happy.",
+        Mode::Transform => "Move, turn and scale the active SubTool with the gizmo, or deform it (Transform folder). Hold Ctrl to snap.",
     }
 }
 
@@ -99,7 +100,13 @@ pub fn ModeBar(ui: Ui) -> impl IntoView {
                                 title=mode_hint(m)
                                 class:on=move || ui.mode.get() == m
                                 on:click=move |_| ui.mode.set(m)
-                            >{if m == Mode::Retopo { "Retopo" } else { m.name() }}</button>
+                            >{match m {
+                                Mode::Retopo => "Retopo",
+                                Mode::Transform => "Gizmo",
+                                Mode::Mannequin => "Pose",
+                                Mode::ZModeler => "ZModel",
+                                _ => m.name(),
+                            }}</button>
                         }
                     })
                     .collect_view()}
@@ -118,6 +125,9 @@ fn style_class(s: OverlayStyle) -> &'static str {
         OverlayStyle::Joint => "ov-joint",
         OverlayStyle::Active => "ov-active",
         OverlayStyle::Curve => "ov-curve",
+        OverlayStyle::Axis(0) => "ov-x",
+        OverlayStyle::Axis(1) => "ov-y",
+        OverlayStyle::Axis(_) => "ov-z",
     }
 }
 
@@ -147,7 +157,7 @@ pub fn ModeOverlay(ui: Ui) -> impl IntoView {
                     .points
                     .iter()
                     .map(|(p, s)| {
-                        let r = if matches!(s, OverlayStyle::Joint | OverlayStyle::Active) { 5.5 } else { 3.5 };
+                        let r = if matches!(s, OverlayStyle::Joint | OverlayStyle::Active | OverlayStyle::Axis(_)) { 5.5 } else { 3.5 };
                         view! { <circle class=style_class(*s) cx=p.x cy=p.y r=r></circle> }
                     })
                     .collect_view();

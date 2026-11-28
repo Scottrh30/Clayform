@@ -82,21 +82,27 @@ pub async fn open_project_bytes(ui: Ui, name: String, path: Option<String>, byte
         }
     };
     start_job(ui, "Opening");
-    let active = parts.active;
-    let mut levels: Vec<LevelData<Mesh>> = Vec::with_capacity(parts.levels.len());
-    let mut active_bvh = None;
-    for (i, l) in parts.levels.into_iter().enumerate() {
-        let (mesh, stencils, bvh) = build_in_slices(ui, l.mesh).await;
-        if i == active {
-            active_bvh = Some(bvh);
+    let mut scene = Vec::with_capacity(parts.subtools.len());
+    let base = name.trim_end_matches(".clayform").to_string();
+    for (k, st) in parts.subtools.into_iter().enumerate() {
+        let active = st.active;
+        let mut levels: Vec<LevelData<Mesh>> = Vec::with_capacity(st.levels.len());
+        let mut active_bvh = None;
+        for (i, l) in st.levels.into_iter().enumerate() {
+            let (mesh, stencils, bvh) = build_in_slices(ui, l.mesh).await;
+            if i == active {
+                active_bvh = Some(bvh);
+            }
+            levels.push(LevelData { mesh, stencils, details: l.details });
         }
-        levels.push(LevelData { mesh, stencils, details: l.details });
+        let fallback = if k == 0 { base.clone() } else { format!("{base} {}", k + 1) };
+        let info = scene_ui::parse_info(&st.info_json, &fallback);
+        scene.push((info, clayform_core::sculpt::Sculptor::from_levels(levels, active, active_bvh)));
     }
     with_ed(|e| {
-        e.cancel_drag();
-        e.sculptor.set_label(format!("Open {name}"));
-        e.sculptor.load_levels(levels, active, active_bvh);
-        e.redraw = true;
+        e.load_scene(scene, parts.active_subtool);
+        // projects without a saved camera open framed on everything
+        e.frame_all();
     });
     apply_settings(ui, &parts.settings_json);
     if let Some(p) = &path {
@@ -134,10 +140,7 @@ fn encode_for_autosave(ui: Ui) -> Vec<u8> {
         "path": ui.project_path.get_untracked(),
     });
     let settings = settings.to_string();
-    with_ed(|e| {
-        let (levels, active) = e.sculptor.project_levels();
-        project::encode(&levels, active, &settings)
-    })
+    scene_ui::encode_project(&settings)
 }
 
 /// Runs for the life of the window: every so often, if there are unsaved

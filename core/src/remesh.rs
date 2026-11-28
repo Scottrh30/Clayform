@@ -103,6 +103,20 @@ pub fn voxel_remesh(src: &Mesh, s: &VoxelSettings) -> Result<Mesh, String> {
 /// Like `voxel_remesh`, reporting progress (0..1) to `progress`, which
 /// returns false to cancel.
 pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut(f32) -> bool) -> Result<Mesh, String> {
+    voxel_csg_with(src, s, &[], progress)
+}
+
+/// Boolean of several closed parts stored one after another in `src`:
+/// `parts` lists where each part's live triangles end and how it combines
+/// with everything before it (the first part's operation is ignored).
+/// With no parts this is a plain voxel remesh (overlaps merge).
+pub fn voxel_csg_with(
+    src: &Mesh,
+    s: &VoxelSettings,
+    parts: &[(usize, crate::scene::BoolOp)],
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Result<Mesh, String> {
+    use crate::scene::BoolOp;
     let mut report = |p: f32| if progress(p) { Ok(()) } else { Err(CANCELLED.to_string()) };
     let tris: Vec<[Vec3; 3]> = src
         .tris
@@ -162,14 +176,21 @@ pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut
     let mut inside: FastMap<()> = FastMap::default();
     if closed {
         let (ny, nz) = (dims[1], dims[2]);
-        let mut columns: Vec<Vec<(f32, i8)>> = vec![Vec::new(); (ny * nz) as usize];
+        let mut columns: Vec<Vec<(f32, i8, u16)>> = vec![Vec::new(); (ny * nz) as usize];
+        let mut part_of = 0usize;
         // a tiny irrational offset keeps column centres off triangle edges
-        let jit = h * 1.234_567e-4;
+        // (different for y and z, so rays never run along a 45° diagonal edge either)
+        let jit = h * 1.234_567e-3;
+        let jitz = h * 2.718_281_7e-3;
         for (ti, t) in tris.iter().enumerate() {
             if ti % 4096 == 0 {
                 report(0.45 + 0.1 * ti as f32 / tris.len() as f32)?;
             }
             let [a, b, c] = *t;
+            while part_of + 1 < parts.len() && ti >= parts[part_of].0 {
+                part_of += 1;
+            }
+            let part = part_of as u16;
             let n = (b - a).cross(c - a);
             if n.x.abs() < 1e-20 {
                 continue;
@@ -180,15 +201,15 @@ pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut
             let zmax = a.z.max(b.z).max(c.z);
             let j0 = (((ymin - grid.origin.y - jit) / h).ceil() as i64).max(0);
             let j1 = (((ymax - grid.origin.y - jit) / h).floor() as i64).min(ny - 1);
-            let k0 = (((zmin - grid.origin.z - jit) / h).ceil() as i64).max(0);
-            let k1 = (((zmax - grid.origin.z - jit) / h).floor() as i64).min(nz - 1);
+            let k0 = (((zmin - grid.origin.z - jitz) / h).ceil() as i64).max(0);
+            let k1 = (((zmax - grid.origin.z - jitz) / h).floor() as i64).min(nz - 1);
             let area = (b.y - a.y) * (c.z - a.z) - (b.z - a.z) * (c.y - a.y);
             if area == 0.0 {
                 continue;
             }
             let sign = if n.x > 0.0 { 1i8 } else { -1i8 };
             for k in k0..=k1 {
-                let z = grid.origin.z + k as f32 * h + jit;
+                let z = grid.origin.z + k as f32 * h + jitz;
                 for j in j0..=j1 {
                     let y = grid.origin.y + j as f32 * h + jit;
                     let e = |p: Vec3, q: Vec3| (q.y - p.y) * (z - p.z) - (q.z - p.z) * (y - p.y);
@@ -202,7 +223,7 @@ pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut
                         continue;
                     }
                     let x = (n.dot(a) - n.y * y - n.z * z) / n.x;
-                    columns[(j + ny * k) as usize].push((x, sign));
+                    columns[(j + ny * k) as usize].push((x, sign, part));
                 }
             }
         }
@@ -215,15 +236,31 @@ pub fn voxel_remesh_with(src: &Mesh, s: &VoxelSettings, progress: &mut dyn FnMut
                 }
                 col.sort_by(|p, q| p.0.total_cmp(&q.0));
                 let mut w: i32 = 0;
+                let mut wp = vec![0i32; parts.len().max(1)];
                 let mut ci = 0;
                 for i in 0..dims[0] {
                     let x = grid.origin.x + i as f32 * h;
                     while ci < col.len() && col[ci].0 < x {
                         w += col[ci].1 as i32;
+                        wp[col[ci].2 as usize] += col[ci].1 as i32;
                         ci += 1;
                     }
-                    // (crossings into an outward-facing surface count -1)
-                    if if s.signed { w < 0 } else { w != 0 } {
+                    let inn = if parts.is_empty() {
+                        // (crossings into an outward-facing surface count -1)
+                        if s.signed { w < 0 } else { w != 0 }
+                    } else {
+                        let mut acc = wp[0] != 0;
+                        for (pi, &(_, op)) in parts.iter().enumerate().skip(1) {
+                            let p = wp[pi] != 0;
+                            acc = match op {
+                                BoolOp::Add => acc || p,
+                                BoolOp::Subtract => acc && !p,
+                                BoolOp::Intersect => acc && p,
+                            };
+                        }
+                        acc
+                    };
+                    if inn {
                         inside.insert(grid.key(i, j, k), ());
                     }
                     if ci == col.len() {
@@ -460,6 +497,28 @@ mod tests {
     }
 
     #[test]
+    fn boolean_parts_subtract_and_intersect() {
+        use crate::scene::{concat, BoolOp};
+        let a = Mesh::icosphere(3);
+        let mut b = Mesh::icosphere(3);
+        for p in &mut b.positions {
+            p.x += 1.0;
+        }
+        b.compute_all_normals();
+        let (both, ends) = concat(&[&a, &b]);
+        let vs = VoxelSettings { resolution: 48, smooth: 0, project: false, signed: false };
+        let sub = voxel_csg_with(&both, &vs, &[(ends[0], BoolOp::Add), (ends[1], BoolOp::Subtract)], &mut |_| true).unwrap();
+        let (mn, mx) = sub.bounds();
+        assert!(mn.x < -0.9 && mx.x < 0.55, "subtract: {mn:?} {mx:?}");
+        let int = voxel_csg_with(&both, &vs, &[(ends[0], BoolOp::Add), (ends[1], BoolOp::Intersect)], &mut |_| true).unwrap();
+        let (mn, mx) = int.bounds();
+        assert!(mn.x > -0.05 && mx.x < 1.05 && mx.y < 0.9, "intersect lens: {mn:?} {mx:?}");
+        let uni = voxel_csg_with(&both, &vs, &[(ends[0], BoolOp::Add), (ends[1], BoolOp::Add)], &mut |_| true).unwrap();
+        let (mn, mx) = uni.bounds();
+        assert!(mn.x < -0.9 && mx.x > 1.9);
+    }
+
+    #[test]
     fn signed_mode_subtracts_inverted_parts() {
         let a = Mesh::icosphere(3);
         let mut b = Mesh::icosphere(3);
@@ -479,5 +538,26 @@ mod tests {
         assert!(m.boundary.iter().all(|b| !b), "shell should have no open edges");
         let (mn, mx) = m.bounds();
         assert!(mx.y - mn.y < 0.2 && mx.x - mn.x > 1.8);
+    }
+}
+#[cfg(test)]
+mod csg_regress {
+    use super::*;
+    #[test]
+    fn subtract_far_from_grid_aligned_union_leaves_nothing() {
+        use crate::scene::{concat, BoolOp, ArraySettings, bake};
+        let a = Mesh::icosphere(3);
+        let mut b = crate::poly::Polys::qcube(2).to_mesh();
+        for p in &mut b.positions { p.x += 2.0; }
+        let mut c = Mesh::icosphere(3);
+        for p in &mut c.positions { p.x += 4.0; }
+        let arr = ArraySettings { count: 4, ..Default::default() };
+        let (mn, mx) = c.bounds();
+        let cb = bake(&c, &arr.transforms(mn, mx));
+        let (all, ends) = concat(&[&a, &b, &cb]);
+        let vs = VoxelSettings { resolution: 96, smooth: 0, project: false, signed: false };
+        let r = voxel_csg_with(&all, &vs, &[(ends[0], BoolOp::Add), (ends[1], BoolOp::Add), (ends[2], BoolOp::Subtract)], &mut |_| true).unwrap();
+        let far = r.positions.iter().filter(|p| p.x > 5.0).count();
+        assert_eq!(far, 0);
     }
 }

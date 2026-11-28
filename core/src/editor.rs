@@ -9,11 +9,15 @@ use crate::symmetry::{apply_point, Symmetry};
 use glam::Mat3;
 use glam::{Vec2, Vec3, Vec4};
 
+mod gz;
 mod mq;
 mod rt;
+mod st;
 mod zm;
 
+pub use gz::GizmoSettings;
 pub use mq::MannequinDrag;
+pub use st::SubTool;
 pub use zm::ZmSettings;
 
 /// What the left mouse button does in the viewport.
@@ -26,16 +30,19 @@ pub enum Mode {
     Retopo,
     /// Posing a mannequin.
     Mannequin,
+    /// Moving, turning, scaling and deforming the active SubTool.
+    Transform,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 4] = [Mode::Sculpt, Mode::ZModeler, Mode::Retopo, Mode::Mannequin];
+    pub const ALL: [Mode; 5] = [Mode::Sculpt, Mode::Transform, Mode::ZModeler, Mode::Retopo, Mode::Mannequin];
     pub fn name(self) -> &'static str {
         match self {
             Mode::Sculpt => "Sculpt",
             Mode::ZModeler => "ZModeler",
             Mode::Retopo => "Retopology",
             Mode::Mannequin => "Mannequin",
+            Mode::Transform => "Transform",
         }
     }
 }
@@ -67,6 +74,8 @@ pub enum OverlayStyle {
     Active,
     /// A curve being drawn.
     Curve,
+    /// Gizmo handles for the X, Y and Z axes.
+    Axis(u8),
 }
 
 /// How dynamic topology picks its triangle size.
@@ -178,6 +187,14 @@ pub struct Editor {
     last_size: Vec2,
     /// A one-line note for the status bar (picks, errors), taken by the interface.
     pub message: Option<String>,
+    /// SubTools; the active one's sculptor is `sculptor`.
+    pub subtools: Vec<st::SubTool>,
+    active: usize,
+    next_id: u64,
+    pub gizmo: GizmoSettings,
+    gzs: gz::GzState,
+    /// Alt pressed on this point: a click (not a drag) picks a SubTool.
+    alt_click: Option<Vec2>,
 }
 
 impl Default for Editor {
@@ -214,6 +231,21 @@ impl Editor {
             paint_group: 0,
             last_size: Vec2::new(800.0, 600.0),
             message: None,
+            subtools: vec![st::SubTool {
+                info: crate::scene::SubToolInfo {
+                    id: 1,
+                    name: "Sculpt".into(),
+                    visible: true,
+                    op: crate::scene::BoolOp::Add,
+                    array: None,
+                },
+                sculptor: None,
+            }],
+            active: 0,
+            next_id: 1,
+            gizmo: GizmoSettings::default(),
+            gzs: Default::default(),
+            alt_click: None,
         };
         e.frame_mesh();
         e
@@ -345,6 +377,18 @@ impl Editor {
         self.redraw = true;
     }
 
+    /// Frames everything visible.
+    pub fn frame_all(&mut self) {
+        let (mn, mx) = self.scene_bounds();
+        self.camera.frame(mn, mx);
+        self.redraw = true;
+    }
+
+    /// Triangles of SubTool `i`.
+    pub fn sculpt_tri_count_of(&self, i: usize) -> usize {
+        self.sculptor_at(i).tri_count()
+    }
+
     pub fn frame_mesh(&mut self) {
         let (mn, mx) = self.sculptor.mesh.bounds();
         self.camera.frame(mn, mx);
@@ -412,6 +456,7 @@ impl Editor {
         self.zms.drag = None;
         self.rts.drag = None;
         self.mqs.drag = None;
+        self.gzs = Default::default();
         self.drag = Drag::None;
     }
 
@@ -468,6 +513,7 @@ impl Editor {
             Mode::ZModeler => self.zm_overlay(p, size),
             Mode::Retopo => self.rt_overlay(p, size),
             Mode::Mannequin => self.mq_overlay(p, size),
+            Mode::Transform => self.gz_overlay(p, size),
         }
     }
 
@@ -479,12 +525,14 @@ impl Editor {
         self.last_size = size;
         self.sculptor.refresh_bvh();
         self.last_pos = p;
+        self.alt_click = (button == Button::Left && mods.alt).then_some(p);
         self.drag = match button {
             Button::Left if mods.alt => Drag::Orbit,
             Button::Left if self.mode != Mode::Sculpt => {
                 let handled = match self.mode {
                     Mode::ZModeler => self.zm_down(p, size, mods),
                     Mode::Retopo => self.rt_down(p, size, mods),
+                    Mode::Transform => self.gz_down(p, size, mods),
                     _ => self.mq_down(p, size, mods),
                 };
                 match handled {
@@ -530,12 +578,27 @@ impl Editor {
                 Mode::ZModeler => self.zm_move(p, size),
                 Mode::Retopo => self.rt_move(p, size),
                 Mode::Mannequin => self.mq_move(p, size),
+                Mode::Transform => self.gz_move(p, size),
             },
             Drag::None => {}
         }
     }
 
     pub fn pointer_up(&mut self) {
+        // Alt + click (without dragging) picks the SubTool under the cursor
+        if let Some(a) = self.alt_click.take() {
+            if a.distance(self.last_pos) < 4.0 {
+                let size = self.last_size;
+                if let Some(i) = self.subtool_at(a, size) {
+                    if i != self.active {
+                        self.cancel_drag();
+                        self.select_subtool(i);
+                        self.message = Some(format!("Selected {}", self.subtools[i].info.name));
+                        return;
+                    }
+                }
+            }
+        }
         match self.mode {
             Mode::Sculpt if self.drag == Drag::Sculpt && self.stroke_tool == Tool::CurveSnakehook => {
                 self.finish_curve();
@@ -543,6 +606,7 @@ impl Editor {
             Mode::ZModeler if self.drag == Drag::Sculpt => self.zm_up(),
             Mode::Retopo if self.drag == Drag::Sculpt => self.rt_up(),
             Mode::Mannequin if self.drag == Drag::Sculpt => self.mq_up(),
+            Mode::Transform if self.drag == Drag::Sculpt => self.gz_up(),
             _ => {}
         }
         self.cancel_drag();
@@ -676,6 +740,7 @@ impl Editor {
                     screen: p - self.drag_start,
                     view: normal,
                     wpp: self.drag_wpp,
+                    ..Default::default()
                 });
                 self.redraw = true;
             }
@@ -1051,6 +1116,101 @@ mod tests {
         }
         e.pointer_up();
         e.sculptor.refresh_bvh();
+    }
+
+    #[test]
+    fn subtools_append_select_split_merge() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(3));
+        e.view_from(ViewDir::Front);
+        let sphere_tris = e.sculptor.tri_count();
+        let mut cube = crate::poly::Polys::qcube(2).to_mesh();
+        for p in &mut cube.positions {
+            p.x += 3.0;
+        }
+        cube.compute_all_normals();
+        e.append_subtool(cube, "Cube");
+        assert_eq!((e.subtool_count(), e.active_subtool()), (2, 1));
+        assert_eq!(e.sculptor.tri_count(), 48);
+        assert_eq!(e.sculpt_tri_count_of(0), sphere_tris);
+        // Alt+click on the sphere picks it
+        e.frame_all();
+        let sp = e.to_screen(glam::Vec3::new(0.0, 0.0, 1.0), SIZE).unwrap();
+        e.pointer_down(Button::Left, sp, SIZE, Mods { alt: true, ..Default::default() });
+        e.pointer_up();
+        assert_eq!(e.active_subtool(), 0);
+        e.select_subtool(1);
+        e.duplicate_subtool();
+        assert_eq!(e.subtool_count(), 3);
+        assert_eq!(e.subtool_info(2).name, "Cube copy");
+        assert_eq!(e.split_by_groups(), 6);
+        assert_eq!(e.subtool_count(), 2 + 6);
+        assert_eq!(e.sculptor.tri_count(), 8);
+        // hide the sphere and the original cube, merge the six sides
+        e.subtool_info_mut(0).visible = false;
+        e.subtool_info_mut(1).visible = false;
+        assert!(e.merge_visible());
+        assert_eq!(e.subtool_count(), 3);
+        assert_eq!(e.sculptor.tri_count(), 48);
+        assert!(e.delete_subtool(0));
+        assert_eq!(e.subtool_count(), 2);
+        let levels = e.scene_levels();
+        assert_eq!(levels.len(), 2);
+    }
+
+    #[test]
+    fn array_and_booleans() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(2));
+        e.subtool_info_mut(0).array = Some(crate::scene::ArraySettings { count: 3, ..Default::default() });
+        assert_eq!(e.array_transforms(0).len(), 3);
+        let (mn, mx) = e.scene_bounds();
+        assert!(mx.x - mn.x > 5.0, "{mn:?} {mx:?}");
+        e.convert_array();
+        assert_eq!(e.sculptor.tri_count(), 320 * 3);
+        e.undo();
+        assert_eq!(e.sculptor.tri_count(), 320);
+        let mut cutter = Mesh::icosphere(2);
+        for p in &mut cutter.positions {
+            p.x += 1.0;
+        }
+        e.append_subtool(cutter, "Cutter");
+        e.subtool_info_mut(1).op = crate::scene::BoolOp::Subtract;
+        let (m, parts) = e.boolean_parts().unwrap();
+        assert_eq!(parts.len(), 2);
+        let vs = crate::remesh::VoxelSettings { resolution: 40, smooth: 0, project: false, signed: false };
+        let r = crate::remesh::voxel_csg_with(&m, &vs, &parts, &mut |_| true).unwrap();
+        assert!(r.bounds().1.x < 0.55);
+    }
+
+    #[test]
+    fn gizmo_moves_and_deforms() {
+        let mut e = Editor::new();
+        e.set_mesh(Mesh::icosphere(3));
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::Transform);
+        let c = SIZE * 0.5;
+        assert!(!e.overlay(Some(c), SIZE).lines.is_empty());
+        // drag the X arrow 50 points to the right
+        drag(&mut e, c + Vec2::new(60.0, 0.0), c + Vec2::new(110.0, 0.0));
+        let (mn, mx) = e.sculptor.mesh.bounds();
+        let wpp = e.camera.world_per_point(glam::Vec3::ZERO, SIZE.y);
+        assert!(((mn.x + mx.x) * 0.5 - 50.0 * wpp).abs() < 0.02, "{mn:?} {mx:?}");
+        assert!((mn.y + mx.y).abs() < 1e-3, "moved only along X");
+        assert_eq!(e.sculptor.history().0.last().unwrap(), "Move");
+        e.undo();
+        // a masked half stays put
+        for (v, p) in e.sculptor.mesh.positions.clone().iter().enumerate() {
+            e.sculptor.mesh.mask[v] = if p.x < 0.0 { 1.0 } else { 0.0 };
+        }
+        e.gizmo.deformer = Some(crate::deform::Deformer::Taper);
+        e.gizmo.axis = 1;
+        let before = e.sculptor.mesh.positions.clone();
+        drag(&mut e, c, c + Vec2::new(150.0, 0.0));
+        let moved_left = e.sculptor.mesh.positions.iter().zip(&before).filter(|(a, b)| b.x < -0.01 && a.distance(**b) > 1e-4).count();
+        let moved_right = e.sculptor.mesh.positions.iter().zip(&before).filter(|(a, b)| b.x > 0.01 && a.distance(**b) > 1e-3).count();
+        assert_eq!(moved_left, 0);
+        assert!(moved_right > 50);
     }
 
     #[test]

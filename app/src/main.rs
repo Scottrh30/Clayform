@@ -7,6 +7,7 @@ mod render;
 mod conveniences;
 mod keys;
 mod output_ui;
+mod scene_ui;
 mod tools_ui;
 
 use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mode, Mods, Overlay, ViewDir, ZmSettings};
@@ -113,6 +114,12 @@ struct Ui {
     /// A recovery copy from an earlier session (when it was written, ms).
     recovery: RwSignal<Option<f64>>,
     autosaved_at: RwSignal<Option<f64>>,
+    subtools: RwSignal<Vec<clayform_core::scene::SubToolInfo>>,
+    active_subtool: RwSignal<usize>,
+    live_bool: RwSignal<bool>,
+    /// Live Boolean preview resolution.
+    bool_res: RwSignal<u32>,
+    gizmo: RwSignal<clayform_core::editor::GizmoSettings>,
 }
 
 impl Ui {
@@ -187,13 +194,21 @@ impl Ui {
             autosave_minutes: RwSignal::new(conveniences::autosave_minutes()),
             recovery: RwSignal::new(None),
             autosaved_at: RwSignal::new(None),
+            subtools: RwSignal::new(Vec::new()),
+            active_subtool: RwSignal::new(0),
+            live_bool: RwSignal::new(false),
+            bool_res: RwSignal::new(96),
+            gizmo: RwSignal::new(Default::default()),
         }
     }
 
     /// Pulls mesh statistics and undo state from the engine.
     fn refresh(self) {
-        let (v, t, u, r, lv, lc, top, rev, rt, msg) = with_ed(|e| {
+        let (v, t, u, r, lv, lc, top, rev, rt, msg, sts, act) = with_ed(|e| {
             let rt = (e.retopo.verts.len(), e.retopo.faces.len());
+            let sts: Vec<_> = (0..e.subtool_count()).map(|i| e.subtool_info(i).clone()).collect();
+            let act = e.active_subtool();
+            let scene_rev = e.scene_revision();
             let retopo_undo = e.mode == Mode::Retopo && e.retopo.can_undo();
             let s = &e.sculptor;
             (
@@ -204,11 +219,19 @@ impl Ui {
                 s.level(),
                 s.level_count(),
                 s.top_tri_count(),
-                s.revision(),
+                scene_rev,
                 rt,
                 e.message.take(),
+                sts,
+                act,
             )
         });
+        if sts != self.subtools.get_untracked() {
+            self.subtools.set(sts);
+        }
+        if act != self.active_subtool.get_untracked() {
+            self.active_subtool.set(act);
+        }
         self.retopo_count.set(rt);
         if let Some(m) = msg {
             self.status.set(m);
@@ -430,7 +453,7 @@ fn act(ui: Ui, a: Action) {
             e.sculptor.invert_mask();
             e.redraw = true;
         }),
-        Action::FrameMesh => with_ed(|e| e.frame_mesh()),
+        Action::FrameMesh => with_ed(|e| e.frame_all()),
         Action::ResetCamera => with_ed(|e| e.reset_camera()),
         Action::View(d) => with_ed(|e| e.view_from(d)),
         Action::TogglePanelSide => ui.panel_right.update(|r| *r = !*r),
@@ -711,10 +734,7 @@ async fn save_project(ui: Ui, ask: bool) {
     with_ed(|e| e.cancel_drag());
     // (settings_json reads the editor itself, so build it first)
     let settings = settings_json(ui);
-    let bytes = with_ed(|e| {
-        let (levels, active) = e.sculptor.project_levels();
-        project::encode(&levels, active, &settings)
-    });
+    let bytes = scene_ui::encode_project(&settings);
     let name = {
         let n = ui.project_name.get_untracked();
         if n.ends_with(".clayform") { n } else { format!("{n}.clayform") }
@@ -877,11 +897,33 @@ fn draw_frame(canvas: &web_sys::HtmlCanvasElement, ui: Ui) {
         e.redraw = false;
         RENDERER.with(|r| {
             if let Some(r) = r.borrow_mut().as_mut() {
-                r.sync_mesh(&e.sculptor.mesh, &mut e.sculptor.dirty, view.wireframe, view.polygroups);
+                sync_scene(r, e, &view);
                 r.render([w, h], e.camera.view(), e.camera.proj((cw / ch) as f32), &view, e.camera.dist * 0.06);
             }
         });
     });
+}
+
+/// Sends every SubTool (and the live boolean preview) to the renderer.
+pub(crate) fn sync_scene(r: &mut Renderer, e: &mut Editor, view: &ViewSettings) {
+    r.begin_sync();
+    let dragging = e.drag() != Drag::None;
+    let preview = scene_ui::live_preview_active(dragging);
+    for i in 0..e.subtool_count() {
+        let info = e.subtool_info(i).clone();
+        let xfs = if info.array.is_some() { e.array_transforms(i) } else { Vec::new() };
+        let active = i == e.active_subtool();
+        let ov = render::ObjectView {
+            id: info.id,
+            visible: info.visible && !preview,
+            dim: !active && e.subtool_count() > 1,
+            instances: &xfs,
+        };
+        let s = e.sculptor_at_mut(i);
+        r.sync_object(&ov, &s.mesh, &mut s.dirty, view.wireframe, view.polygroups);
+    }
+    scene_ui::sync_preview(r, view, dragging);
+    r.end_sync();
 }
 
 // ----------------------------------------------------------------- viewport
@@ -1344,6 +1386,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
     view! {
         <aside class="panel">
             <tools_ui::ModeBar ui />
+            <scene_ui::SubToolFolder ui />
             <conveniences::HistoryFolder ui />
             <Folder title="Sculpting">
                 <label class="row">
@@ -1587,6 +1630,8 @@ fn SidePanel(ui: Ui) -> impl IntoView {
                     }}
                 </div>
             </Folder>
+            <scene_ui::TransformFolder ui />
+            <scene_ui::ArrayFolder ui />
             <tools_ui::ZModelerFolder ui />
             <tools_ui::PolygroupFolder ui />
             <tools_ui::RetopoFolder ui />
@@ -1712,6 +1757,14 @@ fn App() -> impl IntoView {
     Effect::new(move || {
         let zm = ui.zm.get();
         with_ed(|e| e.zm = zm);
+        ui.update_overlay();
+    });
+    Effect::new(move || {
+        let g = ui.gizmo.get();
+        with_ed(|e| {
+            e.gizmo = g;
+            e.redraw = true;
+        });
         ui.update_overlay();
     });
     // display settings -> redraw

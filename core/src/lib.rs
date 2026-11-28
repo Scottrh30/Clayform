@@ -4,6 +4,7 @@
 pub mod bvh;
 pub mod camera;
 pub mod dyntopo;
+pub mod deform;
 pub mod editor;
 pub mod export;
 pub mod io;
@@ -14,6 +15,7 @@ pub mod print;
 pub mod project;
 pub mod remesh;
 pub mod retopo;
+pub mod scene;
 pub mod sculpt;
 pub mod snapshot;
 pub mod symmetry;

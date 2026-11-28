@@ -26,6 +26,13 @@ struct Uniforms {
 @group(1) @binding(1) var lin_samp: sampler;
 @group(1) @binding(2) var matcap_tex: texture_2d<f32>;
 @group(1) @binding(3) var shadow_tex: texture_2d<f32>;
+struct Obj {
+    // x: dim (not the SubTool being sculpted), y: copies
+    params: vec4<f32>,
+    instances: array<mat4x4<f32>, 64>,
+};
+@group(2) @binding(0) var<uniform> obj: Obj;
+
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -44,14 +51,17 @@ struct VOut {
 };
 
 @vertex
-fn vs_mesh(v: VIn) -> VOut {
+fn vs_mesh(v: VIn, @builtin(instance_index) ii: u32) -> VOut {
+    let m = obj.instances[ii];
+    let pos = (m * vec4<f32>(v.pos, 1.0)).xyz;
+    let nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
     var o: VOut;
-    o.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
-    o.vn = (u.view * vec4<f32>(v.nrm, 0.0)).xyz;
-    o.vpos = (u.view * vec4<f32>(v.pos, 1.0)).xyz;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.vn = (u.view * vec4<f32>(nrm, 0.0)).xyz;
+    o.vpos = (u.view * vec4<f32>(pos, 1.0)).xyz;
     o.mask = v.mask;
     o.cavity = v.cavity;
-    o.lpos = u.light_vp * vec4<f32>(v.pos + v.nrm * u.lighting.w, 1.0);
+    o.lpos = u.light_vp * vec4<f32>(pos + nrm * u.lighting.w, 1.0);
     return o;
 }
 
@@ -129,15 +139,18 @@ struct GOut {
 };
 
 @vertex
-fn vs_group(v: GIn) -> GOut {
+fn vs_group(v: GIn, @builtin(instance_index) ii: u32) -> GOut {
+    let m = obj.instances[ii];
+    let pos = (m * vec4<f32>(v.pos, 1.0)).xyz;
+    let nrm = normalize((m * vec4<f32>(v.nrm, 0.0)).xyz);
     var o: GOut;
-    o.clip = u.view_proj * vec4<f32>(v.pos, 1.0);
-    o.vn = (u.view * vec4<f32>(v.nrm, 0.0)).xyz;
-    o.vpos = (u.view * vec4<f32>(v.pos, 1.0)).xyz;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.vn = (u.view * vec4<f32>(nrm, 0.0)).xyz;
+    o.vpos = (u.view * vec4<f32>(pos, 1.0)).xyz;
     o.mask = v.mask;
     o.cavity = v.cavity;
     o.color = v.color;
-    o.lpos = u.light_vp * vec4<f32>(v.pos + v.nrm * u.lighting.w, 1.0);
+    o.lpos = u.light_vp * vec4<f32>(pos + nrm * u.lighting.w, 1.0);
     return o;
 }
 
@@ -285,6 +298,11 @@ fn shade(i: VOut, front: bool, tint: vec3<f32>, tinted: bool) -> vec3<f32> {
         let m = clamp(i.mask, 0.0, 1.0);
         c = mix(c, c * vec3<f32>(0.18, 0.2, 0.28), m * 0.85);
     }
+    // SubTools not being sculpted are shown greyer and darker
+    if (obj.params.x > 0.5) {
+        let g = dot(c, vec3<f32>(0.3, 0.55, 0.15));
+        c = mix(c, vec3<f32>(g) * 0.7, 0.55);
+    }
     return c;
 }
 
@@ -297,8 +315,8 @@ fn encode(c: vec3<f32>) -> vec3<f32> {
 }
 
 @vertex
-fn vs_wire(v: VIn) -> @builtin(position) vec4<f32> {
-    return u.view_proj * vec4<f32>(v.pos, 1.0);
+fn vs_wire(v: VIn, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+    return u.view_proj * obj.instances[ii] * vec4<f32>(v.pos, 1.0);
 }
 
 @fragment

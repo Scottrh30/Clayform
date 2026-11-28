@@ -58,7 +58,8 @@ async fn run_job(
     Ok(Response::new(out))
 }
 
-/// Voxel remesh. Body: mesh (wire format). Headers: resolution, smooth, project, signed.
+/// Voxel remesh. Body: mesh (wire format). Headers: resolution, smooth,
+/// project, signed, and `parts` for booleans ("end:op,end:op…", op = a / s / i).
 #[tauri::command]
 async fn remesh(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'_>) -> Result<Response, String> {
     let bytes = raw_body(&request)?;
@@ -69,9 +70,22 @@ async fn remesh(app: tauri::AppHandle, jobs: State<'_, Jobs>, request: Request<'
         project: header(&request, "project").map_or(defaults.project, |v| v == "1"),
         signed: header(&request, "signed").is_some_and(|v| v == "1"),
     };
+    let parts: Vec<(usize, clayform_core::scene::BoolOp)> = header(&request, "parts")
+        .map(percent_decode)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|p| {
+            let (end, op) = p.split_once(':')?;
+            Some((end.parse().ok()?, clayform_core::scene::BoolOp::from_code(op.chars().next()?)))
+        })
+        .collect();
     run_job(app, &jobs, move |progress| {
         let (mesh, _) = wire::decode(&bytes)?;
-        let out = voxel_remesh_with(&mesh, &settings, progress)?;
+        let out = if parts.len() > 1 {
+            clayform_core::remesh::voxel_csg_with(&mesh, &settings, &parts, progress)?
+        } else {
+            voxel_remesh_with(&mesh, &settings, progress)?
+        };
         Ok(wire::encode(&out, &[]))
     })
     .await

@@ -15,15 +15,17 @@ A rendered image (Lit skin, shadows from the key light): ![Render](docs/render-s
 
 Like SculptGL, the functions are grouped into dropdown areas:
 
-- **Modes** (buttons at the top of the panel, or `Tab`): **Sculpt** (brushes), **ZModeler** (polygon modelling),
-  **Retopo** (draw new topology over the sculpt) and **Mannequin** (pose a figure).
+- **Modes** (buttons at the top of the panel, or `Tab`): **Sculpt** (brushes), **Gizmo** (move, turn, scale and
+  deform the active SubTool), **ZModeler** (polygon modelling), **Retopo** (draw new topology over the sculpt) and
+  **Mannequin** (pose a figure).
 - **Top-bar menus:** **File** (projects, import OBJ/STL, export OBJ/STL/PLY/glTF/FBX), **Render** (render image,
   render turntable), **Edit** (undo, redo), **Scene** (new sphere, cube or plane,
   quad QCube/QSphere/QCylinder/QPlane, mannequin, sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
   (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
-- **Side-panel folders** (click a title to fold it): **Sculpting** (tool dropdown, radius, intensity, negative,
+- **Side-panel folders** (click a title to fold it): **SubTools** (the objects in the scene, Live Boolean),
+  **History**, **Sculpting** (tool dropdown, radius, intensity, negative,
   symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, voxel remesh, mesh statistics),
-  **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**, **Lights**,
+  **Transform** (gizmo and deformers), **Array**, **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**, **Lights**,
   **Render**, **Export** (formats and 3D printing), **Viewport display** (material dropdown, AO, cavity, flat
   shading, wireframe, polygroup colours) and **Interface** (panel side).
 - The side panel docks on the **left or right** of the viewport. Use the **Panel left / Panel right** button in the
@@ -31,6 +33,27 @@ Like SculptGL, the functions are grouped into dropdown areas:
 
 ## Features
 
+- **SubTools:** a scene holds any number of separate objects. The **SubTools** folder lists them: click one to
+  sculpt it (the others are drawn greyed), click the dot to show or hide it, double-click the name to rename it,
+  and use ▲▼ to reorder. **Append** adds a primitive, a QMesh, a mannequin or an imported OBJ/STL beside the scene;
+  **Duplicate**, **Delete**, **Merge visible** (joins every visible SubTool into one) and **Split by polygroups**
+  (one SubTool per polygroup) manage them. Alt+click a SubTool in the viewport to select it. Every SubTool keeps its
+  own levels, mask and undo history. Export (and 3D-print export) writes every visible SubTool by default
+  (**Export › All visible SubTools**).
+- **Gizmo mode (Transform):** a move/rotate/scale gizmo on the active SubTool. Drag the coloured arrows to move along
+  an axis, the centre dot to move freely, the rings to rotate, the end dots to scale one axis, and the dashed outer
+  ring to scale evenly. If part of the SubTool is masked, only the unmasked part moves (with soft mask edges).
+  Hold Ctrl as you start a drag to snap moves to round steps, turns to 15° and scales to 0.1. Each drag is one
+  undo step.
+- **Gizmo deformers** (Transform folder): **Bend, Twist, Taper, Flatten, Inflate** along X, Y or Z. Pick one and
+  drag left or right in the viewport to set the amount; masking limits the effect.
+- **Live Boolean:** each SubTool has an operation badge: **Add**, **Subtract** or **Intersect** (click it to
+  change). Tick **Show the boolean result** and the viewport shows the combined result, top to bottom, updating
+  when you let go of a stroke. **Make boolean mesh** builds the result as a new, closed SubTool at the Topology
+  remesh resolution (the parts are hidden, not deleted).
+- **Arrays** (Array folder): repeat the active SubTool along a **line** (offset, turn and scale per copy), around a
+  **circle** (radius, sweep, axis) or in a **grid** (counts and gap), up to 64 copies. Copies are drawn live while
+  you sculpt the original, take part in Live Boolean and export, and **Convert to mesh** makes them real geometry.
 - **38 brushes**, grouped in the Tool list, each with its own radius and intensity. Hold Ctrl to invert a brush and Shift to smooth.
   - **Draw, Clay, Clay Buildup:** add material. Clay Buildup lays down fast, square-edged strips.
   - **Smooth, Flatten, Trim Dynamic, Scrape:** level the surface. Trim cuts peaks to crisp planes, and Scrape shaves
@@ -111,7 +134,8 @@ Like SculptGL, the functions are grouped into dropdown areas:
   (WebM where MP4 isn't available), an animated **GIF** (up to 640 pixels), or the frames as **PNGs in a ZIP** for
   video editors.
 - **Projects (.clayform):** save and open your work with every level, the mask, the camera and all brush and view
-  settings. The title bar shows ` •` when there are unsaved changes, and opening a project can be undone.
+  settings, and every SubTool with its operation and array. The title bar shows ` •` when there are unsaved
+  changes. Projects from earlier versions open as a single SubTool.
   **File › Open recent** lists the last ten projects.
 - **Autosave and crash recovery** (desktop app): every few minutes (Interface › Autosave, 1–30 minutes or off),
   once you pause, unsaved work is copied to a recovery file. If Clayform closes without saving, the next start
@@ -141,7 +165,8 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 | `D C B S F Y Q I` | Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate |
 | `P E V L G K U M` | Pinch, Crease, Dam Standard, Layer, Move Topological (Grab), Snakehook, Nudge, Mask |
 | `J H O` | Move, Clay Tubes, Polish (every brush is in the Tool list) |
-| `Tab` / Shift+Tab | Next / previous mode (Sculpt, ZModeler, Retopo, Mannequin) |
+| `Tab` / Shift+Tab | Next / previous mode (Sculpt, Gizmo, ZModeler, Retopo, Mannequin) |
+| Alt + click on an object | Select that SubTool |
 | Shift+G | Polygroup colours |
 | `Enter` / Esc | Retopology: close the face / drop the picked points |
 | `[` `]` | Brush radius |
@@ -153,7 +178,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 | `T` | Dynamic topology on/off |
 | `R` | Voxel remesh |
 | Ctrl+I / Ctrl+E | Import / export mesh |
-| Home | Frame mesh |
+| Home | Frame the scene |
 | F12 | Render image |
 | `1` `3` `7` (Ctrl for the opposite side) | Front, right, top views |
 
@@ -175,7 +200,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 

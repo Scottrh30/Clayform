@@ -348,6 +348,8 @@ pub enum Gather {
     /// Everything within the brush radius of the line through the centre
     /// along this direction (the view).
     Depth(Vec3),
+    /// The whole object, less what's masked (gizmo and deformers).
+    Whole,
 }
 
 /// What a dragging brush does with its region.
@@ -357,6 +359,10 @@ pub enum DragKind {
     Anchor(AnchorMode),
     ClothPull,
     ClothTwist,
+    /// Gizmo: `DragInput::affine` about nothing in particular.
+    Affine,
+    /// A deformer along an axis (0 = X, 1 = Y, 2 = Z) by `DragInput::amount`.
+    Deform(crate::deform::Deformer, usize),
 }
 
 /// Pointer state for a dragging brush.
@@ -370,6 +376,10 @@ pub struct DragInput {
     pub view: Vec3,
     /// World units per screen point at the stroke start.
     pub wpp: f32,
+    /// Gizmo transform.
+    pub affine: glam::Mat4,
+    /// Deformer strength (-1..1, roughly).
+    pub amount: f32,
 }
 
 /// One multiresolution level. The active level's mesh lives in
@@ -511,6 +521,8 @@ struct GrabSet {
     /// Cloth: per-vertex inverse mass and edges (local indices, rest length).
     inv_mass: Vec<f32>,
     edges: Vec<(u32, u32, f32)>,
+    /// Bounds of the gathered vertices (deformers).
+    bounds: (Vec3, Vec3),
 }
 
 struct Stroke {
@@ -850,6 +862,35 @@ impl Sculptor {
             })
             .collect();
         (levels, self.level)
+    }
+
+    /// A sculptor holding loaded levels, with no undo history.
+    pub fn from_levels(levels: Vec<crate::project::LevelData<Mesh>>, active: usize, bvh: Option<Bvh>) -> Self {
+        let mut s = Sculptor::new(Mesh::new(Vec::new(), Vec::new()));
+        s.load_levels(levels, active, bvh);
+        s.clear_history();
+        s
+    }
+
+    /// Forgets every undo and redo step.
+    pub fn clear_history(&mut self) {
+        self.end_stroke();
+        self.undo.clear();
+        self.redo.clear();
+        self.undo_labels.clear();
+        self.redo_labels.clear();
+    }
+
+    /// Every level's mesh copied (for duplicating).
+    pub fn clone_levels(&self) -> (Vec<crate::project::LevelData<Mesh>>, usize) {
+        let (levels, active) = self.project_levels();
+        (
+            levels
+                .into_iter()
+                .map(|l| crate::project::LevelData { mesh: l.mesh.clone(), stencils: l.stencils, details: l.details })
+                .collect(),
+            active,
+        )
     }
 
     /// Replaces the whole sculpt with loaded levels (the old sculpt moves
@@ -1605,6 +1646,10 @@ impl Sculptor {
                 self.collect_region(center, reach, seed_tri, true);
                 self.region.clone()
             }
+            Gather::Whole => (0..self.mesh.positions.len() as u32)
+                .filter(|&v| !self.mesh.vert_faces(v).is_empty() && self.mesh.mask[v as usize] < 1.0)
+                .map(|v| (v, 1.0 - self.mesh.mask[v as usize]))
+                .collect(),
             Gather::Spatial | Gather::Elastic | Gather::Depth(_) => {
                 let far = if gather == Gather::Elastic { radius * 3.0 } else { radius };
                 let (mn, mx) = (center - Vec3::splat(far), center + Vec3::splat(far));
@@ -1675,8 +1720,9 @@ impl Sculptor {
         } else {
             (Vec::new(), Vec::new())
         };
+        let bounds = orig.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
         if let Some(st) = self.stroke.as_mut() {
-            st.grab.push(GrabSet { verts, orig, xf, kind, center, normal, nrm, inv_mass, edges });
+            st.grab.push(GrabSet { verts, orig, xf, kind, center, normal, nrm, inv_mass, edges, bounds });
         }
     }
 
@@ -1690,7 +1736,16 @@ impl Sculptor {
             let view = (set.xf * input.view).normalize_or_zero();
             let angle = input.screen.x * 0.01 * det;
             let mut x: Vec<Vec3> = Vec::with_capacity(set.verts.len());
+            if let DragKind::Deform(kind, axis) = set.kind {
+                let moved = crate::deform::apply(kind, axis, input.amount, &set.orig, &set.nrm, set.bounds);
+                for (k, &(_, w)) in set.verts.iter().enumerate() {
+                    x.push(set.orig[k].lerp(moved[k], w));
+                }
+            }
             for (k, &(_, w)) in set.verts.iter().enumerate() {
+                if matches!(set.kind, DragKind::Deform(..)) {
+                    break;
+                }
                 let o = set.orig[k];
                 let rel = o - set.center;
                 let rot = |axis: Vec3, a: f32| -> Vec3 {
@@ -1708,6 +1763,8 @@ impl Sculptor {
                         set.center + rel * (1.0 - input.screen.y * 0.005 * w).max(0.05)
                     }
                     DragKind::Anchor(AnchorMode::Inflate) => o + set.nrm[k] * (-input.screen.y * input.wpp * w),
+                    DragKind::Affine => o.lerp(input.affine.transform_point3(o), w),
+                    DragKind::Deform(..) => o,
                 };
                 x.push(q);
             }
@@ -2278,9 +2335,10 @@ mod tests {
         s.set_level(1);
         let (levels, active) = s.project_levels();
         let bytes = crate::project::encode(&levels, active, r#"{"hello":1}"#);
-        let p = crate::project::decode(&bytes).unwrap();
+        let mut p = crate::project::decode(&bytes).unwrap();
         assert_eq!(p.settings_json, r#"{"hello":1}"#);
-        let loaded: Vec<crate::project::LevelData<Mesh>> = p
+        let st = p.subtools.remove(0);
+        let loaded: Vec<crate::project::LevelData<Mesh>> = st
             .levels
             .into_iter()
             .map(|l| {
@@ -2290,7 +2348,7 @@ mod tests {
             .collect();
         let mut t = Sculptor::new(Mesh::icosphere(1));
         let rev = t.revision();
-        t.load_levels(loaded, p.active, None);
+        t.load_levels(loaded, st.active, None);
         assert!(t.revision() > rev);
         assert_eq!((t.level(), t.level_count()), (1, 3));
         s.set_level(2);

@@ -60,6 +60,8 @@ pub struct RenderSettings {
     pub export_format: usize,
     pub print_size: f32,
     pub print_unit: Unit,
+    /// Export every visible SubTool (not just the active one).
+    pub export_all: bool,
 }
 
 impl Default for RenderSettings {
@@ -76,6 +78,7 @@ impl Default for RenderSettings {
             export_format: 0,
             print_size: 100.0,
             print_unit: Unit::Mm,
+            export_all: true,
         }
     }
 }
@@ -95,7 +98,7 @@ async fn render_rgba(ui: Ui, size: [u32; 2], turn: f32, rs: &RenderSettings) -> 
     let mut r = RENDERER.with(|r| r.borrow_mut().take()).ok_or("The 3D view isn't ready")?;
     let view = ui.view.get_untracked();
     let (cam_view, proj, far, dof, ao) = with_ed(|e| {
-        r.sync_mesh(&e.sculptor.mesh, &mut e.sculptor.dirty, view.wireframe, view.polygroups);
+        sync_scene(&mut r, e, &view);
         let mut cam = e.camera.clone();
         cam.yaw += turn;
         let aspect = size[0] as f32 / size[1].max(1) as f32;
@@ -382,10 +385,20 @@ pub async fn render_turntable(ui: Ui, rs: RenderSettings) {
     }
 }
 
+/// The mesh to export: all visible SubTools (arrays included) or just the active one.
+fn export_source(e: &Editor, all: bool) -> Mesh {
+    if all && e.subtool_count() > 1 {
+        e.visible_mesh()
+    } else {
+        e.baked_mesh(e.active_subtool())
+    }
+}
+
 pub async fn export_mesh(ui: Ui, ext: &'static str) {
+    let all = ui.render.get_untracked().export_all;
     let bytes = with_ed(|e| {
         e.cancel_drag();
-        io::save(&e.sculptor.mesh, ext)
+        io::save(&export_source(e, all), ext)
     });
     let name = format!("{}.{ext}", ui.project_name.get_untracked());
     match host::save_file(&name, ext, "Export mesh", bytes).await {
@@ -398,8 +411,9 @@ pub async fn export_mesh(ui: Ui, ext: &'static str) {
 async fn export_print(ui: Ui, rs: RenderSettings) {
     let (bytes, check) = with_ed(|e| {
         e.cancel_drag();
-        let pl = print::placement(&e.sculptor.mesh, rs.print_size, rs.print_unit);
-        (io::save_placed(&e.sculptor.mesh, "stl", &pl), print::check(&e.sculptor.mesh))
+        let m = export_source(e, rs.export_all);
+        let pl = print::placement(&m, rs.print_size, rs.print_unit);
+        (io::save_placed(&m, "stl", &pl), print::check(&m))
     });
     let name = format!("{}_print.stl", ui.project_name.get_untracked());
     match host::save_file(&name, "stl", "Export for 3D printing", bytes).await {
@@ -696,7 +710,7 @@ pub fn ExportFolder(ui: Ui) -> impl IntoView {
     let dims = move || {
         let _ = ui.rev.get();
         let r = rs.get();
-        let d = with_ed(|e| print::printed_size(&e.sculptor.mesh, r.print_size));
+        let d = with_ed(|e| print::printed_size(&export_source(e, r.export_all), r.print_size));
         format!("{:.1} × {:.1} × {:.1} {}", d.x, d.y, d.z, r.print_unit.name())
     };
     view! {
@@ -715,6 +729,7 @@ pub fn ExportFolder(ui: Ui) -> impl IntoView {
                         .collect_view()}
                 </select>
             </label>
+            <Check label="All visible SubTools" value=Signal::derive(move || rs.get().export_all) on_change=move |v| rs.update(|r| r.export_all = v) />
             <div class="row buttons">
                 <button class="primary" on:click=move |_| {
                     let ext = io::EXPORT_FORMATS[rs.get_untracked().export_format].0;
@@ -743,7 +758,7 @@ pub fn ExportFolder(ui: Ui) -> impl IntoView {
             </div>
             <div class="row info">{dims}</div>
             <div class="row buttons">
-                <button on:click=move |_| check.set(Some(with_ed(|e| print::check(&e.sculptor.mesh))))>"Check mesh"</button>
+                <button on:click=move |_| check.set(Some(with_ed(|e| print::check(&export_source(e, rs.get_untracked().export_all)))))>"Check mesh"</button>
                 <button class="primary" on:click=move |_| spawn_local(export_print(ui, rs.get_untracked()))>"Export STL for printing…"</button>
             </div>
             {move || {

@@ -54,6 +54,49 @@ struct GroupVertex {
     color: [f32; 3],
 }
 
+/// Per-object uniforms: shading tweaks and up to `MAX_INSTANCES` copy transforms.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ObjUniform {
+    /// x: dim (inactive SubTool), y: copies.
+    params: [f32; 4],
+    instances: [[[f32; 4]; 4]; MAX_INSTANCES],
+}
+
+pub const MAX_INSTANCES: usize = clayform_core::scene::MAX_COPIES;
+
+/// One object's GPU buffers.
+struct GpuMesh {
+    vbuf: Option<wgpu::Buffer>,
+    ibuf: Option<wgpu::Buffer>,
+    ebuf: Option<wgpu::Buffer>,
+    gbuf: Option<wgpu::Buffer>,
+    index_count: u32,
+    edge_count: u32,
+    group_count: u32,
+    edges_stale: bool,
+    groups_stale: bool,
+    staging: Vec<GpuVertex>,
+    index_staging: Vec<u32>,
+    /// Bounds of the mesh (without copies).
+    bounds: (Vec3, Vec3),
+    obj_ubuf: wgpu::Buffer,
+    obj_bind: wgpu::BindGroup,
+    obj: ObjUniform,
+    visible: bool,
+    seen: bool,
+}
+
+/// What `sync_object` needs to know about an object besides its mesh.
+pub struct ObjectView<'a> {
+    pub id: u64,
+    pub visible: bool,
+    /// Draw dimmer (not the SubTool being sculpted).
+    pub dim: bool,
+    /// Copy transforms (array); empty = just the object.
+    pub instances: &'a [Mat4],
+}
+
 /// Polygroup colour in linear RGB.
 pub fn group_color(g: u32) -> [f32; 3] {
     clayform_core::poly::group_color(g).map(|c| c.powf(2.2))
@@ -211,9 +254,6 @@ pub struct Renderer {
     mesh_pipe: wgpu::RenderPipeline,
     wire_pipe: wgpu::RenderPipeline,
     group_pipe: wgpu::RenderPipeline,
-    gbuf: Option<wgpu::Buffer>,
-    group_count: u32,
-    groups_stale: bool,
     bg_pipe: wgpu::RenderPipeline,
     depth_pipe: wgpu::RenderPipeline,
     ssao_pipe: wgpu::RenderPipeline,
@@ -226,22 +266,19 @@ pub struct Renderer {
     shadow_zbuf: wgpu::TextureView,
     shadow_ubuf: wgpu::Buffer,
     shadow_bind: wgpu::BindGroup,
-    /// Bounds of the mesh (for fitting the shadow map).
-    bounds: (Vec3, Vec3),
+    obj_bgl: wgpu::BindGroupLayout,
+    /// Identity transform, for draws without an object (background).
+    default_obj: wgpu::BindGroup,
+    empty_bind: wgpu::BindGroup,
+    objects: std::collections::HashMap<u64, GpuMesh>,
+    /// Draw order (the SubTool list order).
+    order: Vec<u64>,
     sampler: wgpu::Sampler,
     matcap_view: wgpu::TextureView,
     /// Why ambient occlusion is unavailable on this GPU, if it is.
     pub ao_error: Option<String>,
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
-    vbuf: Option<wgpu::Buffer>,
-    ibuf: Option<wgpu::Buffer>,
-    ebuf: Option<wgpu::Buffer>,
-    index_count: u32,
-    edge_count: u32,
-    edges_stale: bool,
-    staging: Vec<GpuVertex>,
-    index_staging: Vec<u32>,
     targets: Option<Targets>,
     pub adapter_name: String,
 }
@@ -382,13 +419,44 @@ impl Renderer {
                 tex_entry(2, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
+        let obj_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("object"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let empty_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("empty"), entries: &[] });
+        let empty_bind = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("empty"), layout: &empty_bgl, entries: &[] });
+        let default_obj = {
+            let b = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("default object"),
+                size: std::mem::size_of::<ObjUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut o = ObjUniform::zeroed();
+            o.instances[0] = Mat4::IDENTITY.to_cols_array_2d();
+            queue.write_buffer(&b, 0, bytemuck::bytes_of(&o));
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("default object"),
+                layout: &obj_bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: b.as_entire_binding() }],
+            })
+        };
         let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao depth"),
             entries: &[tex_entry(0, wgpu::TextureSampleType::Float { filterable: false })],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("layout"),
-            bind_group_layouts: &[&bgl, &main_bgl],
+            bind_group_layouts: &[&bgl, &main_bgl, &obj_bgl],
             push_constant_ranges: &[],
         });
         let ssao_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -398,7 +466,7 @@ impl Renderer {
         });
         let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("depth layout"),
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&bgl, &empty_bgl, &obj_bgl],
             push_constant_ranges: &[],
         });
         let dof_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -657,9 +725,6 @@ impl Renderer {
             mesh_pipe,
             wire_pipe,
             group_pipe,
-            gbuf: None,
-            group_count: 0,
-            groups_stale: true,
             bg_pipe,
             depth_pipe,
             ssao_pipe,
@@ -672,20 +737,16 @@ impl Renderer {
             shadow_zbuf,
             shadow_ubuf,
             shadow_bind,
-            bounds: (Vec3::splat(-1.0), Vec3::splat(1.0)),
+            obj_bgl,
+            default_obj,
+            empty_bind,
+            objects: Default::default(),
+            order: Vec::new(),
             sampler,
             matcap_view,
             ao_error: ao_error.map(|e| e.to_string()),
             ubuf,
             bind,
-            vbuf: None,
-            ibuf: None,
-            ebuf: None,
-            index_count: 0,
-            edge_count: 0,
-            edges_stale: true,
-            staging: Vec::new(),
-            index_staging: Vec::new(),
             targets: None,
         })
     }
@@ -800,13 +861,89 @@ impl Renderer {
         self.device.limits().max_texture_dimension_2d.min(8192)
     }
 
-    /// Uploads whatever changed in the mesh since the last frame.
-    pub fn sync_mesh(&mut self, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool, need_groups: bool) {
-        if dirty.topology || dirty.range.is_some() {
-            self.groups_stale = true;
+    /// Starts a frame's object updates (objects not synced again are dropped).
+    pub fn begin_sync(&mut self) {
+        for g in self.objects.values_mut() {
+            g.seen = false;
         }
-        if dirty.topology || self.vbuf.is_none() {
-            self.bounds = mesh.bounds();
+        self.order.clear();
+    }
+
+    /// Forgets objects that weren't synced since `begin_sync`.
+    pub fn end_sync(&mut self) {
+        self.objects.retain(|_, g| g.seen);
+    }
+
+    fn new_object(&self) -> GpuMesh {
+        let obj_ubuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("object"),
+            size: std::mem::size_of::<ObjUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let obj_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("object"),
+            layout: &self.obj_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: obj_ubuf.as_entire_binding() }],
+        });
+        GpuMesh {
+            vbuf: None,
+            ibuf: None,
+            ebuf: None,
+            gbuf: None,
+            index_count: 0,
+            edge_count: 0,
+            group_count: 0,
+            edges_stale: true,
+            groups_stale: true,
+            staging: Vec::new(),
+            index_staging: Vec::new(),
+            bounds: (Vec3::splat(-1.0), Vec3::splat(1.0)),
+            obj_ubuf,
+            obj_bind,
+            obj: ObjUniform::zeroed(),
+            visible: true,
+            seen: true,
+        }
+    }
+
+    /// Uploads whatever changed in an object's mesh since the last frame.
+    pub fn sync_object(&mut self, ov: &ObjectView, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool, need_groups: bool) {
+        let mut g = self.objects.remove(&ov.id).unwrap_or_else(|| {
+            dirty.topology = true;
+            self.new_object()
+        });
+        g.seen = true;
+        g.visible = ov.visible;
+        self.order.push(ov.id);
+        // object uniforms (cheap; written when they change)
+        let mut obj = ObjUniform::zeroed();
+        obj.params = [if ov.dim { 1.0 } else { 0.0 }, ov.instances.len().max(1) as f32, 0.0, 0.0];
+        if ov.instances.is_empty() {
+            obj.instances[0] = Mat4::IDENTITY.to_cols_array_2d();
+        } else {
+            for (k, m) in ov.instances.iter().take(MAX_INSTANCES).enumerate() {
+                obj.instances[k] = m.to_cols_array_2d();
+            }
+        }
+        if bytemuck::bytes_of(&obj) != bytemuck::bytes_of(&g.obj) {
+            self.queue.write_buffer(&g.obj_ubuf, 0, bytemuck::bytes_of(&obj));
+            g.obj = obj;
+        }
+        if !ov.visible {
+            self.objects.insert(ov.id, g);
+            return;
+        }
+        self.sync_buffers(&mut g, mesh, dirty, need_edges, need_groups);
+        self.objects.insert(ov.id, g);
+    }
+
+    fn sync_buffers(&self, g: &mut GpuMesh, mesh: &Mesh, dirty: &mut GpuDirty, need_edges: bool, need_groups: bool) {
+        if dirty.topology || dirty.range.is_some() {
+            g.groups_stale = true;
+        }
+        if dirty.topology || g.vbuf.is_none() {
+            g.bounds = mesh.bounds();
         }
         let n = mesh.positions.len();
         let to_gpu = |i: usize| GpuVertex {
@@ -815,43 +952,43 @@ impl Renderer {
             mask: mesh.mask[i],
             cavity: cavity(mesh, i),
         };
-        if dirty.topology || self.vbuf.is_none() {
+        if dirty.topology || g.vbuf.is_none() {
             // Dynamic topology re-uploads every frame while sculpting, so
             // buffers grow with headroom and are reused when big enough.
-            self.staging.clear();
-            self.staging.extend((0..n).map(to_gpu));
-            self.index_staging.clear();
+            g.staging.clear();
+            g.staging.extend((0..n).map(to_gpu));
+            g.index_staging.clear();
             for t in &mesh.tris {
                 if t[0] != NONE {
-                    self.index_staging.extend_from_slice(t);
+                    g.index_staging.extend_from_slice(t);
                 }
             }
-            let vbytes = (self.staging.len().max(1) * std::mem::size_of::<GpuVertex>()) as u64;
-            if self.vbuf.as_ref().is_none_or(|b| b.size() < vbytes) {
-                self.vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            let vbytes = (g.staging.len().max(1) * std::mem::size_of::<GpuVertex>()) as u64;
+            if g.vbuf.as_ref().is_none_or(|b| b.size() < vbytes) {
+                g.vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("vertices"),
                     size: vbytes + vbytes / 2,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
             }
-            let ibytes = (self.index_staging.len().max(3) * 4) as u64;
-            if self.ibuf.as_ref().is_none_or(|b| b.size() < ibytes) {
-                self.ibuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            let ibytes = (g.index_staging.len().max(3) * 4) as u64;
+            if g.ibuf.as_ref().is_none_or(|b| b.size() < ibytes) {
+                g.ibuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("indices"),
                     size: (ibytes + ibytes / 2 + 3) & !3,
                     usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
             }
-            if !self.staging.is_empty() {
-                self.queue.write_buffer(self.vbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.staging));
+            if !g.staging.is_empty() {
+                self.queue.write_buffer(g.vbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&g.staging));
             }
-            if !self.index_staging.is_empty() {
-                self.queue.write_buffer(self.ibuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.index_staging));
+            if !g.index_staging.is_empty() {
+                self.queue.write_buffer(g.ibuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&g.index_staging));
             }
-            self.index_count = self.index_staging.len() as u32;
-            self.edges_stale = true;
+            g.index_count = g.index_staging.len() as u32;
+            g.edges_stale = true;
             dirty.topology = false;
             dirty.range = None;
             dirty.blocks.clear();
@@ -860,16 +997,16 @@ impl Renderer {
             for (a, b) in dirty.take_runs(n) {
                 let (a, b) = (a as usize, b as usize);
                 for i in a..=b {
-                    self.staging[i] = to_gpu(i);
+                    g.staging[i] = to_gpu(i);
                     // grow the shadow bounds with moved vertices (cheaper than a full pass)
                     let p = mesh.positions[i];
-                    self.bounds = (self.bounds.0.min(p), self.bounds.1.max(p));
+                    g.bounds = (g.bounds.0.min(p), g.bounds.1.max(p));
                 }
                 let off = (a * std::mem::size_of::<GpuVertex>()) as u64;
-                self.queue.write_buffer(self.vbuf.as_ref().unwrap(), off, bytemuck::cast_slice(&self.staging[a..=b]));
+                self.queue.write_buffer(g.vbuf.as_ref().unwrap(), off, bytemuck::cast_slice(&g.staging[a..=b]));
             }
         }
-        if need_edges && self.edges_stale {
+        if need_edges && g.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);
             let mut edges: Vec<u32> = Vec::with_capacity(mesh.tris.len() * 3);
             for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
@@ -894,22 +1031,22 @@ impl Renderer {
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&ebuf, 0, bytemuck::cast_slice(&edges));
-            self.ebuf = Some(ebuf);
-            self.edge_count = edges.len() as u32;
-            self.edges_stale = false;
+            g.ebuf = Some(ebuf);
+            g.edge_count = edges.len() as u32;
+            g.edges_stale = false;
         }
-        if need_groups && self.groups_stale {
+        if need_groups && g.groups_stale {
             let mut verts: Vec<GroupVertex> = Vec::with_capacity(mesh.tris.len() * 3);
             for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
                 let color = group_color(mesh.groups.get(f).copied().unwrap_or(0));
                 for &v in t {
-                    let g = &self.staging[v as usize];
+                    let g = &g.staging[v as usize];
                     verts.push(GroupVertex { pos: g.pos, nrm: g.nrm, mask: g.mask, cavity: g.cavity, color });
                 }
             }
             let bytes = (verts.len().max(1) * std::mem::size_of::<GroupVertex>()) as u64;
-            if self.gbuf.as_ref().is_none_or(|b| b.size() < bytes) {
-                self.gbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            if g.gbuf.as_ref().is_none_or(|b| b.size() < bytes) {
+                g.gbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("polygroup vertices"),
                     size: bytes + bytes / 4,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -917,10 +1054,52 @@ impl Renderer {
                 }));
             }
             if !verts.is_empty() {
-                self.queue.write_buffer(self.gbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
+                self.queue.write_buffer(g.gbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
             }
-            self.group_count = verts.len() as u32;
-            self.groups_stale = false;
+            g.group_count = verts.len() as u32;
+            g.groups_stale = false;
+        }
+    }
+
+    /// Visible objects with geometry, in draw order.
+    fn drawn(&self) -> impl Iterator<Item = &GpuMesh> {
+        self.order.iter().filter_map(|id| self.objects.get(id)).filter(|g| g.visible && g.vbuf.is_some() && g.index_count > 0)
+    }
+
+    fn has_geometry(&self) -> bool {
+        self.drawn().next().is_some()
+    }
+
+    /// Bounds of everything drawn, copies included.
+    fn scene_bounds(&self) -> (Vec3, Vec3) {
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for g in self.drawn() {
+            let (a, b) = g.bounds;
+            for k in 0..(g.obj.params[1] as usize).clamp(1, MAX_INSTANCES) {
+                let m = Mat4::from_cols_array_2d(&g.obj.instances[k]);
+                for c in 0..8 {
+                    let q = Vec3::new(
+                        if c & 1 == 0 { a.x } else { b.x },
+                        if c & 2 == 0 { a.y } else { b.y },
+                        if c & 4 == 0 { a.z } else { b.z },
+                    );
+                    let q = m.transform_point3(q);
+                    mn = mn.min(q);
+                    mx = mx.max(q);
+                }
+            }
+        }
+        if mn.x > mx.x { (Vec3::splat(-1.0), Vec3::splat(1.0)) } else { (mn, mx) }
+    }
+
+    /// Draws every visible object's triangles with the current pipeline.
+    fn draw_all<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        for g in self.drawn() {
+            let (Some(vb), Some(ib)) = (&g.vbuf, &g.ibuf) else { continue };
+            pass.set_bind_group(2, &g.obj_bind, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..g.index_count, 0, 0..g.obj.params[1].max(1.0) as u32);
         }
     }
 
@@ -940,14 +1119,14 @@ impl Renderer {
         // the key light's shadow map covers the mesh's bounding sphere
         let key = rig.lights[0];
         let world_dir = if rig.follow_camera { inv_view.transform_vector3(key.dir()).normalize_or_zero() } else { key.dir() };
-        let (mn, mx) = self.bounds;
+        let (mn, mx) = self.scene_bounds();
         let c = (mn + mx) * 0.5;
         let r = ((mx - mn) * 0.5).length().max(1e-3) * 1.05;
         let up = if world_dir.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
         let lview = Mat4::look_at_rh(c + world_dir * r * 2.0, c, up);
         let lproj = Mat4::orthographic_rh(-r, r, -r, r, r * 0.5, r * 3.5);
         let light_vp = lproj * lview;
-        let shadows = lit && rig.shadows && key.on && self.vbuf.is_some();
+        let shadows = lit && rig.shadows && key.on && self.has_geometry();
         let u = Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
             view: view.to_cols_array_2d(),
@@ -964,7 +1143,7 @@ impl Renderer {
             bg_bottom: [bottom[0], bottom[1], bottom[2], 1.0],
             viewport: [size[0] as f32, size[1] as f32, 1.0 / size[0] as f32, 1.0 / size[1] as f32],
             shading: [
-                (s.ao && self.vbuf.is_some() && self.ao_error.is_none()) as u32 as f32,
+                (s.ao && self.has_geometry() && self.ao_error.is_none()) as u32 as f32,
                 s.ao_strength,
                 if s.cavity { s.cavity_strength } else { 0.0 },
                 ao_radius,
@@ -994,7 +1173,7 @@ impl Renderer {
         transparent: bool,
     ) {
         if u.lighting[1] > 0.5 {
-            if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {
+            {
                 // the shadow pass reuses the depth shader with the light's matrices
                 let mut su = *u;
                 su.view_proj = light_vp.to_cols_array_2d();
@@ -1016,13 +1195,12 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.shadow_pipe);
                 pass.set_bind_group(0, &self.shadow_bind, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+                pass.set_bind_group(1, &self.empty_bind, &[]);
+                self.draw_all(&mut pass);
             }
         }
         if s.ao && self.ao_error.is_none() {
-            if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {
+            if self.has_geometry() {
                 // 1. depth of the sculpt at half resolution
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("ao depth"),
@@ -1041,9 +1219,8 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.depth_pipe);
                 pass.set_bind_group(0, &self.bind, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+                pass.set_bind_group(1, &self.empty_bind, &[]);
+                self.draw_all(&mut pass);
             }
             // 2. occlusion from that depth
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1057,7 +1234,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if self.vbuf.is_some() {
+            if self.has_geometry() {
                 pass.set_pipeline(&self.ssao_pipe);
                 pass.set_bind_group(0, &self.bind, &[]);
                 pass.set_bind_group(1, &t.ssao_bind, &[]);
@@ -1082,30 +1259,34 @@ impl Renderer {
         });
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_bind_group(1, &t.main_bind, &[]);
+        pass.set_bind_group(2, &self.default_obj, &[]);
         if !transparent {
             pass.set_pipeline(&self.bg_pipe);
             pass.draw(0..3, 0..1);
         }
-        if let (Some(vb), Some(ib)) = (&self.vbuf, &self.ibuf) {
-            match (&self.gbuf, s.polygroups) {
+        for g in self.drawn() {
+            let (Some(vb), Some(ib)) = (&g.vbuf, &g.ibuf) else { continue };
+            let copies = g.obj.params[1].max(1.0) as u32;
+            pass.set_bind_group(2, &g.obj_bind, &[]);
+            match (&g.gbuf, s.polygroups) {
                 (Some(gb), true) => {
                     pass.set_vertex_buffer(0, gb.slice(..));
                     pass.set_pipeline(&self.group_pipe);
-                    pass.draw(0..self.group_count, 0..1);
+                    pass.draw(0..g.group_count, 0..copies);
                 }
                 _ => {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_pipeline(&self.mesh_pipe);
                     pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..self.index_count, 0, 0..1);
+                    pass.draw_indexed(0..g.index_count, 0, 0..copies);
                 }
             }
-            pass.set_vertex_buffer(0, vb.slice(..));
             if s.wireframe {
-                if let Some(eb) = &self.ebuf {
+                if let Some(eb) = &g.ebuf {
+                    pass.set_vertex_buffer(0, vb.slice(..));
                     pass.set_pipeline(&self.wire_pipe);
                     pass.set_index_buffer(eb.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..self.edge_count, 0, 0..1);
+                    pass.draw_indexed(0..g.edge_count, 0, 0..copies);
                 }
             }
         }
@@ -1162,7 +1343,7 @@ impl Renderer {
         let mut enc = self.device.create_command_encoder(&Default::default());
         self.encode_scene(&mut enc, &t, &scene_view, s, &u, light_vp, transparent);
         let mut out_tex = scene;
-        if let (Some(_), Some(vb), Some(ib)) = (dof_params, &self.vbuf, &self.ibuf) {
+        if dof_params.is_some() && self.has_geometry() {
             // full-resolution linear depth for the blur
             let depth = self.plain_texture("dof depth", PACKED_DEPTH_FORMAT, size, false);
             let zbuf = self.plain_texture("dof zbuf", DEPTH_FORMAT, size, false);
@@ -1184,9 +1365,8 @@ impl Renderer {
                 });
                 pass.set_pipeline(&self.depth_pipe);
                 pass.set_bind_group(0, &self.bind, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+                pass.set_bind_group(1, &self.empty_bind, &[]);
+                self.draw_all(&mut pass);
             }
             let blurred = self.plain_texture_raw("dof out", fmt, size, true);
             let blurred_view = blurred.create_view(&Default::default());
