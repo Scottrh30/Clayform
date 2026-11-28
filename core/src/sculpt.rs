@@ -449,6 +449,8 @@ pub(crate) enum Undo {
     Colors { idx: Vec<u32>, col: Vec<[u8; 4]> },
     /// The whole polypaint (empty = unpainted).
     AllColors(Vec<[u8; 4]>),
+    /// A mannequin's mesh and pose.
+    Pose(Box<(Mesh, Vec<f32>)>),
     State(Box<State>),
     /// Go back to this multiresolution level (level changes are exactly
     /// reversible, so nothing needs copying).
@@ -473,6 +475,7 @@ impl Undo {
             Undo::Extra(b) => b.0.bytes() + b.1.len() * 12,
             Undo::Colors { idx, .. } => idx.len() * 8,
             Undo::AllColors(c) => c.len() * 4,
+            Undo::Pose(b) => mesh_bytes(&b.0) + b.1.len() * 4,
             Undo::State(s) => {
                 mesh_bytes(&s.mesh)
                     + s.levels
@@ -695,6 +698,8 @@ pub struct Sculptor {
     /// The highest level as it was before the last topology change, for
     /// "Reproject higher levels" (mesh, how many levels it had above the base).
     pub(crate) lost_top: Option<(std::sync::Arc<Mesh>, usize)>,
+    /// Revision after the last merged pose step (slider drags).
+    pub(crate) pose_rev: Option<u64>,
     /// Level to return to while a split subdivision is in progress.
     pending_level: Option<usize>,
     /// Counts changes, so the interface can tell when there's unsaved work.
@@ -741,6 +746,7 @@ impl Sculptor {
             level: 0,
             extra: Default::default(),
             lost_top: None,
+            pose_rev: None,
             pending_level: None,
             revision: 0,
             dirty: GpuDirty { topology: true, ..Default::default() },
@@ -816,6 +822,7 @@ impl Sculptor {
                 Undo::Groups { .. } => "Polygroups",
                 Undo::Extra(_) => "Layers",
                 Undo::Colors { .. } | Undo::AllColors(_) => "Paint",
+                Undo::Pose(_) => "Pose",
             }
             .to_string()
         });
@@ -1220,6 +1227,19 @@ impl Sculptor {
             paint: false,
             old_col: Vec::new(),
         });
+    }
+
+    /// Records the current mannequin mesh and pose as an undo step (before
+    /// the pose changes). With `merge`, repeated calls with the same label
+    /// and nothing in between make one step (a slider drag).
+    pub fn push_pose_undo(&mut self, label: &str, merge: bool) {
+        self.end_stroke();
+        if merge && self.undo_labels.last().map(|s| s.as_str()) == Some(label) && self.pose_rev == Some(self.revision) {
+            return;
+        }
+        self.set_label(label);
+        self.push_undo(Undo::Pose(Box::new((self.mesh.clone(), self.extra.pose.clone()))));
+        self.pose_rev = Some(self.revision);
     }
 
     /// Name of the running stroke's undo step.
@@ -2098,6 +2118,13 @@ impl Sculptor {
                     }
                 }
                 Undo::Colors { idx, col: cur }
+            }
+            Undo::Pose(b) => {
+                let (mesh, pose) = *b;
+                let cur_mesh = std::mem::replace(&mut self.mesh, mesh);
+                let cur_pose = std::mem::replace(&mut self.extra.pose, pose);
+                self.topology_changed();
+                Undo::Pose(Box::new((cur_mesh, cur_pose)))
             }
             Undo::AllColors(c) => {
                 let cur = std::mem::replace(&mut self.mesh.colors, c);

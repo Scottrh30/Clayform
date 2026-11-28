@@ -39,6 +39,9 @@ pub struct Extra {
     pub recording: Option<(usize, Vec<Vec3>)>,
     /// Stored shape: (level, positions).
     pub morph: Option<(usize, Vec<Vec3>)>,
+    /// When the sculpt is a posed mannequin: its pose (so undo can bring
+    /// back the pose with the mesh).
+    pub pose: Vec<f32>,
 }
 
 impl Extra {
@@ -46,6 +49,7 @@ impl Extra {
         self.layers.iter().map(|l| l.delta.len() * 12 + 64).sum::<usize>()
             + self.recording.as_ref().map_or(0, |r| r.1.len() * 12)
             + self.morph.as_ref().map_or(0, |m| m.1.len() * 12)
+            + self.pose.len() * 4
     }
 
     /// The levels below `cut` were deleted: renumber, dropping what was on them.
@@ -504,6 +508,13 @@ impl Sculptor {
     /// Subdivides the new base as many times as the old sculpt had levels
     /// and projects the old highest level's detail onto it (one undo step).
     pub fn reproject_higher(&mut self) -> Result<(), String> {
+        self.reproject_higher_with(false)
+    }
+
+    /// `local`: only pull points that sit right on the old surface and face
+    /// the same way (after a local edit like ZModeler's, so new parts keep
+    /// their shape while untouched areas get their detail back).
+    pub fn reproject_higher_with(&mut self, local: bool) -> Result<(), String> {
         let Some((top, count)) = self.lost_top.clone() else { return Err("Nothing to reproject".into()) };
         if self.levels.len() != 1 {
             return Err("The sculpt already has levels".into());
@@ -523,11 +534,30 @@ impl Sculptor {
         }
         let bvh = Bvh::build(&top);
         let (mn, mx) = top.bounds();
-        let reach = (mx - mn).max_element() * 0.08;
+        let reach = if local {
+            // a few of the old top level's edges
+            let (sum, cnt) = top.tris.iter().filter(|t| t[0] != crate::mesh::NONE).take(20_000).fold((0.0f32, 0usize), |(s, c), t| {
+                (s + top.positions[t[0] as usize].distance(top.positions[t[1] as usize]), c + 1)
+            });
+            sum / cnt.max(1) as f32 * 4.0
+        } else {
+            (mx - mn).max_element() * 0.08
+        };
         for v in 0..self.mesh.positions.len() {
             let p = self.mesh.positions[v];
             let n = self.mesh.normals[v];
-            if let Some(q) = project_point(&top, &bvh, p, n, reach) {
+            let q = if local {
+                let nn = n.normalize_or_zero();
+                [nn, -nn]
+                    .into_iter()
+                    .filter_map(|d| bvh.raycast(&top, p, d))
+                    .filter(|h| h.t <= reach && top.face_normal_raw(h.tri as usize).normalize_or_zero().dot(nn) > 0.6)
+                    .min_by(|a, b| a.t.total_cmp(&b.t))
+                    .map(|h| h.point)
+            } else {
+                project_point(&top, &bvh, p, n, reach)
+            };
+            if let Some(q) = q {
                 self.mesh.positions[v] = q;
             }
         }

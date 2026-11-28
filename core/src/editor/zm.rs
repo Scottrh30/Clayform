@@ -39,6 +39,8 @@ pub(super) struct ZmDrag {
     action: Action,
     face: usize,
     edge: (u32, u32),
+    /// The sculpt had levels when the drag started (rebuilt on release).
+    had_levels: bool,
 }
 
 pub(super) struct BridgePick {
@@ -132,9 +134,30 @@ impl Editor {
             return;
         }
         let m = polys.to_mesh();
+        let had_levels = self.sculptor.level_count() > 1;
         self.sculptor.set_label(self.zm.action.name());
         self.sculptor.set_mesh(m);
+        if had_levels {
+            self.zm_rebuild_levels();
+        }
         self.redraw = true;
+    }
+
+    /// After an edit of the base level: subdivides it back up and puts the
+    /// old detail back where the surface didn't change, all part of the
+    /// edit's own undo step. Stays on the base level for more edits.
+    fn zm_rebuild_levels(&mut self) {
+        let n0 = self.sculptor.undo.len();
+        let labels0 = self.sculptor.undo_labels.len();
+        match self.sculptor.reproject_higher_with(true) {
+            Ok(()) => {
+                self.sculptor.undo.truncate(n0);
+                self.sculptor.undo_labels.truncate(labels0);
+                self.sculptor.goto_level(0);
+            }
+            Err(e) => self.message = Some(format!("Levels removed: {e}")),
+        }
+        self.zms.cache = None;
     }
 
     pub(super) fn zm_down(&mut self, p: Vec2, size: Vec2, _mods: Mods) -> Option<Drag> {
@@ -158,6 +181,7 @@ impl Editor {
                 action,
                 face: pick.face,
                 edge: pick.edge,
+                had_levels: self.sculptor.level_count() > 1,
             });
             return Some(Drag::Sculpt);
         }
@@ -317,7 +341,12 @@ impl Editor {
     }
 
     pub(super) fn zm_up(&mut self) {
-        self.zms.drag = None;
+        if let Some(dr) = self.zms.drag.take() {
+            if dr.applied && dr.had_levels {
+                self.zm_rebuild_levels();
+                self.redraw = true;
+            }
+        }
         self.zms.cache = None;
     }
 

@@ -178,19 +178,42 @@ pub fn surface_nets(min: Vec3, max: Vec3, h: f32, f: &dyn Fn(Vec3) -> f32) -> Re
                 if inside == 0 || inside == 8 {
                     continue;
                 }
+                // dual contouring: the point that best fits the surface's
+                // tangent planes at the crossings, so sharp edges and corners
+                // stay sharp instead of being cut off
                 let mut sum = Vec3::ZERO;
                 let mut n = 0.0;
+                let mut ata = glam::Mat3::ZERO;
+                let mut atb = Vec3::ZERO;
+                let base = node(i, j, k);
                 for &(a, b) in &EDGES {
                     if (d[a] < 0.0) != (d[b] < 0.0) {
                         let t = d[a] / (d[a] - d[b]);
                         let pa = Vec3::new(CORNERS[a][0] as f32, CORNERS[a][1] as f32, CORNERS[a][2] as f32);
                         let pb = Vec3::new(CORNERS[b][0] as f32, CORNERS[b][1] as f32, CORNERS[b][2] as f32);
-                        sum += pa.lerp(pb, t);
+                        let local = pa.lerp(pb, t);
+                        sum += local;
                         n += 1.0;
+                        let q = base + local * h;
+                        let g = gradient(f, q, h * 0.5);
+                        if g != Vec3::ZERO {
+                            ata += glam::Mat3::from_cols(g * g.x, g * g.y, g * g.z);
+                            atb += g * g.dot(local);
+                        }
                     }
                 }
+                let mass = sum / n;
+                // a little pull to the mass point keeps flat areas tidy
+                let lambda = 0.05;
+                let m = ata + glam::Mat3::from_diagonal(Vec3::splat(lambda));
+                let rhs = atb + mass * lambda;
+                let mut local = if m.determinant().abs() > 1e-9 { m.inverse() * rhs } else { mass };
+                if !local.is_finite() {
+                    local = mass;
+                }
+                let local = local.clamp(Vec3::splat(-0.25), Vec3::splat(1.25));
                 cell_vert[cidx(i, j, k)] = pos.len() as u32;
-                pos.push(node(i, j, k) + sum / n * h);
+                pos.push(base + local * h);
             }
         }
     }
@@ -244,16 +267,48 @@ pub fn surface_nets(min: Vec3, max: Vec3, h: f32, f: &dyn Fn(Vec3) -> f32) -> Re
     Ok(MeshBuilder::new(pos, tris).finish())
 }
 
-fn relax(mesh: &mut Mesh, passes: u32) {
+/// Unit normal of the field (central differences).
+fn gradient(f: &dyn Fn(Vec3) -> f32, p: Vec3, e: f32) -> Vec3 {
+    let g = Vec3::new(
+        f(p + Vec3::X * e) - f(p - Vec3::X * e),
+        f(p + Vec3::Y * e) - f(p - Vec3::Y * e),
+        f(p + Vec3::Z * e) - f(p - Vec3::Z * e),
+    );
+    g.normalize_or_zero()
+}
+
+/// Evens out the spacing while keeping sharp edges: vertices where faces
+/// meet at a crease stay put, the rest relax and snap back onto the surface.
+fn relax(mesh: &mut Mesh, passes: u32, f: &dyn Fn(Vec3) -> f32, h: f32) {
+    mesh.compute_all_normals();
+    let cos = 35f32.to_radians().cos();
+    let sharp: Vec<bool> = (0..mesh.positions.len())
+        .map(|v| {
+            let fs = mesh.vert_faces(v as u32);
+            fs.iter().any(|&a| {
+                let na = mesh.face_normals[a as usize].normalize_or_zero();
+                fs.iter().any(|&b| na.dot(mesh.face_normals[b as usize].normalize_or_zero()) < cos)
+            })
+        })
+        .collect();
     for _ in 0..passes {
         let prev = mesh.positions.clone();
         for v in 0..prev.len() {
+            if sharp[v] {
+                continue;
+            }
             let nb = mesh.neighbors(v as u32);
             if nb.is_empty() {
                 continue;
             }
             let avg: Vec3 = nb.iter().map(|&u| prev[u as usize]).sum::<Vec3>() / nb.len() as f32;
-            mesh.positions[v] = prev[v].lerp(avg, 0.5);
+            let mut p = prev[v].lerp(avg, 0.5);
+            // back onto the surface (two Newton steps)
+            for _ in 0..2 {
+                let g = gradient(f, p, h * 0.25);
+                p -= g * f(p);
+            }
+            mesh.positions[v] = p;
         }
     }
     mesh.compute_all_normals();
@@ -277,7 +332,22 @@ pub fn build(w: usize, h: usize, rgba: &[u8], s: &SnapshotSettings) -> Result<Me
             pm[(y + pad) * pw + x + pad] = mask[y * iw + x];
         }
     }
-    let sd = signed_distance(&pm, pw, ph);
+    let mut sd = signed_distance(&pm, pw, ph);
+    // soften the pixel staircase of the outline (a distance field blurs well)
+    for _ in 0..4 {
+        let prev = sd.clone();
+        for y in 1..ph - 1 {
+            for x in 1..pw - 1 {
+                let mut acc = 0.0;
+                for dy in [-1i32, 0, 1] {
+                    for dx in [-1i32, 0, 1] {
+                        acc += prev[((y as i32 + dy) as usize) * pw + (x as i32 + dx) as usize];
+                    }
+                }
+                sd[y * pw + x] = acc / 9.0;
+            }
+        }
+    }
     let px = 2.0 / iw.max(ih) as f32; // world size of a pixel
     let dmax = sd.iter().copied().fold(0.0f32, |a, d| a.max(-d)) * px;
     // deep shapes are built shallow and stretched, so the grid stays small
@@ -314,13 +384,14 @@ pub fn build(w: usize, h: usize, rgba: &[u8], s: &SnapshotSettings) -> Result<Me
     let hcell = 2.0 / s.resolution.clamp(32, 400) as f32;
     let ext = Vec3::new(pw as f32 * px * 0.5, ph as f32 * px * 0.5, half_depth + 3.0 * hcell);
     let mut m = surface_nets(-ext, ext, hcell, &field)?;
+    relax(&mut m, s.smooth, &field, hcell);
     if wanted > half_depth {
         let k = wanted / half_depth;
         for p in &mut m.positions {
             p.z *= k;
         }
+        m.compute_all_normals();
     }
-    relax(&mut m, s.smooth);
     Ok(m)
 }
 
@@ -398,6 +469,32 @@ mod tests {
             let front = (0..m.positions.len()).max_by(|&a, &b| m.positions[a].z.total_cmp(&m.positions[b].z)).unwrap();
             assert!(m.normals[front].z > 0.5);
         }
+    }
+
+    #[test]
+    fn extruded_edges_stay_sharp_and_round_outlines_smooth() {
+        let img = disc_image(96);
+        let s = SnapshotSettings { style: Style::Extrude, resolution: 96, ..Default::default() };
+        let m = build(96, 96, &img, &s).unwrap();
+        let (_, mx) = m.bounds();
+        // vertices on the flat front reach right out to the rim (not chamfered)
+        let front_r = m.positions.iter().filter(|p| (p.z - mx.z).abs() < 0.004).map(|p| (p.x * p.x + p.y * p.y).sqrt()).fold(0.0f32, f32::max);
+        assert!(front_r > 0.56, "front face reaches {front_r}");
+        // few faces slope between the front and the side: the rim isn't bevelled
+        let slanted = (0..m.tris.len())
+            .filter(|&f| {
+                let nz = m.face_normals[f].normalize_or_zero().z.abs();
+                nz > 0.35 && nz < 0.94
+            })
+            .count();
+        assert!(slanted * 100 < m.tris.len() * 3, "{slanted} of {} faces bevelled", m.tris.len());
+        // the side wall is round: rim radii vary little
+        let ring: Vec<Vec3> = m.positions.iter().copied().filter(|p| p.z.abs() < 0.05).collect();
+        let c = ring.iter().copied().sum::<Vec3>() / ring.len() as f32;
+        let side: Vec<f32> = ring.iter().map(|p| ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt()).collect();
+        let mean = side.iter().sum::<f32>() / side.len() as f32;
+        let dev = (side.iter().map(|r| (r - mean) * (r - mean)).sum::<f32>() / side.len() as f32).sqrt();
+        assert!(dev < 0.0035, "rim wobble {dev}");
     }
 
     #[test]

@@ -267,7 +267,12 @@ impl Ui {
             self.status.set(m);
         }
         self.update_overlay();
-        self.rev.set(rev);
+        // reference images are saved in the project too: changing them
+        // counts as an unsaved change
+        let rev = rev.wrapping_add(tools_ui::refs_fingerprint(self));
+        if rev != self.rev.get_untracked() {
+            self.rev.set(rev);
+        }
         self.stats.set((v, t));
         self.can_undo.set(u);
         self.can_redo.set(r);
@@ -1841,6 +1846,11 @@ fn App() -> impl IntoView {
         });
     });
     brush_ui::restore_user_alphas(ui);
+    // moving, resizing or changing a reference image updates the unsaved mark
+    Effect::new(move || {
+        let _ = ui.refs.get();
+        ui.refresh();
+    });
     // mode and ZModeler settings -> engine
     Effect::new(move || {
         let mode = ui.mode.get();

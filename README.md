@@ -156,7 +156,9 @@ Like SculptGL, the functions are grouped into dropdown areas:
 - **Brush presets:** save the current brush (tool, size, strength, stroke, falloff and alpha) under a name, load it
   with a click, and **export** it as a `.claybrush` file to share or **import** one. Six starter presets show the
   features (skin pores, reptile scales, fabric weave, clean lines, rivets, a stitched seam).
-- **ZModeler** (polygon modelling, like ZBrush's ZModeler): hover a polygon to see the target highlighted, then
+- **ZModeler** (polygon modelling, like ZBrush's ZModeler) works on the lowest level and keeps subdivision levels:
+  after each edit the levels are rebuilt and the old detail goes back wherever the surface didn't change (all one
+  undo step). hover a polygon to see the target highlighted, then
   click or drag. Actions: **Extrude**, **Inset**, **Bevel** (drag to set the amount, one undo step), **Insert edge
   loop**, **Delete**, **Bridge** (click two polygons or holes, with the same number of edges, to join them with a
   tube), **Polygroup** and **PolyGroupIt**. Targets: **Polygon**, **Polygroup** or **Polyloop** (the quad strip
@@ -171,13 +173,16 @@ Like SculptGL, the functions are grouped into dropdown areas:
   **Mirror X** copies to the other side, and **Apply** replaces the sculpt, optionally with 1–5 subdivision levels
   each projected onto the old sculpt so its detail carries over.
 - **Mannequins:** a posable figure of capsules (each bone its own polygroup). Drag a joint to aim its bone; presets
-  T-pose, A-pose, Walk, Sit, Arms up and Run; a **Build** slider. **Convert to sculpt** voxel-merges it into one surface.
+  T-pose, A-pose, Walk, Sit, Arms up and Run; a **Build** slider. Every pose change is an undo step (a slider drag
+  is one), and undo brings back the pose with the figure. **Convert to sculpt** voxel-merges it into one surface.
 - **Snapshot 3D:** turns an image's silhouette (dark pixels, or opaque ones in a transparent PNG; **Invert** for
   light shapes) into a solid: **Inflate** (pillowy) or **Extrude** (flat), with depth and resolution. **New** starts a
   sculpt from it, **Add** places it on the surface facing you, and **Subtract** cuts it straight through the model,
-  both merged with a voxel remesh.
+  both merged with a voxel remesh. Extruded edges stay sharp (dual contouring places points on corners and
+  creases) while curved outlines come out smooth.
 - **Reference images** (like Spotlight): pin PNG/JPEG images over the viewport, drag to place, drag the corner to
-  size, set opacity, hide, or lock them so you sculpt through. They're saved in the project.
+  size, set opacity, hide, or lock them so you sculpt through. They're saved in the project (changing them marks
+  it unsaved).
 - **Symmetry:** mirror across X, Y and/or Z, plus **radial** copies (2–32 around X, Y or Z), about the world
   origin or the model's own centre. Ghost cursors show where every copy lands.
 - **Dynamic topology** (like SculptGL's dynamic mode or ZBrush's Sculptris Pro): long edges under the brush are
@@ -281,7 +286,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: ZSpheres, Shadowbox, 3D text and shapes, FiberMesh, Dynamics, polypaint (levels, remesh, projects, Spotlight), UV unwrapping, baking, QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: pose undo, ZModeler keeping levels, sharp Snapshot edges, ZSpheres, Shadowbox, 3D text and shapes, FiberMesh, Dynamics, polypaint (levels, remesh, projects, Spotlight), UV unwrapping, baking, QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 

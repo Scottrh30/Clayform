@@ -504,12 +504,14 @@ impl Editor {
                 break;
             }
         }
+        self.sync_pose();
         self.redraw = true;
     }
 
     pub fn undo(&mut self) {
         if self.drag == Drag::None {
             self.sculptor.undo();
+            self.sync_pose();
             self.redraw = true;
         }
     }
@@ -517,6 +519,7 @@ impl Editor {
     pub fn redo(&mut self) {
         if self.drag == Drag::None {
             self.sculptor.redo();
+            self.sync_pose();
             self.redraw = true;
         }
     }
@@ -548,6 +551,11 @@ impl Editor {
         self.retopo.pending.clear();
         if mode == Mode::Mannequin {
             self.enter_mannequin();
+        }
+        // ZModeler edits the base level; the levels are rebuilt after each edit
+        if mode == Mode::ZModeler && self.sculptor.level() > 0 {
+            self.sculptor.set_level(0);
+            self.message = Some("ZModeler works on the lowest level: higher levels are rebuilt after each edit".into());
         }
         self.mode = mode;
         self.redraw = true;
@@ -1579,6 +1587,40 @@ mod tests {
     }
 
     #[test]
+    fn zmodeler_keeps_levels_and_their_detail() {
+        let mut e = Editor::new();
+        e.new_primitive(crate::poly::Primitive::QCube);
+        e.brush.symmetry.mirror = [false; 3];
+        e.sculptor.subdivide().unwrap();
+        e.sculptor.subdivide().unwrap();
+        // detail on the top face, seen from above
+        e.view_from(ViewDir::Top);
+        e.sculptor.refresh_bvh();
+        stroke(&mut e, Mods::default());
+        let top_y = |e: &Editor| e.sculptor.mesh.positions.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+        let bump = top_y(&e);
+        // extrude the front face in ZModeler (on the base level)
+        e.view_from(ViewDir::Front);
+        e.set_mode(Mode::ZModeler);
+        assert_eq!(e.sculptor.level(), 0, "ZModeler works on the base level");
+        e.zm.action = crate::poly::Action::Extrude;
+        let n_undo = e.sculptor.history().0.len();
+        drag(&mut e, SIZE * 0.5, SIZE * 0.5 - Vec2::new(0.0, 80.0));
+        assert_eq!(e.sculptor.level_count(), 3, "levels rebuilt");
+        assert_eq!(e.sculptor.level(), 0);
+        assert_eq!(e.sculptor.history().0.len(), n_undo + 1, "one undo step");
+        e.sculptor.set_level(2);
+        assert!((top_y(&e) - bump).abs() < bump * 0.02, "the detail on the untouched face is back: {} vs {bump}", top_y(&e));
+        let front = e.sculptor.mesh.positions.iter().map(|p| p.z).fold(f32::MIN, f32::max);
+        assert!(front > 1.0, "the extrusion kept its shape: {front}");
+        e.undo(); // level change
+        e.undo(); // the extrude
+        assert_eq!(e.sculptor.level_count(), 3);
+        e.sculptor.set_level(2);
+        assert!((top_y(&e) - bump).abs() < 1e-4);
+    }
+
+    #[test]
     fn zmodeler_extrude_by_dragging_is_one_undo_step() {
         let mut e = Editor::new();
         e.new_primitive(crate::poly::Primitive::QCube);
@@ -1689,6 +1731,30 @@ mod tests {
         assert!(e.mannequin_shown());
         e.mannequin_preset("Sit");
         assert!(e.mannequin_shown());
+        let sit = e.mannequin.to_pose();
+        // poses are undo steps: back to the dragged pose, then to the start
+        let (labels, _) = e.sculptor.history();
+        assert_eq!(labels[labels.len() - 2..], ["Pose".to_string(), "Sit".to_string()]);
+        e.undo();
+        assert!(e.mannequin_shown());
+        assert!((e.mannequin.world()[hand].0 - moved).length() < 1e-4, "undo brings back the dragged pose");
+        e.undo();
+        assert!((e.mannequin.world()[hand].0 - hp).length() < 1e-4);
+        e.redo();
+        e.redo();
+        let close = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(close(&e.mannequin.to_pose(), &sit));
+        // a build slider drag is one step
+        let n = e.sculptor.history().0.len();
+        for k in 0..5 {
+            e.mannequin_bulk(1.0 + k as f32 * 0.05);
+        }
+        assert_eq!(e.sculptor.history().0.len(), n + 1);
+        e.undo();
+        assert!(close(&e.mannequin.to_pose(), &sit));
+        // and the mesh follows the pose back
+        let m = e.mannequin.mesh();
+        assert!(m.positions.iter().zip(&e.sculptor.mesh.positions).all(|(a, b)| a.distance(*b) < 1e-4));
     }
 }
 

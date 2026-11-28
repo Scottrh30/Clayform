@@ -30,6 +30,20 @@ pub struct RefImage {
     pub visible: bool,
 }
 
+/// A number that changes whenever any reference image changes.
+pub fn refs_fingerprint(ui: Ui) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let refs = ui.refs.get_untracked();
+    if refs.is_empty() {
+        return 0; // a fresh scene stays clean
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in refs.iter() {
+        (r.id, &r.name, r.src.len(), r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.opacity.to_bits(), r.locked, r.visible).hash(&mut h);
+    }
+    h.finish()
+}
+
 fn data_url(bytes: &[u8]) -> String {
     use base64::Engine as _;
     let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) { "image/png" } else { "image/jpeg" };
@@ -415,12 +429,7 @@ pub fn MannequinFolder(ui: Ui) -> impl IntoView {
                 value=ui.bulk
                 on_change=move |v| {
                     ui.bulk.set(v);
-                    with_ed(|e| {
-                        e.mannequin.bulk = v;
-                        if e.mannequin_shown() {
-                            e.mannequin_changed();
-                        }
-                    });
+                    with_ed(|e| e.mannequin_bulk(v));
                     ui.refresh();
                 }
                 format=|v| format!("{:.0}%", v * 100.0)

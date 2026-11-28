@@ -86,6 +86,25 @@ impl Mannequin {
         out
     }
 
+    /// The pose as numbers (each joint's rotation, then the build).
+    pub fn to_pose(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = self.joints.iter().flat_map(|j| j.rot.to_array()).collect();
+        v.push(self.bulk);
+        v
+    }
+
+    /// Sets the pose from `to_pose` numbers (ignored if they don't fit).
+    pub fn load_pose(&mut self, v: &[f32]) -> bool {
+        if v.len() != self.joints.len() * 4 + 1 {
+            return false;
+        }
+        for (i, j) in self.joints.iter_mut().enumerate() {
+            j.rot = Quat::from_slice(&v[i * 4..i * 4 + 4]).normalize();
+        }
+        self.bulk = v[v.len() - 1];
+        true
+    }
+
     pub fn reset(&mut self) {
         for jt in &mut self.joints {
             jt.rot = Quat::IDENTITY;
