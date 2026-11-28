@@ -61,23 +61,6 @@ pub async fn open_mesh() -> Result<Option<Opened>, String> {
     }
 }
 
-/// Returns where the file went (a path in the app, the name in a browser),
-/// or None if the user cancelled.
-pub async fn save_mesh(suggested_name: &str, extension: &str, bytes: Vec<u8>) -> Result<Option<String>, String> {
-    if in_desktop_app() {
-        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let v = invoke(
-            "save_mesh",
-            serde_json::json!({ "suggestedName": suggested_name, "extension": extension, "data": data }),
-        )
-        .await?;
-        Ok(v.as_string())
-    } else {
-        browser_download(suggested_name, &bytes)?;
-        Ok(Some(suggested_name.to_string()))
-    }
-}
-
 async fn browser_pick(accept: &str) -> Result<Option<Opened>, String> {
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let input: web_sys::HtmlInputElement =
@@ -188,6 +171,19 @@ pub async fn save_project(bytes: Vec<u8>, path: Option<&str>, suggested_name: &s
     if in_desktop_app() {
         let headers = [("path", uri(path.unwrap_or(""))), ("name", uri(suggested_name))];
         let v = invoke_body("save_project", &bytes, &headers).await?;
+        Ok(v.as_string())
+    } else {
+        browser_download(suggested_name, &bytes)?;
+        Ok(Some(suggested_name.to_string()))
+    }
+}
+
+/// Saves any file (asking where in the desktop app, downloading in a
+/// browser). Returns where it went, or None if the user cancelled.
+pub async fn save_file(suggested_name: &str, extension: &str, title: &str, bytes: Vec<u8>) -> Result<Option<String>, String> {
+    if in_desktop_app() {
+        let headers = [("name", uri(suggested_name)), ("ext", uri(extension)), ("title", uri(title))];
+        let v = invoke_body("save_file", &bytes, &headers).await?;
         Ok(v.as_string())
     } else {
         browser_download(suggested_name, &bytes)?;

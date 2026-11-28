@@ -12,12 +12,20 @@ struct Uniforms {
     viewport: vec4<f32>,
     // x: ambient occlusion on, y: AO strength, z: cavity strength, w: AO radius
     shading: vec4<f32>,
+    // per light: view-space direction + on, then colour * intensity
+    lights: array<vec4<f32>, 8>,
+    light_vp: mat4x4<f32>,
+    // x: ambient, y: shadows on, z: shadow softness (texels)
+    lighting: vec4<f32>,
+    // x: focus depth (0..1 of far), y: max blur (px), z: blur per depth, w: on
+    dof: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(1) @binding(0) var ao_tex: texture_2d<f32>;
 @group(1) @binding(1) var lin_samp: sampler;
 @group(1) @binding(2) var matcap_tex: texture_2d<f32>;
+@group(1) @binding(3) var shadow_tex: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -32,6 +40,7 @@ struct VOut {
     @location(1) mask: f32,
     @location(2) vpos: vec3<f32>,
     @location(3) cavity: f32,
+    @location(4) lpos: vec4<f32>,
 };
 
 @vertex
@@ -42,6 +51,7 @@ fn vs_mesh(v: VIn) -> VOut {
     o.vpos = (u.view * vec4<f32>(v.pos, 1.0)).xyz;
     o.mask = v.mask;
     o.cavity = v.cavity;
+    o.lpos = u.light_vp * vec4<f32>(v.pos + v.nrm * u.lighting.w, 1.0);
     return o;
 }
 
@@ -115,6 +125,7 @@ struct GOut {
     @location(2) vpos: vec3<f32>,
     @location(3) cavity: f32,
     @location(4) color: vec3<f32>,
+    @location(5) lpos: vec4<f32>,
 };
 
 @vertex
@@ -126,6 +137,7 @@ fn vs_group(v: GIn) -> GOut {
     o.mask = v.mask;
     o.cavity = v.cavity;
     o.color = v.color;
+    o.lpos = u.light_vp * vec4<f32>(v.pos + v.nrm * u.lighting.w, 1.0);
     return o;
 }
 
@@ -137,7 +149,94 @@ fn fs_group(i: GOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     v.mask = i.mask;
     v.vpos = i.vpos;
     v.cavity = i.cavity;
+    v.lpos = i.lpos;
     return vec4<f32>(encode(shade(v, front, i.color, true)), 1.0);
+}
+
+struct LitMat {
+    base: vec3<f32>,
+    rough: f32,
+    metal: f32,
+    // light wrapping round the terminator (soft materials)
+    wrap: f32,
+};
+
+fn lit_material(id: i32) -> LitMat {
+    switch id {
+        case 8: { return LitMat(srgb(vec3<f32>(0.86, 0.62, 0.52)), 0.55, 0.0, 0.35); } // skin
+        case 9: { return LitMat(srgb(vec3<f32>(1.0, 0.78, 0.36)), 0.3, 1.0, 0.0); }   // gold
+        case 10: { return LitMat(srgb(vec3<f32>(0.78, 0.78, 0.8)), 0.35, 0.0, 0.1); } // plastic
+        case 11: { return LitMat(srgb(vec3<f32>(0.93, 0.93, 0.9)), 0.12, 0.0, 0.05); } // ceramic
+        case 12: { return LitMat(srgb(vec3<f32>(0.8, 0.5, 0.3)), 0.4, 0.9, 0.0); }    // bronze
+        default: { return LitMat(srgb(vec3<f32>(0.78, 0.6, 0.5)), 0.6, 0.0, 0.1); }   // clay
+    }
+}
+
+fn unpack_depth(e: vec4<f32>) -> f32 {
+    return dot(e.rgb, vec3<f32>(1.0, 1.0 / 255.0, 1.0 / 65025.0));
+}
+
+// 1 = lit by the key light, 0 = in its shadow (3x3 percentage-closer filter)
+fn shadow_factor(lpos: vec4<f32>) -> f32 {
+    if (u.lighting.y < 0.5) {
+        return 1.0;
+    }
+    let p = lpos.xyz / lpos.w;
+    let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    if (uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0 || p.z >= 1.0) {
+        return 1.0;
+    }
+    let size = vec2<i32>(textureDimensions(shadow_tex));
+    let base = vec2<i32>(uv * vec2<f32>(size));
+    let soft = max(u.lighting.z, 0.5);
+    var lit = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let q = clamp(base + vec2<i32>(vec2<f32>(f32(x), f32(y)) * soft), vec2<i32>(0), size - vec2<i32>(1));
+            let d = unpack_depth(textureLoad(shadow_tex, q, 0));
+            if (p.z - 0.0015 <= d) {
+                lit += 1.0;
+            }
+        }
+    }
+    return lit / 9.0;
+}
+
+// filmic curve (ACES fit) so bright lights roll off instead of clipping
+fn tonemap(x: vec3<f32>) -> vec3<f32> {
+    let a = x * 0.9;
+    return clamp((a * (2.51 * a + 0.03)) / (a * (2.43 * a + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// physically inspired shading with the light rig (lights are in view space)
+fn lit_shade(n: vec3<f32>, vpos: vec3<f32>, m: LitMat, shadow: f32) -> vec3<f32> {
+    let v = normalize(-vpos);
+    let up = normalize((u.view * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+    let hemi = mix(0.45, 1.0, dot(n, up) * 0.5 + 0.5);
+    let f0 = mix(vec3<f32>(0.04), m.base, m.metal);
+    var c = m.base * (1.0 - m.metal * 0.7) * u.lighting.x * hemi;
+    // a little environment reflection for metals
+    c += f0 * m.metal * u.lighting.x * 1.2 * mix(0.3, 1.0, dot(reflect(-v, n), up) * 0.5 + 0.5);
+    let shininess = mix(400.0, 6.0, m.rough);
+    for (var i = 0; i < 4; i++) {
+        let ld = u.lights[i * 2];
+        if (ld.w < 0.5) {
+            continue;
+        }
+        let l = normalize(ld.xyz);
+        let col = u.lights[i * 2 + 1].rgb;
+        var s = 1.0;
+        if (i == 0) {
+            s = shadow;
+        }
+        let ndl = dot(n, l);
+        let diffuse = max((ndl + m.wrap) / (1.0 + m.wrap), 0.0);
+        let h = normalize(l + v);
+        let spec = pow(max(dot(n, h), 0.0), shininess) * (shininess + 8.0) / 25.0 * 2.0;
+        let fres = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+        c += col * s * (m.base * (1.0 - m.metal) * diffuse / 3.14159 * 2.0 + fres * spec * max(ndl, 0.0) * 0.15);
+    }
+    return c;
 }
 
 @fragment
@@ -153,9 +252,18 @@ fn shade(i: VOut, front: bool, tint: vec3<f32>, tinted: bool) -> vec3<f32> {
     } else if (!front) {
         n = -n;
     }
-    var c = material(n, i32(u.params.x + 0.5));
-    if (tinted) {
+    let id = i32(u.params.x + 0.5);
+    var c = vec3<f32>(0.0);
+    if (id >= 7) {
+        var m = lit_material(id);
+        if (tinted) {
+            m.base = tint;
+        }
+        c = tonemap(lit_shade(n, i.vpos, m, shadow_factor(i.lpos)));
+    } else if (tinted) {
         c = studio(n, tint, 24.0, 0.12, tint, 0.2, 0.3);
+    } else {
+        c = material(n, id);
     }
     // cavity: darken creases, lift ridges
     let k = u.shading.z;

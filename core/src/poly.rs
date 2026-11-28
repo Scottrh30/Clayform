@@ -675,6 +675,24 @@ impl Polys {
     }
 }
 
+/// A distinct, stable colour for polygroup `g` (sRGB, 0..1; golden-ratio hues).
+pub fn group_color(g: u32) -> [f32; 3] {
+    let h = (g as f32 * 0.618_034 + 0.12).fract() * 6.0;
+    let (s, v) = (0.55 + 0.25 * ((g / 7) % 2) as f32, 0.95 - 0.2 * ((g / 3) % 2) as f32);
+    let c = v * s;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let (r, gg, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r + m, gg + m, b + m]
+}
+
 /// Quad primitives for polygon modelling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Primitive {

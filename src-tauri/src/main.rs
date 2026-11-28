@@ -177,6 +177,37 @@ async fn save_project(app: tauri::AppHandle, request: Request<'_>) -> Result<Opt
     Ok(Some(path.display().to_string()))
 }
 
+/// Saves any file. Body: file bytes. Headers: `name` (suggested file name),
+/// `ext` (extension for the filter) and `title` (dialog title), URL-encoded.
+/// Returns the path written, or null if the user cancelled.
+#[tauri::command]
+async fn save_file(app: tauri::AppHandle, request: Request<'_>) -> Result<Option<String>, String> {
+    let bytes = raw_body(&request)?;
+    let name = header(&request, "name").map(percent_decode).unwrap_or_else(|| "export".into());
+    let ext = header(&request, "ext").map(percent_decode).unwrap_or_default();
+    let title = header(&request, "title").map(percent_decode).unwrap_or_else(|| "Save".into());
+    let path = match std::env::var_os("CLAYFORM_TEST_SAVE_DIR") {
+        // scripted tests: no dialog
+        Some(dir) => std::path::PathBuf::from(dir).join(&name),
+        None => {
+            let mut d = app.dialog().file().set_title(&title).set_file_name(&name);
+            if !ext.is_empty() {
+                d = d.add_filter(ext.to_uppercase(), &[ext.as_str()]);
+            }
+            let Some(p) = d.blocking_save_file() else { return Ok(None) };
+            let mut p = p.into_path().map_err(|e| e.to_string())?;
+            if p.extension().is_none() && !ext.is_empty() {
+                p.set_extension(&ext);
+            }
+            p
+        }
+    };
+    let tmp = path.with_extension(format!("{ext}.saving"));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 #[tauri::command]
 fn cancel_job(jobs: State<'_, Jobs>) {
     jobs.cancel.store(true, Ordering::SeqCst);
@@ -211,36 +242,12 @@ async fn open_mesh(app: tauri::AppHandle) -> Result<Option<Opened>, String> {
 
 /// Asks where to save and writes the file; returns the chosen path, or None
 /// if the user cancelled.
-#[tauri::command]
-async fn save_mesh(
-    app: tauri::AppHandle,
-    suggested_name: String,
-    extension: String,
-    data: String,
-) -> Result<Option<String>, String> {
-    let bytes = b64().decode(data).map_err(|e| e.to_string())?;
-    let picked = app
-        .dialog()
-        .file()
-        .set_title("Export mesh")
-        .set_file_name(&suggested_name)
-        .add_filter(extension.to_uppercase(), &[extension.as_str()])
-        .blocking_save_file();
-    let Some(path) = picked else { return Ok(None) };
-    let mut path = path.into_path().map_err(|e| e.to_string())?;
-    if path.extension().is_none() {
-        path.set_extension(&extension);
-    }
-    std::fs::write(&path, bytes).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
-    Ok(Some(path.display().to_string()))
-}
-
 fn main() {
     tauri::Builder::default()
         .manage(Jobs::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![open_mesh, save_mesh, remesh, subdivide, cancel_job, open_project, save_project, open_image])
+        .invoke_handler(tauri::generate_handler![open_mesh, save_file, remesh, subdivide, cancel_job, open_project, save_project, open_image])
         .run(tauri::generate_context!())
         .expect("error while running Clayform");
 }

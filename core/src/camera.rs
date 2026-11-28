@@ -2,6 +2,7 @@
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
+#[derive(Clone, Debug)]
 pub struct Camera {
     pub target: Vec3,
     pub yaw: f32,

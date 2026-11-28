@@ -8,12 +8,22 @@ struct Uniforms {
     view: mat4x4<f32>,
     proj: mat4x4<f32>,
     inv_proj: mat4x4<f32>,
+    // x: material id, y: show mask, z: flat shading, w: encode sRGB in the shader
     params: vec4<f32>,
     wire_color: vec4<f32>,
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    // xy: viewport size in pixels, zw: 1 / size
     viewport: vec4<f32>,
+    // x: ambient occlusion on, y: AO strength, z: cavity strength, w: AO radius
     shading: vec4<f32>,
+    // per light: view-space direction + on, then colour * intensity
+    lights: array<vec4<f32>, 8>,
+    light_vp: mat4x4<f32>,
+    // x: ambient, y: shadows on, z: shadow softness (texels)
+    lighting: vec4<f32>,
+    // x: focus depth (0..1 of far), y: max blur (px), z: blur per depth, w: on
+    dof: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -49,6 +59,15 @@ fn vs_depth(v: VIn) -> DOut {
 @fragment
 fn fs_depth(i: DOut) -> @location(0) vec4<f32> {
     let d = clamp(-i.vz / far_plane(), 0.0, 0.9999);
+    var e = fract(d * vec3<f32>(1.0, 255.0, 65025.0));
+    e = e - vec3<f32>(e.y, e.z, 0.0) / 255.0;
+    return vec4<f32>(e, 1.0);
+}
+
+// shadow map: depth along the key light (orthographic, so clip z is linear)
+@fragment
+fn fs_shadow(i: DOut) -> @location(0) vec4<f32> {
+    let d = clamp(i.clip.z, 0.0, 0.9999);
     var e = fract(d * vec3<f32>(1.0, 255.0, 65025.0));
     e = e - vec3<f32>(e.y, e.z, 0.0) / 255.0;
     return vec4<f32>(e, 1.0);

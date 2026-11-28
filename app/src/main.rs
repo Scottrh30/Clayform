@@ -4,6 +4,7 @@
 
 mod host;
 mod render;
+mod output_ui;
 mod tools_ui;
 
 use clayform_core::editor::{Brush, Button, DetailMode, Drag, Editor, Mode, Mods, Overlay, ViewDir, ZmSettings};
@@ -99,6 +100,7 @@ struct Ui {
     retopo_count: RwSignal<(usize, usize)>,
     group_angle: RwSignal<f32>,
     bulk: RwSignal<f32>,
+    render: RwSignal<output_ui::RenderSettings>,
 }
 
 impl Ui {
@@ -131,6 +133,7 @@ impl Ui {
                 cavity: true,
                 cavity_strength: 0.6,
                 polygroups: false,
+                lighting: render::Lighting::default(),
             }),
             fov: RwSignal::new(40.0),
             panel_right: RwSignal::new(
@@ -164,6 +167,7 @@ impl Ui {
             retopo_count: RwSignal::new((0, 0)),
             group_angle: RwSignal::new(30.0),
             bulk: RwSignal::new(1.0),
+            render: RwSignal::new(Default::default()),
         }
     }
 
@@ -255,6 +259,9 @@ enum Action {
     TogglePanelSide,
     NewPrimitive(clayform_core::poly::Primitive),
     NewMannequin,
+    Export(&'static str),
+    RenderImage,
+    RenderTurntable,
 }
 
 fn act(ui: Ui, a: Action) {
@@ -267,6 +274,7 @@ fn act(ui: Ui, a: Action) {
             | Action::TogglePanelSide
             | Action::ExportObj
             | Action::ExportStl
+            | Action::Export(_)
             | Action::SaveProject
             | Action::SaveProjectAs
     );
@@ -305,20 +313,11 @@ fn act(ui: Ui, a: Action) {
         }),
         Action::SaveProject => spawn_local(save_project(ui, false)),
         Action::SaveProjectAs => spawn_local(save_project(ui, true)),
-        Action::ExportObj | Action::ExportStl => {
-            let ext = if matches!(a, Action::ExportStl) { "stl" } else { "obj" };
-            let bytes = with_ed(|e| {
-                e.pointer_up();
-                io::save(&e.sculptor.mesh, ext)
-            });
-            spawn_local(async move {
-                match host::save_mesh(&format!("sculpt.{ext}"), ext, bytes).await {
-                    Ok(Some(p)) => ui.status.set(format!("Saved {p}")),
-                    Ok(None) => {}
-                    Err(e) => ui.status.set(format!("Export failed: {e}")),
-                }
-            });
-        }
+        Action::ExportObj => spawn_local(output_ui::export_mesh(ui, "obj")),
+        Action::ExportStl => spawn_local(output_ui::export_mesh(ui, "stl")),
+        Action::Export(ext) => spawn_local(output_ui::export_mesh(ui, ext)),
+        Action::RenderImage => spawn_local(output_ui::render_still(ui, ui.render.get_untracked())),
+        Action::RenderTurntable => spawn_local(output_ui::render_turntable(ui, ui.render.get_untracked())),
         Action::Undo => with_ed(|e| {
             if !e.retopo_undo() {
                 e.undo()
@@ -542,6 +541,8 @@ fn settings_json(ui: Ui) -> String {
             "divisions": ui.zm.get_untracked().divisions,
         },
         "references": tools_ui::refs_json(ui),
+        "lighting": output_ui::lighting_json(ui),
+        "render": output_ui::render_json(ui),
         "view": {
             "material": v.material, "show_mask": v.show_mask, "flat": v.flat, "wireframe": v.wireframe,
             "background": v.background, "ao": v.ao, "ao_strength": v.ao_strength,
@@ -648,6 +649,12 @@ fn apply_settings(ui: Ui, json: &str) {
     }
     if let Some(r) = j.get("references") {
         tools_ui::apply_refs_json(ui, r);
+    }
+    if let Some(l) = j.get("lighting") {
+        output_ui::apply_lighting_json(ui, l);
+    }
+    if let Some(r) = j.get("render") {
+        output_ui::apply_render_json(ui, r);
     }
     if let Some(v) = j.get("view") {
         ui.view.update(|s| {
@@ -1031,6 +1038,7 @@ fn Viewport(ui: Ui) -> impl IntoView {
                         <span class="job-pct">{move || format!("{:.0}%", ui.job.get().map(|j| j.1).unwrap_or(0.0) * 100.0)}</span>
                         <button class="job-cancel" on:click=move |_| {
                             ui.status.set("Cancelling…".into());
+                            output_ui::cancel_local_job();
                             spawn_local(host::cancel_job());
                         }>"Cancel"</button>
                     </div>
@@ -1179,6 +1187,9 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                 <Item ui action=Action::Import label="Import OBJ / STL…" key="Ctrl+I" />
                 <Item ui action=Action::ExportObj label="Export OBJ…" key="Ctrl+E" />
                 <Item ui action=Action::ExportStl label="Export STL…" />
+                <Item ui action=Action::Export("ply") label="Export PLY…" />
+                <Item ui action=Action::Export("glb") label="Export glTF (GLB)…" />
+                <Item ui action=Action::Export("fbx") label="Export FBX…" />
             </Menu>
             <Menu ui id="edit" label="Edit">
                 <Item ui action=Action::Undo label="Undo" key="Ctrl+Z" enabled=can_undo />
@@ -1229,6 +1240,12 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                     />
                 </div>
             </Menu>
+            <Menu ui id="render" label="Render">
+                <Item ui action=Action::RenderImage label="Render image…" key="F12" />
+                <Item ui action=Action::RenderTurntable label="Render turntable…" />
+                <div class="sep"></div>
+                <div class="menu-note">"Size, depth of field, turntable length and format are in the Render folder."</div>
+            </Menu>
             <Menu ui id="background" label="Background">
                 {BACKGROUNDS
                     .iter()
@@ -1262,6 +1279,7 @@ fn MenuBar(ui: Ui) -> impl IntoView {
                         <tr><td>"D C B S F Y Q I"</td><td>"Draw, Clay, Clay Buildup, Smooth, Flatten, Trim Dynamic, Scrape, Inflate"</td></tr>
                         <tr><td>"P E V L G K U M"</td><td>"Pinch, Crease, Dam Standard, Layer, Move Topological, Snakehook, Nudge, Mask"</td></tr>
                         <tr><td>"J H O"</td><td>"Move, Clay Tubes, Polish (more brushes in the Tool list)"</td></tr>
+                        <tr><td>"F12"</td><td>"Render image"</td></tr>
                         <tr><td>"Tab / Shift+Tab"</td><td>"Next / previous mode: Sculpt, ZModeler, Retopology, Mannequin"</td></tr>
                         <tr><td>"Shift+G"</td><td>"Polygroup colours"</td></tr>
                         <tr><td>"Enter / Esc"</td><td>"Retopology: close the face / drop the picked points"</td></tr>
@@ -1547,7 +1565,10 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             <tools_ui::MannequinFolder ui />
             <tools_ui::SnapshotFolder ui />
             <tools_ui::ReferenceFolder ui />
-            <Folder title="Rendering">
+            <output_ui::LightsFolder ui />
+            <output_ui::RenderFolder ui />
+            <output_ui::ExportFolder ui />
+            <Folder title="Viewport display">
                 <label class="row">
                     <span class="label">"Material"</span>
                     <select on:change=move |ev| {
@@ -1665,6 +1686,7 @@ fn handle_key(ui: Ui, ev: &web_sys::KeyboardEvent) {
             "1" => act(ui, Action::View(ViewDir::Front)),
             "3" => act(ui, Action::View(ViewDir::Right)),
             "7" => act(ui, Action::View(ViewDir::Top)),
+            "f12" => act(ui, Action::RenderImage),
             "escape" => {
                 ui.menu.set(None);
                 with_ed(|e| e.retopo.pending.clear());

@@ -9,19 +9,23 @@ A digital sculpting app in Rust inspired by [SculptGL](https://stephaneginier.co
 |---|---|
 | ![ZModeler](docs/screenshot-zmodeler.png) | ![Mannequin](docs/screenshot-mannequin.png) |
 
+A rendered image (Lit skin, shadows from the key light): ![Render](docs/render-sample.png)
+
 ## Interface
 
 Like SculptGL, the functions are grouped into dropdown areas:
 
 - **Modes** (buttons at the top of the panel, or `Tab`): **Sculpt** (brushes), **ZModeler** (polygon modelling),
   **Retopo** (draw new topology over the sculpt) and **Mannequin** (pose a figure).
-- **Top-bar menus:** **File** (import, export OBJ/STL), **Edit** (undo, redo), **Scene** (new sphere, cube or plane,
+- **Top-bar menus:** **File** (projects, import OBJ/STL, export OBJ/STL/PLY/glTF/FBX), **Render** (render image,
+  render turntable), **Edit** (undo, redo), **Scene** (new sphere, cube or plane,
   quad QCube/QSphere/QCylinder/QPlane, mannequin, sphere detail), **Camera** (frame, reset, front/back/left/right/top/bottom views, field of view), **Background**
   (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
 - **Side-panel folders** (click a title to fold it): **Sculpting** (tool dropdown, radius, intensity, negative,
   symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, voxel remesh, mesh statistics),
-  **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**,
-  **Rendering** (material dropdown, AO, cavity, flat shading, wireframe, polygroup colours) and **Interface** (panel side).
+  **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**, **Lights**,
+  **Render**, **Export** (formats and 3D printing), **Viewport display** (material dropdown, AO, cavity, flat
+  shading, wireframe, polygroup colours) and **Interface** (panel side).
 - The side panel docks on the **left or right** of the viewport. Use the **Panel left / Panel right** button in the
   top bar, or **Interface › Panel side**. Your choice is remembered.
 
@@ -91,7 +95,21 @@ Like SculptGL, the functions are grouped into dropdown areas:
   doesn't freeze at the end.
 - **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
   mesh change.
-- **Import/export** OBJ and STL (Ctrl+I / Ctrl+E). Imported meshes are rescaled for sculpting and exported at their original scale.
+- **Import** OBJ and STL (Ctrl+I) and **export** OBJ, STL, PLY, glTF binary (.glb) and FBX (binary 7.4) from
+  **File** or the **Export** folder. OBJ, PLY and FBX keep quads; OBJ writes polygroups as groups; PLY and glTF
+  carry polygroup colours. Imported meshes are rescaled for sculpting and exported at their original scale.
+- **3D printing:** set the longest side in mm, cm or inches, check the mesh (holes, edges shared by three or more
+  faces, inside-out shells, piece count), fix it with **Make watertight** (a voxel remesh), and export an STL in
+  millimetres, Z up, centred on the plate and sitting at Z = 0.
+- **Lights and Lit materials:** six **Lit** materials (clay, skin, gold, plastic, ceramic, bronze) shaded by a
+  four-light rig (key, fill, rim, bounce), each with direction, colour and strength. The lights can turn with the
+  camera or stay put, and the key light casts soft **shadows**. Matcap materials work as before.
+- **Render image** (`F12`): renders off screen at the viewport size, ×2, HD, 1440p, 4K or square sizes, with an
+  optional **transparent background** and **depth of field** (focused on the model at the centre of the view),
+  and saves a PNG.
+- **Turntable:** the camera circles the model (24–360 frames at 24, 30 or 60 fps) and saves an **MP4** video
+  (WebM where MP4 isn't available), an animated **GIF** (up to 640 pixels), or the frames as **PNGs in a ZIP** for
+  video editors.
 - **Projects (.clayform):** save and open your work with every level, the mask, the camera and all brush and view
   settings. The title bar shows ` •` when there are unsaved changes, and opening a project can be undone.
 - **Viewport:** ambient occlusion and cavity shading (each with a strength slider), custom matcaps loaded from
@@ -123,6 +141,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 | `R` | Voxel remesh |
 | Ctrl+I / Ctrl+E | Import / export mesh |
 | Home | Frame mesh |
+| F12 | Render image |
 | `1` `3` `7` (Ctrl for the opposite side) | Front, right, top views |
 
 ## Project layout
@@ -143,7 +162,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -161,6 +180,7 @@ Automatic (ZRemesher-style) retopology, multiple objects (SubTools), alpha/stamp
 
 ## Automated testing hook
 
-If the `CLAYFORM_TEST_FILE` environment variable is set, the desktop app's Open project, Save project, Load matcap
+If `CLAYFORM_TEST_SAVE_DIR` is set, every Save dialog for exports, renders and turntables is skipped and the file
+is written into that folder. If the `CLAYFORM_TEST_FILE` environment variable is set, the desktop app's Open project, Save project, Load matcap
 and image pickers (Snapshot 3D, reference images) use that file instead of showing a dialog. It exists for scripted UI tests on machines with nobody to click the
 dialogs, and normal use never sets it.

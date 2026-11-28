@@ -1,4 +1,4 @@
-//! OBJ and STL import / export.
+//! OBJ and STL import, and export to OBJ, STL, PLY, glTF (GLB) and FBX.
 
 use crate::mesh::Mesh;
 use glam::Vec3;
@@ -20,24 +20,68 @@ pub fn load(file_name: &str, bytes: &[u8]) -> Result<Mesh, String> {
     Ok(mesh)
 }
 
-/// Serialises the mesh as OBJ (`"obj"`) or binary STL (`"stl"`).
+/// Formats `save` can write: (extension, description).
+pub const EXPORT_FORMATS: [(&str, &str); 5] = [
+    ("obj", "OBJ"),
+    ("stl", "STL"),
+    ("ply", "PLY"),
+    ("glb", "glTF (.glb)"),
+    ("fbx", "FBX"),
+];
+
+/// Serialises the mesh (`"obj"`, `"stl"`, `"ply"`, `"glb"` or `"fbx"`) at
+/// the scale and position it was imported with.
 pub fn save(mesh: &Mesh, ext: &str) -> Vec<u8> {
+    save_placed(mesh, ext, &Placement::of_mesh(mesh))
+}
+
+/// Like `save`, with an explicit placement (3D printing scales and lifts the model).
+pub fn save_placed(mesh: &Mesh, ext: &str, pl: &Placement) -> Vec<u8> {
     let mut w = Vec::new();
     let r = match ext.to_ascii_lowercase().as_str() {
-        "stl" => write_stl(mesh, &mut w),
-        _ => write_obj(mesh, &mut w),
+        "stl" => write_stl(mesh, pl, &mut w),
+        "ply" => crate::export::write_ply(mesh, pl, &mut w),
+        "glb" => crate::export::write_glb(mesh, pl, &mut w),
+        "fbx" => crate::export::write_fbx(mesh, pl, &mut w),
+        _ => write_obj(mesh, pl, &mut w),
     };
     r.expect("writing to memory cannot fail");
     w
 }
 
-fn extension(name: &str) -> String {
-    name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+/// Where exported vertices go: `p * scale + offset`, then optionally turned
+/// from Y-up to Z-up (3D printers and most CAD tools).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub scale: f32,
+    pub offset: Vec3,
+    pub z_up: bool,
 }
 
-#[inline]
-fn export_pos(mesh: &Mesh, p: Vec3) -> Vec3 {
-    p / mesh.export_scale + mesh.export_center
+impl Placement {
+    /// The scale and position the mesh was imported with.
+    pub fn of_mesh(mesh: &Mesh) -> Self {
+        Self { scale: 1.0 / mesh.export_scale, offset: mesh.export_center, z_up: false }
+    }
+
+    #[inline]
+    fn turn(&self, q: Vec3) -> Vec3 {
+        if self.z_up { Vec3::new(q.x, -q.z, q.y) } else { q }
+    }
+
+    #[inline]
+    pub fn pos(&self, p: Vec3) -> Vec3 {
+        self.turn(p * self.scale + self.offset)
+    }
+
+    #[inline]
+    pub fn nrm(&self, n: Vec3) -> Vec3 {
+        self.turn(n)
+    }
+}
+
+fn extension(name: &str) -> String {
+    name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
 }
 
 pub fn parse_obj(src: &str) -> Result<Mesh, String> {
@@ -127,16 +171,17 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
     Ok(Mesh::from_soup_welded(&soup))
 }
 
-fn write_obj<W: Write>(mesh: &Mesh, w: &mut W) -> std::io::Result<()> {
+fn write_obj<W: Write>(mesh: &Mesh, pl: &Placement, w: &mut W) -> std::io::Result<()> {
     // quads are written as quads, and each polygroup as its own "g" group
     let (polys, _) = crate::poly::Polys::from_mesh(mesh);
     writeln!(w, "# Exported from Clayform")?;
     writeln!(w, "o sculpt")?;
     for p in &mesh.positions {
-        let p = export_pos(mesh, *p);
+        let p = pl.pos(*p);
         writeln!(w, "v {:.6} {:.6} {:.6}", p.x, p.y, p.z)?;
     }
     for n in &mesh.normals {
+        let n = pl.nrm(*n);
         writeln!(w, "vn {:.5} {:.5} {:.5}", n.x, n.y, n.z)?;
     }
     let mut order: Vec<usize> = (0..polys.faces.len()).collect();
@@ -157,19 +202,22 @@ fn write_obj<W: Write>(mesh: &Mesh, w: &mut W) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_stl<W: Write>(mesh: &Mesh, w: &mut W) -> std::io::Result<()> {
+fn write_stl<W: Write>(mesh: &Mesh, pl: &Placement, w: &mut W) -> std::io::Result<()> {
     let mut header = [0u8; 80];
     let tag = b"Clayform binary STL";
     header[..tag.len()].copy_from_slice(tag);
     w.write_all(&header)?;
-    w.write_all(&(mesh.tris.len() as u32).to_le_bytes())?;
+    w.write_all(&(mesh.live_tri_count() as u32).to_le_bytes())?;
     for (f, t) in mesh.tris.iter().enumerate() {
-        let n = mesh.face_normals[f].normalize_or_zero();
+        if t[0] == crate::mesh::NONE {
+            continue;
+        }
+        let n = pl.nrm(mesh.face_normals[f].normalize_or_zero());
         for c in n.to_array() {
             w.write_all(&c.to_le_bytes())?;
         }
         for &v in t {
-            let p = export_pos(mesh, mesh.positions[v as usize]);
+            let p = pl.pos(mesh.positions[v as usize]);
             for c in p.to_array() {
                 w.write_all(&c.to_le_bytes())?;
             }
@@ -190,7 +238,7 @@ mod tests {
         assert_eq!(m.tris.len(), 2);
         m.normalize_for_sculpting();
         let mut buf = Vec::new();
-        write_obj(&m, &mut buf).unwrap();
+        write_obj(&m, &Placement::of_mesh(&m), &mut buf).unwrap();
         let back = parse_obj(&String::from_utf8(buf).unwrap()).unwrap();
         assert!((back.positions[2] - Vec3::new(4.0, 4.0, 0.0)).length() < 1e-4);
     }
@@ -208,7 +256,7 @@ mod tests {
     fn obj_keeps_quads_and_groups() {
         let q = crate::poly::Polys::qcube(2).to_mesh();
         let mut buf = Vec::new();
-        write_obj(&q, &mut buf).unwrap();
+        write_obj(&q, &Placement::of_mesh(&q), &mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text.lines().filter(|l| l.starts_with("f ")).count(), 24);
         assert_eq!(text.lines().filter(|l| l.starts_with("g ")).count(), 6);
@@ -225,7 +273,7 @@ mod tests {
     fn stl_roundtrip() {
         let m = Mesh::icosphere(2);
         let mut buf = Vec::new();
-        write_stl(&m, &mut buf).unwrap();
+        write_stl(&m, &Placement::of_mesh(&m), &mut buf).unwrap();
         let back = parse_stl(&buf).unwrap();
         assert_eq!(back.tris.len(), m.tris.len());
         assert_eq!(back.positions.len(), m.positions.len());
