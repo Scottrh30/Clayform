@@ -73,7 +73,7 @@ rm -rf dist && mkdir -p dist/Clayform
 cp "$out/clayform.exe" dist/Clayform/Clayform.exe
 cp "$out/WebView2Loader.dll" dist/Clayform/
 (cd dist && zip -qr Clayform-portable.zip Clayform)
-setup=$(ls "$out"/bundle/nsis/*-setup.exe 2>/dev/null | head -1 || true)
+setup=$(ls -t "$out"/bundle/nsis/*-setup.exe 2>/dev/null | head -1 || true)
 [ -n "$setup" ] && cp "$setup" dist/Clayform-setup.exe
 echo
 echo "Done:"
