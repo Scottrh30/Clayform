@@ -580,6 +580,9 @@ pub(crate) fn carry_up_extras(coarse: &Mesh, fine: &mut Mesh, odd: &[[u32; 4]]) 
         }
     }
     let live: Vec<usize> = (0..coarse.tris.len()).filter(|&f| coarse.tris[f][0] != NONE).collect();
+    if fine.hidden.is_empty() && coarse.hidden.len() == coarse.tris.len() && fine.tris.len() == live.len() * 4 {
+        fine.hidden = live.iter().flat_map(|&f| [coarse.hidden[f]; 4]).collect();
+    }
     if fine.uvs.is_empty() && coarse.uvs.len() == coarse.tris.len() && fine.tris.len() == live.len() * 4 {
         for f in live {
             let [ua, ub, uc] = coarse.uvs[f];

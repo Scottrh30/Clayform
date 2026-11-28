@@ -24,7 +24,7 @@ Like SculptGL, the functions are grouped into dropdown areas:
   (Dark gradient, Studio grey, Light, Black) and **Help** (controls).
 - **Side-panel folders** (click a title to fold it): **SubTools** (the objects in the scene, Live Boolean),
   **History**, **Sculpting** (tool dropdown, radius, intensity, negative,
-  symmetry), **Masking** (mask brush, clear, invert, show mask), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, voxel remesh, mesh statistics),
+  symmetry), **Masking** (mask brush, lasso and rectangle masks, grow, shrink, blur, sharpen, mask by cavity, peaks or polygroup), **Visibility and cuts** (hide and show, Clip, Trim and Slice, Extract), **Topology** (multiresolution levels, subdivide, delete lower/higher, dynamic topology and detail, voxel remesh, mesh statistics),
   **Transform** (gizmo and deformers), **Array**, **ZModeler**, **Polygroups**, **Retopology**, **Mannequin**, **Snapshot 3D**, **Reference images**, **Lights**,
   **Render**, **Export** (formats and 3D printing), **Viewport display** (material dropdown, AO, cavity, flat
   shading, wireframe, polygroup colours) and **Interface** (panel side).
@@ -202,7 +202,21 @@ Like SculptGL, the functions are grouped into dropdown areas:
   **Cancel** appears, and you can keep rotating the view. The finished mesh is then prepared a slice at a time between
   frames, and undo no longer copies the whole sculpt for level changes, subdivisions or remeshes, so the window
   doesn't freeze at the end.
-- **Masking**, **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
+- **Masking** (like ZBrush): **Ctrl + drag off the model** masks inside a lasso or rectangle (mirrored by
+  symmetry), **Ctrl + Alt + drag** unmasks; **Ctrl + click** off the model inverts the mask and **Ctrl + Alt +
+  click** clears it. **Grow**, **Shrink**, **Blur** and **Sharpen** the mask; mask **by cavity** (creases and
+  hollows) or **by peaks** (ridges and bumps) with a strength, or **by polygroup** (click one to keep it unmasked).
+- **Hiding:** **Ctrl + Shift + drag** shows only what's inside the outline (add Alt to hide it instead);
+  **Ctrl + Shift + click** a polygroup isolates it (with Alt: hides it), and off the model shows everything. Plus
+  Show all, Invert, Hide masked / unmasked, Hide or Isolate a clicked polygroup, and **Delete hidden**. Hidden faces
+  aren't drawn, picked or sculpted, stay hidden on every subdivision level and are saved in the project.
+- **Clip, Trim and Slice curves:** pick the tool in **Visibility and cuts**, then Ctrl + Shift + drag a line
+  across the view. Ticks mark the side that's affected (Alt flips it). **Clip** flattens that side onto the line
+  (masked points stay put), **Trim** cuts it away and caps the opening flat (rings through hollow models too), and
+  **Slice** splits the faces along the line into new polygroups. All three follow symmetry.
+- **Extract:** the masked area becomes a new SubTool, a closed shell grown out from the surface (thickness and
+  edge smoothing), for clothing, armour or straps.
+- **Loop subdivision** (up to 6M triangles) and **undo/redo** for every stroke, level change and
   mesh change.
 - **Import** OBJ and STL (Ctrl+I) and **export** OBJ, STL, PLY, glTF binary (.glb) and FBX (binary 7.4) from
   **File** or the **Export** folder. OBJ, PLY and FBX keep quads; OBJ writes polygroups as groups; PLY and glTF
@@ -244,7 +258,8 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 |---|---|
 | Left drag on mesh | Sculpt |
 | Shift + drag | Smooth |
-| Ctrl + drag | Invert brush |
+| Ctrl + drag | Invert brush (off the model: mask lasso; with Alt: unmask) |
+| Ctrl + Shift + drag | Show only inside (Alt: hide), or Clip / Trim / Slice along a line |
 | Left drag on background, Alt + left, right drag | Rotate |
 | Middle drag, Shift + right drag | Pan |
 | Wheel | Zoom |
@@ -286,7 +301,7 @@ These are the defaults; every key can be changed in **Help › All keyboard shor
 The interface also runs in a browser with WebGL 2 (`cd app && trunk serve`, then open http://localhost:1420). There,
 Import and Export use the browser's file picker and downloads.
 
-Tests: `cargo test` (engine: pose undo, ZModeler keeping levels, sharp Snapshot edges, ZSpheres, Shadowbox, 3D text and shapes, FiberMesh, Dynamics, polypaint (levels, remesh, projects, Spotlight), UV unwrapping, baking, QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
+Tests: `cargo test` (engine: mask tools, lasso and rectangle gestures, hiding across levels, Clip, Trim (with hollow caps) and Slice, Extract, pose undo, ZModeler keeping levels, sharp Snapshot edges, ZSpheres, Shadowbox, 3D text and shapes, FiberMesh, Dynamics, polypaint (levels, remesh, projects, Spotlight), UV unwrapping, baking, QRemesh, decimation, closing holes, mirror and weld, creases, the new ZModeler actions, strip extension and topology strokes, sculpt layers, morph target, surface noise, Project All, reprojecting levels, falloff curves, alphas, chisel shapes, lazy mouse, Drag Rect, Spray and Dots strokes, pen pressure, backface masking, curve tubes and straps, SubTools (append, select, split, merge), arrays, boolean parts, gizmo moves and deformers, undo history names and jumps, partial BVH refits, exporters (FBX structure, GLB, PLY, print placement and watertight checks), symmetry, project files, meshes, subdivision, dynamic topology, multiresolution, voxel remesh and subtract, picking, brushes (including dragging, curve and cloth brushes), strokes, undo, ZModeler actions and primitives, polygroups and quads, retopology, mannequins, Snapshot 3D, OBJ/STL).
 
 ## Windows build
 
@@ -300,7 +315,7 @@ Clayform uses Microsoft Edge WebView2, which Windows 10 and 11 include. The inst
 
 ## Roadmap ideas
 
-Multithreaded brushes (needs WebAssembly threads in the window), feature-following (ZRemesher-style) edge flow and a lasso mask.
+Multithreaded brushes (needs WebAssembly threads in the window), feature-following (ZRemesher-style) edge flow.
 
 ## Automated testing hook
 

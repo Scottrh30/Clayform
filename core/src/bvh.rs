@@ -265,7 +265,7 @@ impl Bvh {
         let mut best_t = f32::MAX;
         let test = |t: u32, best: &mut Option<Hit>, best_t: &mut f32| {
             let [a, b, c] = mesh.tris[t as usize];
-            if a == NONE {
+            if a == NONE || mesh.is_hidden(t) {
                 return;
             }
             if let Some(tt) =

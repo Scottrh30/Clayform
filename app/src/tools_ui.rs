@@ -145,6 +145,11 @@ fn style_class(s: OverlayStyle) -> &'static str {
         OverlayStyle::Axis(0) => "ov-x",
         OverlayStyle::Axis(1) => "ov-y",
         OverlayStyle::Axis(_) => "ov-z",
+        OverlayStyle::Select(0) => "ov-sel-mask",
+        OverlayStyle::Select(1) => "ov-sel-unmask",
+        OverlayStyle::Select(2) => "ov-sel-show",
+        OverlayStyle::Select(3) => "ov-sel-hide",
+        OverlayStyle::Select(_) => "ov-sel-cut",
     }
 }
 

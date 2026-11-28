@@ -25,6 +25,7 @@ pub mod retopo;
 pub mod scene;
 pub mod shadowbox;
 pub mod sculpt;
+pub mod select;
 pub mod snapshot;
 pub mod symmetry;
 pub mod text3d;

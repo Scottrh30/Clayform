@@ -157,6 +157,12 @@ button, select, input { font: inherit; color: inherit; }
 .mode-overlay .ov-joint { stroke: #8fc3ff; fill: #2b6fd6; stroke-width: 1.5; }
 .mode-overlay .ov-curve { stroke: #ff965a; stroke-width: 2; }
 .mode-overlay .ov-crease { stroke: #4fc3f7; stroke-width: 1.5; }
+.mode-overlay [class^="ov-sel"] { stroke-width: 1.5; stroke-dasharray: 6 4; }
+.mode-overlay .ov-sel-mask { stroke: #c792ea; }
+.mode-overlay .ov-sel-unmask { stroke: #e0e0e0; }
+.mode-overlay .ov-sel-show { stroke: #7bd88f; }
+.mode-overlay .ov-sel-hide { stroke: #ff6b6b; }
+.mode-overlay .ov-sel-cut { stroke: #ffcb6b; stroke-dasharray: none; stroke-width: 2; }
 .mode-overlay .ov-face { fill: rgba(111, 227, 154, 0.16); stroke: none; }
 .snap-thumb img { max-width: 100%; max-height: 120px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
 .ref-item { border-top: 1px solid var(--line); padding: 4px 0; }

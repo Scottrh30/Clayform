@@ -461,6 +461,8 @@ pub(crate) enum Undo {
     AddTop { level: Box<Level>, then_level: usize },
     /// Polygroups of these faces.
     Groups { faces: Vec<u32>, groups: Vec<u32> },
+    /// Which faces were hidden.
+    Hidden(Vec<bool>),
 }
 
 impl Undo {
@@ -469,6 +471,7 @@ impl Undo {
             Undo::Verts { idx, .. } => idx.len() * 20,
             Undo::Level(_) | Undo::DropTop { .. } => 16,
             Undo::Groups { faces, .. } => faces.len() * 8,
+            Undo::Hidden(h) => h.len(),
             Undo::AddTop { level, .. } => {
                 level.mesh.as_ref().map_or(0, mesh_bytes) + level.odd.len() * 16 + level.details.len() * 12
             }
@@ -820,6 +823,7 @@ impl Sculptor {
                 Undo::DropTop { .. } => "Subdivide",
                 Undo::AddTop { .. } => "Remove level",
                 Undo::Groups { .. } => "Polygroups",
+                Undo::Hidden(_) => "Visibility",
                 Undo::Extra(_) => "Layers",
                 Undo::Colors { .. } | Undo::AllColors(_) => "Paint",
                 Undo::Pose(_) => "Pose",
@@ -976,11 +980,29 @@ impl Sculptor {
         if target == self.level {
             return;
         }
+        // hidden faces stay hidden on every level: each face of a level
+        // has four children (in order) on the next
+        let hidden = std::mem::take(&mut self.mesh.hidden);
+        let from = self.level;
         while self.level < target {
             self.step_up();
         }
         while self.level > target {
             self.step_down();
+        }
+        if !hidden.is_empty() {
+            let f = 4usize.pow(from.abs_diff(target) as u32);
+            let n = self.mesh.tris.len();
+            self.mesh.hidden = if target > from && n == hidden.len() * f {
+                (0..n).map(|i| hidden[i / f]).collect()
+            } else if target < from && n * f == hidden.len() {
+                (0..n).map(|i| hidden[i * f..(i + 1) * f].iter().all(|&h| h)).collect()
+            } else {
+                Vec::new()
+            };
+            if !self.mesh.hidden.contains(&true) {
+                self.mesh.hidden.clear();
+            }
         }
         self.topology_changed();
     }
@@ -1263,12 +1285,14 @@ impl Sculptor {
         self.export_creases(out);
         self.export_colors(out);
         self.export_uvs(out);
+        self.export_hidden(out);
     }
     pub(crate) fn import_more_extras(&mut self, tag: &[u8; 4], body: &[u8]) {
         match tag {
             b"CRSE" => self.import_creases(body),
             b"COLR" => self.import_colors(body),
             b"UVS0" => self.import_uvs(body),
+            b"HIDE" => self.import_hidden(body),
             _ => {}
         }
     }
@@ -1414,7 +1438,11 @@ impl Sculptor {
         }
         let r2 = radius * radius;
         let inv_r = 1.0 / radius;
+        let hides = mesh.any_hidden();
         while let Some(v) = stack.pop() {
+            if hides && mesh.vert_hidden(v) {
+                continue;
+            }
             let d2 = mesh.positions[v as usize].distance_squared(center);
             let inside = d2 < r2;
             if inside {
@@ -1934,6 +1962,9 @@ impl Sculptor {
                     .collect()
             }
         };
+        if self.mesh.any_hidden() {
+            verts.retain(|&(v, _)| !self.mesh.vert_hidden(v));
+        }
         if cloth {
             // the brush moves its own radius; the rest follows as cloth
             for (k, &(v, _)) in verts.clone().iter().enumerate() {
@@ -2158,6 +2189,11 @@ impl Sculptor {
                 }
                 self.dirty.topology = true;
                 Undo::Groups { faces, groups: cur }
+            }
+            Undo::Hidden(h) => {
+                let cur = std::mem::replace(&mut self.mesh.hidden, h);
+                self.dirty.topology = true;
+                Undo::Hidden(cur)
             }
             Undo::Level(l) => {
                 let cur = self.level;

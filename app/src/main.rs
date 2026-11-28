@@ -7,6 +7,7 @@ mod detail_ui;
 mod topo_ui;
 mod paint_ui;
 mod special_ui;
+mod select_ui;
 mod host;
 mod render;
 mod conveniences;
@@ -1459,6 +1460,7 @@ fn SidePanel(ui: Ui) -> impl IntoView {
     let multi = Signal::derive(move || ui.level_count.get() > 1);
     // (comparisons stay outside view!: a bare `>` in an attribute ends the tag)
     let at_top = move || ui.level.get() + 1 >= ui.level_count.get();
+    let sel_shape = RwSignal::new(clayform_core::editor::SelectShape::Lasso);
     view! {
         <aside class="panel">
             <tools_ui::ModeBar ui />
@@ -1596,18 +1598,8 @@ fn SidePanel(ui: Ui) -> impl IntoView {
             <special_ui::FiberFolder ui />
             <special_ui::DynamicsFolder ui />
             <special_ui::ShadowboxFolder ui />
-            <Folder title="Masking">
-                <div class="row buttons">
-                    <button on:click=move |_| ui.tool.set(Tool::Mask)>"Mask brush"</button>
-                    <button on:click=move |_| act(ui, Action::ClearMask)>"Clear"</button>
-                    <button on:click=move |_| act(ui, Action::InvertMask)>"Invert"</button>
-                </div>
-                <Check
-                    label="Show mask"
-                    value=Signal::derive(move || ui.view.get().show_mask)
-                    on_change=move |v| ui.view.update(|s| s.show_mask = v)
-                />
-            </Folder>
+            <select_ui::MaskingFolder ui shape=sel_shape />
+            <select_ui::VisibilityFolder ui shape=sel_shape />
             <Folder title="Topology">
                 <div class="subhead">"Multiresolution"</div>
                 <div class="row">

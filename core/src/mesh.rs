@@ -37,6 +37,9 @@ pub struct Mesh {
     pub colors: Vec<[u8; 4]>,
     /// Texture coordinates per triangle corner (empty = not unwrapped).
     pub uvs: Vec<[glam::Vec2; 3]>,
+    /// Hidden triangles (empty = everything shown). Hidden faces aren't
+    /// drawn, picked or sculpted.
+    pub hidden: Vec<bool>,
 }
 
 /// An unpainted vertex.
@@ -126,6 +129,7 @@ impl MeshBuilder {
                 creases: Vec::new(),
                 colors: Vec::new(),
                 uvs: Vec::new(),
+                hidden: Vec::new(),
             },
             phase: 0,
             i: 0,
@@ -362,6 +366,9 @@ impl Mesh {
         let f = self.tris.len() as u32;
         self.tris.push(t);
         self.groups.push(g);
+        if !self.hidden.is_empty() {
+            self.hidden.push(false);
+        }
         self.partner.push(NONE);
         self.face_normals.push(Vec3::ZERO);
         for &v in &t {
@@ -394,6 +401,26 @@ impl Mesh {
             }
         }
         self.tris[f as usize] = t;
+    }
+
+    /// Whether face `f` is hidden.
+    #[inline]
+    pub fn is_hidden(&self, f: u32) -> bool {
+        self.hidden.get(f as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether every face around vertex `v` is hidden (so brushes skip it).
+    #[inline]
+    pub fn vert_hidden(&self, v: u32) -> bool {
+        !self.hidden.is_empty() && {
+            let f = &self.vf[v as usize];
+            !f.is_empty() && f.iter().all(|&f| self.hidden[f as usize])
+        }
+    }
+
+    /// Whether any face is hidden.
+    pub fn any_hidden(&self) -> bool {
+        self.hidden.contains(&true)
     }
 
     /// Deletes a face (it stays as `DEAD` until `compact()`).
@@ -439,6 +466,8 @@ impl Mesh {
         let mut groups = Vec::with_capacity(self.tris.len());
         let mut uvs = Vec::new();
         let has_uv = self.uvs.len() == self.tris.len();
+        let has_hidden = self.hidden.len() == self.tris.len();
+        let mut hidden = Vec::new();
         for (f, t) in self.tris.iter().enumerate() {
             if t[0] != NONE {
                 face_remap[f] = tris.len() as u32;
@@ -446,6 +475,9 @@ impl Mesh {
                 groups.push(self.groups[f]);
                 if has_uv {
                     uvs.push(self.uvs[f]);
+                }
+                if has_hidden {
+                    hidden.push(self.hidden[f]);
                 }
             }
         }
@@ -469,6 +501,7 @@ impl Mesh {
         self.creases = creases;
         self.colors = colors;
         self.uvs = uvs;
+        self.hidden = if hidden.contains(&true) { hidden } else { Vec::new() };
         self.mask = mask;
         self.export_center = c;
         self.export_scale = s;
@@ -667,6 +700,7 @@ impl Mesh {
         let mut new_tris = Vec::with_capacity(self.tris.len() * 4);
         let mut new_groups: Vec<u32> = Vec::with_capacity(self.tris.len() * 4);
         let mut new_uvs: Vec<[glam::Vec2; 3]> = Vec::new();
+        let mut new_hidden: Vec<bool> = Vec::new();
         for (ti, t) in self.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
             if ti % 16384 == 0 && !progress(0.6 * ti as f32 / total as f32) {
                 return Err(());
@@ -691,6 +725,9 @@ impl Mesh {
             let [ab, bc, ca] = mids;
             let g = self.groups[ti];
             new_groups.extend([g; 4]);
+            if self.hidden.len() == self.tris.len() {
+                new_hidden.extend([self.hidden[ti]; 4]);
+            }
             if let Some(&[ua, ub, uc]) = self.uvs.get(ti).filter(|_| self.uvs.len() == self.tris.len()) {
                 let (uab, ubc, uca) = ((ua + ub) * 0.5, (ub + uc) * 0.5, (uc + ua) * 0.5);
                 new_uvs.extend([[ua, uab, uca], [uab, ub, ubc], [uca, ubc, uc], [uab, ubc, uca]]);
@@ -731,6 +768,9 @@ impl Mesh {
         out.colors = colors;
         if new_uvs.len() == out.tris.len() {
             out.uvs = new_uvs;
+        }
+        if new_hidden.len() == out.tris.len() {
+            out.hidden = new_hidden;
         }
         out.export_center = self.export_center;
         out.export_scale = self.export_scale;

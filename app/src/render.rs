@@ -965,8 +965,9 @@ impl Renderer {
             g.staging.clear();
             g.staging.extend((0..n).map(to_gpu));
             g.index_staging.clear();
-            for t in &mesh.tris {
-                if t[0] != NONE {
+            // hidden faces aren't drawn
+            for (f, t) in mesh.tris.iter().enumerate() {
+                if t[0] != NONE && !mesh.is_hidden(f as u32) {
                     g.index_staging.extend_from_slice(t);
                 }
             }
@@ -1016,7 +1017,7 @@ impl Renderer {
         if need_edges && g.edges_stale {
             let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(mesh.tris.len() * 3 / 2);
             let mut edges: Vec<u32> = Vec::with_capacity(mesh.tris.len() * 3);
-            for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
+            for (f, t) in mesh.tris.iter().enumerate().filter(|(f, t)| t[0] != NONE && !mesh.is_hidden(*f as u32)) {
                 // the diagonal shared with a quad partner isn't drawn
                 let p = mesh.partner.get(f).copied().unwrap_or(NONE);
                 let pt = if p != NONE { mesh.tris[p as usize] } else { [NONE; 3] };
@@ -1044,7 +1045,7 @@ impl Renderer {
         }
         if need_groups && g.groups_stale {
             let mut verts: Vec<GroupVertex> = Vec::with_capacity(mesh.tris.len() * 3);
-            for (f, t) in mesh.tris.iter().enumerate().filter(|(_, t)| t[0] != NONE) {
+            for (f, t) in mesh.tris.iter().enumerate().filter(|(f, t)| t[0] != NONE && !mesh.is_hidden(*f as u32)) {
                 let color = group_color(mesh.groups.get(f).copied().unwrap_or(0));
                 for &v in t {
                     let g = &g.staging[v as usize];

@@ -16,12 +16,14 @@ mod gz;
 mod zs;
 mod mq;
 mod rt;
+mod sel;
 mod st;
 mod zm;
 
 pub use gz::GizmoSettings;
 pub use zs::ZsTool;
 pub use mq::MannequinDrag;
+pub use sel::{CutTool, PickAction, SelectShape};
 pub use st::SubTool;
 pub use zm::ZmSettings;
 
@@ -86,6 +88,8 @@ pub enum OverlayStyle {
     Axis(u8),
     /// Creased edges.
     Crease,
+    /// A selection outline: 0 mask, 1 unmask, 2 show, 3 hide, 4 cut line.
+    Select(u8),
 }
 
 /// How dynamic topology picks its triangle size.
@@ -236,6 +240,14 @@ pub struct Editor {
     pub show_creases: bool,
     /// Direction of the last dabs on screen (alpha "follow stroke").
     stroke_dir: Vec2,
+    /// Mask and Select gestures draw this outline.
+    pub select_shape: SelectShape,
+    /// What Ctrl + Shift + drag does.
+    pub cut_tool: CutTool,
+    /// The next click on the model does this.
+    pub pending_pick: Option<PickAction>,
+    sel: Option<sel::SelGesture>,
+    sel_sym: Vec<Mat3>,
 }
 
 /// Per-dab changes to the brush (pressure, Spray, Drag Rect).
@@ -320,6 +332,11 @@ impl Editor {
             spotlight_on: false,
             show_creases: true,
             stroke_dir: Vec2::X,
+            select_shape: SelectShape::Lasso,
+            cut_tool: CutTool::Select,
+            pending_pick: None,
+            sel: None,
+            sel_sym: Vec::new(),
         };
         e.frame_mesh();
         e
@@ -525,6 +542,9 @@ impl Editor {
     }
 
     pub fn cancel_drag(&mut self) {
+        if self.sel.take().is_some() {
+            self.redraw = true;
+        }
         if self.drag == Drag::Sculpt {
             self.sculptor.end_stroke();
         }
@@ -590,7 +610,8 @@ impl Editor {
     pub fn overlay(&mut self, p: Option<Vec2>, size: Vec2) -> Overlay {
         match self.mode {
             Mode::Sculpt => {
-                let mut o = Overlay { brush: true, ..Default::default() };
+                let mut o = Overlay { brush: self.sel.is_none(), ..Default::default() };
+                self.sel_overlay(&mut o);
                 for w in self.curve.windows(2) {
                     o.lines.push((w[0], w[1], OverlayStyle::Curve));
                 }
@@ -634,6 +655,13 @@ impl Editor {
         self.sculptor.refresh_bvh();
         self.last_pos = p;
         self.alt_click = (button == Button::Left && mods.alt).then_some(p);
+        if button == Button::Left {
+            if let Some(d) = self.sel_down(p, size, mods) {
+                self.alt_click = None;
+                self.drag = d;
+                return d;
+            }
+        }
         self.drag = match button {
             Button::Left if mods.alt => Drag::Orbit,
             Button::Left if self.mode != Mode::Sculpt => {
@@ -680,6 +708,7 @@ impl Editor {
                 self.redraw = true;
             }
             Drag::Sculpt => match self.mode {
+                Mode::Sculpt if self.sel_active() => self.sel_move(p),
                 Mode::Sculpt => {
                     self.sculptor.refresh_bvh();
                     self.continue_sculpt(p, size);
@@ -710,6 +739,7 @@ impl Editor {
             }
         }
         match self.mode {
+            Mode::Sculpt if self.sel_active() => self.sel_up(),
             Mode::Sculpt if self.drag == Drag::Sculpt && self.stroke_tool == Tool::CurveSnakehook => {
                 self.finish_curve();
             }

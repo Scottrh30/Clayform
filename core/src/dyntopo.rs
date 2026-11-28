@@ -28,7 +28,10 @@ pub fn split_edge(m: &mut Mesh, a: u32, b: u32, touched: &mut Vec<u32>) -> u32 {
         let (x, y, c) = (t[i], t[(i + 1) % 3], t[(i + 2) % 3]);
         let g = m.groups[f as usize];
         m.set_face(f, [x, nv, c]);
-        m.add_face_in_group([nv, y, c], g);
+        let nf = m.add_face_in_group([nv, y, c], g);
+        if m.hidden.len() == m.tris.len() {
+            m.hidden[nf as usize] = m.hidden[f as usize];
+        }
         touched.push(c);
     }
     touched.extend([a, b, nv]);
